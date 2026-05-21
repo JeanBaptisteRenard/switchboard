@@ -49,7 +49,12 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
     let agentId = null;
     let sidechainSeen = false;
     for (const line of lines) {
-      const entry = JSON.parse(line);
+      // Per-line try/catch: a JSONL file being written concurrently by a live
+      // Claude CLI session can have its tail captured mid-write — one truncated
+      // line should not invalidate the whole file. Skip the malformed line and
+      // keep parsing.
+      let entry;
+      try { entry = JSON.parse(line); } catch { continue; }
       if (entry.slug && !slug) slug = entry.slug;
       if (entry.agentId && !agentId) agentId = entry.agentId;
       if (entry.isSidechain) sidechainSeen = true;
