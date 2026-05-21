@@ -1,5 +1,6 @@
 const { app, BrowserWindow, dialog, ipcMain, Menu, screen, shell } = require('electron');
 const { Worker } = require('worker_threads');
+const { execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -349,6 +350,84 @@ ipcMain.handle('remove-project', (_event, projectPath) => {
   } catch (err) {
     return { error: err.message };
   }
+});
+
+// --- IPC: delete-worktree ---
+// Validated path pattern: <project>/.<segment>/[worktrees/]<name>
+// Matches .claude/worktrees/<n>, .claude-worktrees/<n>, .worktrees/<n>
+const WORKTREE_PATH_RE = /^(.+?)\/\.(?:claude\/worktrees|claude-worktrees|worktrees)\/([^/]+)\/?$/;
+
+ipcMain.handle('delete-worktree', (_event, worktreePath) => {
+  return new Promise((resolve) => {
+    // Normalize trailing slash
+    const normalizedPath = worktreePath.replace(/\/$/, '');
+
+    // Validate path matches a known worktree layout
+    const match = normalizedPath.match(WORKTREE_PATH_RE);
+    if (!match) {
+      return resolve({ ok: false, error: 'Path does not match a recognized worktree layout' });
+    }
+    const parentRepo = match[1];
+
+    // Helper: run git worktree remove, optionally double-force
+    function runRemove(doubleForce, callback) {
+      const args = ['-C', parentRepo, 'worktree', 'remove', '-f'];
+      if (doubleForce) args.push('-f');
+      args.push('--', normalizedPath);
+      execFile('git', args, (err, _stdout, stderr) => callback(err, stderr));
+    }
+
+    runRemove(false, (err, stderr) => {
+      if (err && /locked/i.test(stderr || err.message || '')) {
+        // Retry with double force for locked worktrees
+        runRemove(true, (err2, stderr2) => {
+          if (err2) return resolve({ ok: false, error: (stderr2 || err2.message || String(err2)).trim() });
+          afterRemove();
+        });
+      } else if (err) {
+        return resolve({ ok: false, error: (stderr || err.message || String(err)).trim() });
+      } else {
+        afterRemove();
+      }
+    });
+
+    function afterRemove() {
+      // Clean up DB cache: delete all sessions whose projectPath matches worktreePath
+      let removed = 0;
+      try {
+        const allRows = getAllCached();
+        for (const row of allRows) {
+          if (row.projectPath === normalizedPath) {
+            deleteCachedSession(row.sessionId);
+            deleteSearchSession(row.sessionId);
+            removed++;
+          }
+        }
+      } catch (dbErr) {
+        log.warn('[delete-worktree] DB cleanup error:', dbErr.message);
+      }
+
+      // Remove from hiddenProjects if present
+      try {
+        const global = getSetting('global') || {};
+        if (Array.isArray(global.hiddenProjects) && global.hiddenProjects.includes(normalizedPath)) {
+          global.hiddenProjects = global.hiddenProjects.filter(p => p !== normalizedPath);
+          setSetting('global', global);
+        }
+      } catch {}
+
+      // Also clean up folder meta
+      try {
+        const folder = encodeProjectPath(normalizedPath);
+        deleteCachedFolder(folder);
+        deleteSearchFolder(folder);
+      } catch {}
+
+      log.info(`[delete-worktree] removed=${normalizedPath} sessions=${removed}`);
+      notifyRendererProjectsChanged();
+      resolve({ ok: true, removed });
+    }
+  });
 });
 
 // --- IPC: get-projects ---
