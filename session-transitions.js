@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const { readSubagentMeta } = require('./read-session-file');
 
 /**
  * Fork / plan-accept detection for active PTY sessions.
@@ -13,6 +14,89 @@ function init(ctx) {
   getMainWindow = ctx.getMainWindow;
   log = ctx.log;
   rekeyMcpServer = ctx.rekeyMcpServer;
+}
+
+// --- Subagent spawn / completion detection ---
+
+/** Walk <folder>/<sessionId>/subagents/ and detect new or completed subagent files.
+ *  Mutates session.knownSubagents (Map<agentId, { mtimeMs, completed }>).
+ *  Emits IPC 'subagent-spawned' and 'subagent-completed' via mainWindow. */
+function detectSubagentTransitions(sessionId, session, folderPath) {
+  const subagentsDir = path.join(folderPath, sessionId, 'subagents');
+  let files;
+  try {
+    files = fs.readdirSync(subagentsDir).filter(f => f.endsWith('.jsonl'));
+  } catch {
+    return; // directory doesn't exist yet — normal
+  }
+
+  if (!session.knownSubagents) {
+    session.knownSubagents = new Map();
+  }
+
+  const mainWindow = getMainWindow();
+  const now = Date.now();
+  const STABLE_MS = 30000; // 30 seconds of no mtime advance → completed
+
+  for (const file of files) {
+    // agent-<agentId>.jsonl
+    const m = file.match(/^agent-(.+)\.jsonl$/);
+    if (!m) continue;
+    const agentId = m[1];
+    const filePath = path.join(subagentsDir, file);
+
+    let stat;
+    try { stat = fs.statSync(filePath); } catch { continue; }
+    const mtimeMs = stat.mtimeMs;
+
+    const known = session.knownSubagents.get(agentId);
+
+    if (!known) {
+      // First sighting — emit subagent-spawned
+      const meta = readSubagentMeta(filePath) || {};
+      session.knownSubagents.set(agentId, { mtimeMs, completed: false });
+      log.info(`[subagent-spawn] parent=${sessionId} agentId=${agentId} type=${meta.agentType || 'unknown'}`);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('subagent-spawned', {
+          parentSessionId: sessionId,
+          agentId,
+          subagentType: meta.agentType || null,
+          description: meta.description || null,
+        });
+      }
+    } else if (!known.completed) {
+      if (mtimeMs !== known.mtimeMs) {
+        // File is still being written — update mtime, reset stability clock
+        known.mtimeMs = mtimeMs;
+        known._stableStart = null;
+      } else {
+        // mtime stable — start or continue stability timer
+        if (!known._stableStart) {
+          known._stableStart = now;
+        } else if (now - known._stableStart >= STABLE_MS) {
+          known.completed = true;
+          log.info(`[subagent-complete] parent=${sessionId} agentId=${agentId}`);
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('subagent-completed', {
+              parentSessionId: sessionId,
+              agentId,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // GC: remove completed entries after 5 minutes to avoid unbounded growth
+  const GC_TTL = 5 * 60 * 1000;
+  for (const [agentId, state] of session.knownSubagents) {
+    if (state.completed && state._completedAt && now - state._completedAt > GC_TTL) {
+      session.knownSubagents.delete(agentId);
+    }
+    if (state.completed && !state._completedAt) {
+      state._completedAt = now;
+    }
+  }
 }
 
 // --- Fork / plan-accept detection ---
@@ -85,6 +169,12 @@ function detectSessionTransitions(folder) {
   } catch { return; }
 
   for (const [sessionId, session] of [...activeSessions]) {
+    // Run subagent detection for all non-exited, non-terminal sessions in this folder
+    if (!session.exited && !session.isPlainTerminal && session.projectFolder === folder) {
+      const effectiveSessionId = session.realSessionId || sessionId;
+      detectSubagentTransitions(effectiveSessionId, session, folderPath);
+    }
+
     if (session.exited || session.isPlainTerminal || !session.knownJsonlFiles || session.projectFolder !== folder) {
       if (!session.exited && !session.isPlainTerminal && session.forkFrom) {
         log.info(`[fork-detect] skipped session=${sessionId} forkFrom=${session.forkFrom||'none'} reason=${session.exited ? 'exited' : session.isPlainTerminal ? 'terminal' : !session.knownJsonlFiles ? 'noKnown' : 'folderMismatch('+session.projectFolder+' vs '+folder+')'}`);
@@ -195,4 +285,4 @@ function detectSessionTransitions(folder) {
 }
 
 
-module.exports = { init, detectSessionTransitions };
+module.exports = { init, detectSessionTransitions, detectSubagentTransitions };
