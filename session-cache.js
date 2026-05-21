@@ -3,7 +3,7 @@ const fs = require('fs');
 const { Worker } = require('worker_threads');
 const { getFolderIndexMtimeMs } = require('./folder-index-state');
 const { deriveProjectPath } = require('./derive-project-path');
-const { readSessionFile } = require('./read-session-file');
+const { readSessionFile, enumerateSessionFiles, resolveJsonlPath } = require('./read-session-file');
 const { encodeProjectPath } = require('./encode-project-path');
 
 /**
@@ -46,13 +46,10 @@ function readFolderFromFilesystem(folder) {
   if (!projectPath) return { projectPath: null, sessions: [] };
   const sessions = [];
 
-  try {
-    const jsonlFiles = fs.readdirSync(folderPath).filter(f => f.endsWith('.jsonl'));
-    for (const file of jsonlFiles) {
-      const s = readSessionFile(path.join(folderPath, file), folder, projectPath);
-      if (s) sessions.push(s);
-    }
-  } catch {}
+  for (const { filePath, parentSessionId } of enumerateSessionFiles(folderPath)) {
+    const s = readSessionFile(filePath, folder, projectPath, { parentSessionId });
+    if (s) sessions.push(s);
+  }
 
   return { projectPath, sessions };
 }
@@ -71,18 +68,17 @@ function refreshFolder(folder) {
     return;
   }
 
-  // Get what's currently cached for this folder
+  // Get what's currently cached for this folder.
+  // cachedMap: DB sessionId → { modified, filePath } so we can do mtime comparison
+  // even for subagents whose DB sessionId differs from the on-disk filename.
   const cachedSessions = getCachedByFolder(folder);
-  const cachedMap = new Map(); // sessionId → modified ISO string
+  const cachedMap = new Map(); // DB sessionId → { modified, filePath }
   for (const row of cachedSessions) {
-    cachedMap.set(row.sessionId, row.modified);
+    cachedMap.set(row.sessionId, {
+      modified: row.modified,
+      filePath: resolveJsonlPath(PROJECTS_DIR, row),
+    });
   }
-
-  // Scan current .jsonl files
-  let jsonlFiles;
-  try {
-    jsonlFiles = fs.readdirSync(folderPath).filter(f => f.endsWith('.jsonl'));
-  } catch { return; }
 
   const currentIds = new Set();
   let changed = false;
@@ -93,22 +89,35 @@ function refreshFolder(folder) {
   const namesToSet = [];
   const sessionsToDelete = [];
 
-  for (const file of jsonlFiles) {
-    const filePath = path.join(folderPath, file);
-    const sessionId = path.basename(file, '.jsonl');
-    currentIds.add(sessionId);
-
-    // Check if file mtime changed
+  for (const { filePath, parentSessionId } of enumerateSessionFiles(folderPath)) {
+    // Check if file mtime changed.
+    // We need the DB sessionId to look up the cache, but we don't know it until after
+    // readSessionFile — for subagents it's sub:<parent>:<agentId>. Use the file path
+    // to find a matching cached entry instead.
     let fileMtime;
     try { fileMtime = fs.statSync(filePath).mtime.toISOString(); } catch { continue; }
 
-    if (cachedMap.has(sessionId) && cachedMap.get(sessionId) === fileMtime) {
+    // Find cached entry by file path (handles both top-level and subagent IDs)
+    let cachedEntry = null;
+    let cachedDbId = null;
+    for (const [dbId, entry] of cachedMap) {
+      if (entry.filePath === filePath) {
+        cachedEntry = entry;
+        cachedDbId = dbId;
+        break;
+      }
+    }
+
+    if (cachedDbId !== null) currentIds.add(cachedDbId);
+
+    if (cachedEntry && cachedEntry.modified === fileMtime) {
       continue; // unchanged, skip
     }
 
     // File is new or modified — re-read it
-    const s = readSessionFile(filePath, folder, projectPath);
+    const s = readSessionFile(filePath, folder, projectPath, { parentSessionId });
     if (s) {
+      currentIds.add(s.sessionId); // ensure we don't delete a newly-read subagent row
       sessionsToUpsert.push(s);
       // Title precedence: user rename (session_meta.name) > JSONL custom-title > JSONL ai-title.
       // Only customTitle (Claude /title) promotes to session_meta.name — AI titles must NEVER
