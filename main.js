@@ -407,13 +407,18 @@ ipcMain.handle('unwatch-file', (_event, filePath) => {
   return { ok: true };
 });
 
-ipcMain.handle('get-projects', (_event, showArchived) => {
+ipcMain.handle('get-projects', async (_event, showArchived) => {
   try {
     const needsPopulate = !isCachePopulated() || !isSearchIndexPopulated();
 
     if (needsPopulate) {
-      populateCacheViaWorker();
-      return [];
+      // First call after a migration that clears session_cache (e.g. v4) finds
+      // an empty cache. Returning [] immediately makes the renderer paint an
+      // empty list and rely on `notifyRendererProjectsChanged` firing later —
+      // which only triggers a reload if the user is on the Sessions tab. To
+      // avoid that race, await the scan here so the response carries the
+      // freshly-populated cache. Concurrent callers share the same Promise.
+      await populateCacheViaWorker();
     }
 
     return buildProjectsFromCache(showArchived);

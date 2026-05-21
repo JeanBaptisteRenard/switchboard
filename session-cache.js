@@ -306,13 +306,24 @@ function sendStatus(text, type) {
   }
 }
 
-// --- Worker-based cache population (non-blocking) ---
-let populatingCache = false;
+// --- Worker-based cache population ---
+// Returns a Promise that resolves when the in-flight scan finishes. Concurrent
+// callers share the same Promise so the first get-projects after a migration
+// can await it instead of seeing an empty list.
+let populatePromise = null;
 
 function populateCacheViaWorker() {
-  if (populatingCache) return;
-  populatingCache = true;
+  if (populatePromise) return populatePromise;
   sendStatus('Scanning projects\u2026', 'active');
+
+  populatePromise = new Promise((resolve) => {
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      populatePromise = null;
+      resolve();
+    };
 
   const worker = new Worker(path.join(__dirname, 'workers', 'scan-projects.js'), {
     workerData: { projectsDir: PROJECTS_DIR },
@@ -328,7 +339,7 @@ function populateCacheViaWorker() {
     if (!msg.ok) {
       console.error('Worker scan error:', msg.error);
       sendStatus('Scan failed: ' + msg.error, 'error');
-      populatingCache = false;
+      settle();
       return;
     }
 
@@ -360,30 +371,28 @@ function populateCacheViaWorker() {
       setFolderMeta(folder, projectPath, indexMtimeMs);
     }
 
-    populatingCache = false;
     sendStatus(`Indexed ${sessionCount} sessions across ${msg.results.length} projects`, 'done');
     // Clear status after a few seconds
     setTimeout(() => sendStatus(''), 5000);
     notifyRendererProjectsChanged();
+    settle();
   });
 
   worker.on('error', (err) => {
     console.error('Worker error:', err);
     sendStatus('Worker error: ' + err.message, 'error');
-    populatingCache = false;
+    settle();
   });
 
   // If the worker exits abnormally (SIGSEGV, OOM, uncaught exception) without
   // sending a message, neither the 'message' nor 'error' handler will fire.
-  // Reset the flag here to prevent a permanent lockout where the session list
-  // stays empty because populateCacheViaWorker() returns immediately.
+  // Resolve here so awaiters aren't stuck forever and the next call can retry.
   worker.on('exit', (code) => {
-    if (populatingCache) {
-      populatingCache = false;
-      if (code !== 0) {
-        sendStatus('Scan worker exited unexpectedly', 'error');
-      }
+    if (!settled && code !== 0) {
+      sendStatus('Scan worker exited unexpectedly', 'error');
     }
+    settle();
+  });
   });
 }
 
