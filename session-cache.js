@@ -11,7 +11,7 @@ const { encodeProjectPath } = require('./encode-project-path');
  * Call init(ctx) once with the shared context object.
  */
 let PROJECTS_DIR, activeSessions, getMainWindow, log;
-let deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession;
+let deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession, touchCachedModified;
 let deleteSearchFolder, deleteSearchSession, upsertSearchEntries;
 let setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName;
 
@@ -24,6 +24,7 @@ function init(ctx) {
   deleteCachedFolder = ctx.db.deleteCachedFolder;
   getCachedByFolder = ctx.db.getCachedByFolder;
   upsertCachedSessions = ctx.db.upsertCachedSessions;
+  touchCachedModified = ctx.db.touchCachedModified;
   deleteCachedSession = ctx.db.deleteCachedSession;
   deleteSearchFolder = ctx.db.deleteSearchFolder;
   deleteSearchSession = ctx.db.deleteSearchSession;
@@ -128,13 +129,25 @@ function refreshFolder(folder, opts = {}) {
   const namesToSet = [];
   const sessionsToDelete = [];
 
+  // Skip the full re-read for already-cached files above this size. Live
+  // Claude session JSONLs grow without bound (can exceed 200 MB); re-reading
+  // and JSON.parsing the whole thing on every fs.watch flush froze the main
+  // process. The cached metadata (summary, slug, customTitle) was captured
+  // when the file was small enough to read, and rarely changes after the
+  // first turn anyway — bump the mtime in the DB so the sidebar reflects
+  // activity, and trust the next cold-start (or a smaller file) to refresh
+  // the rest. Subagent transcripts are usually small and stay under this
+  // threshold; the host conversation's own JSONL is the typical offender.
+  const HUGE_FILE_BYTES = 5 * 1024 * 1024;
+
   for (const { filePath, parentSessionId } of filesToScan) {
     // Check if file mtime changed.
     // We need the DB sessionId to look up the cache, but we don't know it until after
     // readSessionFile — for subagents it's sub:<parent>:<agentId>. Use the file path
     // to find a matching cached entry instead.
-    let fileMtime;
-    try { fileMtime = fs.statSync(filePath).mtime.toISOString(); } catch { continue; }
+    let stat;
+    try { stat = fs.statSync(filePath); } catch { continue; }
+    const fileMtime = stat.mtime.toISOString();
 
     const cachedDbId = filePathToDbId.get(filePath) || null;
     const cachedEntry = cachedDbId ? cachedMap.get(cachedDbId) : null;
@@ -143,6 +156,14 @@ function refreshFolder(folder, opts = {}) {
 
     if (cachedEntry && cachedEntry.modified === fileMtime) {
       continue; // unchanged, skip
+    }
+
+    // Huge cached file: bump mtime only, skip the multi-hundred-MB readFileSync.
+    if (cachedEntry && stat.size > HUGE_FILE_BYTES) {
+      touchCachedModified(cachedDbId, fileMtime);
+      cachedEntry.modified = fileMtime;
+      changed = true;
+      continue;
     }
 
     // File is new or modified — re-read it
