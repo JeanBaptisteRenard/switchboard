@@ -6,6 +6,7 @@ set: [pipefail]
 
 vars:
   SWITCHBOARD_DB: "{{.HOME}}/.switchboard/switchboard.db"
+  SWITCHBOARD_DEV_DATA_DIR: "{{.HOME}}/.switchboard-dev"
 
 tasks:
   default:
@@ -20,10 +21,21 @@ tasks:
       - npm install
 
   dev:
-    desc: Launch Switchboard in development mode (Electron, no-sandbox)
+    desc: Launch Switchboard in development mode (Electron, no-sandbox, isolated DB)
     silent: true
+    env:
+      # Force a separate SQLite DB so a running AppImage isn't disturbed by the
+      # dev electron sharing session_cache. Override per-run with
+      # `SWITCHBOARD_DATA_DIR=/some/other/dir task dev`.
+      SWITCHBOARD_DATA_DIR: "{{.SWITCHBOARD_DEV_DATA_DIR}}"
     cmds:
       - npx electron . --no-sandbox
+
+  "db:reset:dev":
+    desc: Wipe just the dev SQLite database
+    cmds:
+      - rm -f "{{.SWITCHBOARD_DEV_DATA_DIR}}/switchboard.db" "{{.SWITCHBOARD_DEV_DATA_DIR}}/switchboard.db-wal" "{{.SWITCHBOARD_DEV_DATA_DIR}}/switchboard.db-shm"
+      - echo "Removed {{.SWITCHBOARD_DEV_DATA_DIR}}/switchboard.db"
 
   build:
     desc: Build Linux distribution packages (AppImage + deb)
