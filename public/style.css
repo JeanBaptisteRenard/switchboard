@@ -1584,6 +1584,27 @@ body { display: flex; flex-direction: column; }
   color: #6a6a80;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.sidebar-orphan-label:hover { color: #b0b0c4; }
+.sidebar-orphan-label .orphan-caret {
+  display: inline-block;
+  transition: transform 0.12s;
+  font-size: 10px;
+}
+.sidebar-orphan-subagents:not(.collapsed) .orphan-caret {
+  transform: rotate(90deg);
+}
+.sidebar-orphan-label .orphan-count {
+  margin-left: 4px;
+  opacity: 0.6;
+}
+.sidebar-orphan-subagents.collapsed > :not(.sidebar-orphan-label) {
+  display: none;
 }
 
 /* ========== SUBAGENT GRID PILLS ========== */

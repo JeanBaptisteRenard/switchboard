@@ -413,12 +413,24 @@ function renderProjects(projects, resort) {
         }
       }
       if (orphans.length > 0) {
+        // Persist expand/collapse per project. Default = collapsed: this
+        // section is rarely the user's focus and can grow long on long-lived
+        // projects (this very session has 1300+ orphan subagents).
+        const orphanStateKey = 'orphanExpanded:' + project.projectPath;
+        const expanded = localStorage.getItem(orphanStateKey) === '1';
+
         const orphanGroup = document.createElement('div');
-        orphanGroup.className = 'sidebar-orphan-subagents';
+        orphanGroup.className = 'sidebar-orphan-subagents' + (expanded ? '' : ' collapsed');
+
         const orphanLabel = document.createElement('div');
         orphanLabel.className = 'sidebar-orphan-label';
-        orphanLabel.textContent = 'Orphan subagents';
+        orphanLabel.innerHTML = `<span class="orphan-caret">&#9656;</span> Orphan subagents <span class="orphan-count">${orphans.length}</span>`;
+        orphanLabel.addEventListener('click', () => {
+          const isCollapsed = orphanGroup.classList.toggle('collapsed');
+          localStorage.setItem(orphanStateKey, isCollapsed ? '0' : '1');
+        });
         orphanGroup.appendChild(orphanLabel);
+
         for (const orphan of orphans) {
           orphanGroup.appendChild(buildSubagentItem(orphan));
         }
