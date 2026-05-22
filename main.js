@@ -1477,20 +1477,31 @@ let projectsWatcher = null;
 function startProjectsWatcher() {
   if (!fs.existsSync(PROJECTS_DIR)) return;
 
-  const pendingFolders = new Set();
+  // pendingChanges: folder → Set<relativePath> | true.
+  //   Set<string>  — only the listed files changed (targeted refresh, fast path)
+  //   true         — folder-level event or unknown scope, do a full walk
+  // The watcher reports the specific filename, so for the common case of a
+  // subagent appending JSONL we can stat one file instead of thousands.
+  const pendingChanges = new Map();
   let debounceTimer = null;
 
   function flushChanges() {
     debounceTimer = null;
-    const folders = new Set(pendingFolders);
-    pendingFolders.clear();
+    // Drain pendingChanges into a local copy so events arriving during the
+    // synchronous flush land in a fresh batch for the next tick.
+    const work = new Map(pendingChanges);
+    pendingChanges.clear();
 
     let changed = false;
-    for (const folder of folders) {
+    for (const [folder, scope] of work) {
       const folderPath = path.join(PROJECTS_DIR, folder);
       if (fs.existsSync(folderPath)) {
         detectSessionTransitions(folder);
-        refreshFolder(folder);
+        if (scope === true) {
+          refreshFolder(folder);
+        } else {
+          refreshFolder(folder, { files: scope });
+        }
       } else {
         deleteCachedFolder(folder);
       }
@@ -1499,6 +1510,20 @@ function startProjectsWatcher() {
 
     if (changed) {
       notifyRendererProjectsChanged();
+    }
+  }
+
+  function recordChange(folder, relPath) {
+    const existing = pendingChanges.get(folder);
+    if (existing === true) return;
+    if (relPath === null) {
+      pendingChanges.set(folder, true);
+      return;
+    }
+    if (existing instanceof Set) {
+      existing.add(relPath);
+    } else {
+      pendingChanges.set(folder, new Set([relPath]));
     }
   }
 
@@ -1511,12 +1536,14 @@ function startProjectsWatcher() {
       const folder = parts[0];
       if (!folder || folder === '.git') return;
 
-      // Only care about .jsonl changes or top-level folder add/remove
       const basename = parts[parts.length - 1];
       if (parts.length === 1) {
-        pendingFolders.add(folder);
+        // Top-level folder add/remove — must re-scan the whole folder
+        recordChange(folder, null);
       } else if (basename.endsWith('.jsonl')) {
-        pendingFolders.add(folder);
+        // Specific .jsonl changed — targeted refresh on just this file
+        const rel = parts.slice(1).join(path.sep);
+        recordChange(folder, rel);
       } else {
         return;
       }

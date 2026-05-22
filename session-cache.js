@@ -54,8 +54,17 @@ function readFolderFromFilesystem(folder) {
   return { projectPath, sessions };
 }
 
-/** Refresh a single folder incrementally: only re-read changed/new .jsonl files */
-function refreshFolder(folder) {
+/** Refresh a single folder incrementally: only re-read changed/new .jsonl files.
+ *
+ * @param {string} folder    folder name relative to PROJECTS_DIR
+ * @param {object} [opts]
+ * @param {Set<string>|null} [opts.files]  if provided, ONLY scan these on-disk
+ *   relative paths within the folder instead of walking everything. Used by the
+ *   fs.watch flush to avoid statSync'ing thousands of files when only a handful
+ *   of subagent transcripts were appended. When null/undefined, walk the whole
+ *   folder (used for bootstrap and folder-level events).
+ */
+function refreshFolder(folder, opts = {}) {
   const folderPath = path.join(PROJECTS_DIR, folder);
   if (!fs.existsSync(folderPath)) {
     deleteCachedFolder(folder);
@@ -84,6 +93,32 @@ function refreshFolder(folder) {
     filePathToDbId.set(filePath, row.sessionId);
   }
 
+  // Targeted refresh: walk only the files the watcher said changed, not the
+  // entire folder. Skips enumerateSessionFiles (which does many readdirSyncs on
+  // every subagent subdir) and only stats the dirty files. Falls back to full
+  // walk when opts.files is omitted (bootstrap / folder-level events / cold
+  // delete-detection).
+  const targeted = opts.files instanceof Set && opts.files.size > 0;
+  let filesToScan;
+  if (targeted) {
+    filesToScan = [];
+    for (const rel of opts.files) {
+      const filePath = path.join(folderPath, rel);
+      // Derive parentSessionId for subagent paths: <folder>/<parent>/subagents/agent-X.jsonl
+      const parts = rel.split(path.sep);
+      let parentSessionId = null;
+      if (parts.length === 3 && parts[1] === 'subagents') {
+        parentSessionId = parts[0];
+      } else if (parts.length === 2) {
+        // legacy <folder>/<parent>/agent-X.jsonl layout (no subagents/ subdir)
+        parentSessionId = parts[0];
+      }
+      filesToScan.push({ filePath, parentSessionId });
+    }
+  } else {
+    filesToScan = enumerateSessionFiles(folderPath);
+  }
+
   const currentIds = new Set();
   let changed = false;
 
@@ -93,7 +128,7 @@ function refreshFolder(folder) {
   const namesToSet = [];
   const sessionsToDelete = [];
 
-  for (const { filePath, parentSessionId } of enumerateSessionFiles(folderPath)) {
+  for (const { filePath, parentSessionId } of filesToScan) {
     // Check if file mtime changed.
     // We need the DB sessionId to look up the cache, but we don't know it until after
     // readSessionFile — for subagents it's sub:<parent>:<agentId>. Use the file path
@@ -128,11 +163,29 @@ function refreshFolder(folder) {
     changed = true;
   }
 
-  // Remove sessions whose .jsonl files were deleted
-  for (const sessionId of cachedMap.keys()) {
-    if (!currentIds.has(sessionId)) {
-      sessionsToDelete.push(sessionId);
-      changed = true;
+  // Remove sessions whose .jsonl files were deleted. Skip in targeted mode —
+  // we only stat'd the dirty files, so cachedMap entries not in currentIds
+  // weren't checked and may still exist on disk. Targeted-mode deletions are
+  // handled by the watcher path-stat: missing files surface via statSync's
+  // ENOENT in the loop above and produce no upsert. A full walk picks up any
+  // drift on the next folder-level event.
+  if (!targeted) {
+    for (const sessionId of cachedMap.keys()) {
+      if (!currentIds.has(sessionId)) {
+        sessionsToDelete.push(sessionId);
+        changed = true;
+      }
+    }
+  } else {
+    // Targeted mode still needs to delete entries for files explicitly deleted
+    // in this flush — detected by statSync failing on a path we tried to scan.
+    for (const { filePath } of filesToScan) {
+      const dbId = filePathToDbId.get(filePath);
+      if (!dbId) continue;
+      try { fs.statSync(filePath); } catch {
+        sessionsToDelete.push(dbId);
+        changed = true;
+      }
     }
   }
 
