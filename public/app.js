@@ -1083,10 +1083,13 @@ window.api.onProjectsChanged(() => {
     projectsChangedWhileAway = true;
     return;
   }
+  // 300ms debounce was visibly flickering while live JSONLs trigger watcher
+  // flushes every ~500ms; with the main-side notify throttle (1.5s) too the
+  // sidebar redraws at most ~1×/sec.
   projectsChangedTimer = setTimeout(() => {
     projectsChangedTimer = null;
     loadProjects();
-  }, 300);
+  }, 900);
 });
 
 // Status bar
