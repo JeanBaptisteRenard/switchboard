@@ -184,4 +184,92 @@ function enumerateSessionFiles(folderPath) {
   return out;
 }
 
-module.exports = { readSessionFile, subagentSessionId, resolveJsonlPath, readSubagentMeta, enumerateSessionFiles };
+/** Lightweight refresh path. Reads only the first ~256 KB / 500 lines of a
+ *  jsonl file to extract display-level metadata (summary, slug, titles,
+ *  agentId). Does NOT compute textContent or messageCount — the caller is
+ *  expected to merge with the cached row for unchanged fields. Designed so
+ *  the fs.watch flush can update a live 200+ MB host-session JSONL in ~ms
+ *  instead of seconds.
+ *
+ *  Returns the same shape as the display subset of readSessionFile() so it
+ *  can be merged into a cached row before upsert. Returns null if the chunk
+ *  doesn't yet contain a usable first-user-message.
+ */
+function readSessionDisplayHeader(filePath, opts = {}) {
+  const fileBase = path.basename(filePath, '.jsonl');
+  const isSubagent = Boolean(opts.parentSessionId);
+  const MAX_BYTES = 256 * 1024;
+  const MAX_LINES = 500;
+  try {
+    const stat = fs.statSync(filePath);
+    const readLen = Math.min(MAX_BYTES, stat.size);
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(readLen);
+    const n = fs.readSync(fd, buf, 0, readLen, 0);
+    fs.closeSync(fd);
+    const text = buf.toString('utf8', 0, n);
+    const lines = text.split('\n');
+    // Drop the potentially-partial last line unless we read the whole file
+    if (n < stat.size) lines.pop();
+
+    let summary = '';
+    let slug = null, customTitle = null, aiTitle = null, agentId = null;
+    let sidechainSeen = false;
+    let lineCount = 0;
+    for (const line of lines) {
+      if (!line) continue;
+      if (++lineCount > MAX_LINES) break;
+      let entry;
+      try { entry = JSON.parse(line); } catch { continue; }
+      if (entry.slug && !slug) slug = entry.slug;
+      if (entry.agentId && !agentId) agentId = entry.agentId;
+      if (entry.isSidechain) sidechainSeen = true;
+      if (entry.type === 'custom-title' && entry.customTitle && !customTitle) customTitle = entry.customTitle;
+      if (entry.type === 'ai-title' && entry.aiTitle && !aiTitle) aiTitle = entry.aiTitle;
+      const msg = entry.message;
+      const txt = typeof msg === 'string' ? msg :
+        (typeof msg?.content === 'string' ? msg.content :
+        (msg?.content?.[0]?.text || ''));
+      if (!summary && (entry.type === 'user' || (entry.type === 'message' && entry.role === 'user'))) {
+        if (txt && !/<bash-input>|<bash-stdout>|<local-command-caveat>/.test(txt)) {
+          const taskMatch = txt.match(/<scheduled-task\s+name="([^"]+)"/);
+          summary = taskMatch ? 'Scheduled: ' + taskMatch[1] : txt.slice(0, 120);
+        }
+      }
+    }
+
+    if (!summary) return null;
+
+    if (isSubagent) {
+      if (!sidechainSeen) return null;
+      if (!agentId) {
+        const m = fileBase.match(/^agent-(.+)$/);
+        if (m) agentId = m[1];
+      }
+      if (!agentId) return null;
+      const meta = readSubagentMeta(filePath) || {};
+      return {
+        sessionId: subagentSessionId(opts.parentSessionId, agentId),
+        summary: meta.description || summary,
+        firstPrompt: summary,
+        modified: stat.mtime.toISOString(),
+        slug, customTitle, aiTitle,
+        parentSessionId: opts.parentSessionId,
+        agentId,
+        subagentType: meta.agentType || null,
+        description: meta.description || null,
+      };
+    }
+
+    return {
+      sessionId: fileBase,
+      summary, firstPrompt: summary,
+      modified: stat.mtime.toISOString(),
+      slug, customTitle, aiTitle,
+    };
+  } catch {
+    return null;
+  }
+}
+
+module.exports = { readSessionFile, readSessionDisplayHeader, subagentSessionId, resolveJsonlPath, readSubagentMeta, enumerateSessionFiles };

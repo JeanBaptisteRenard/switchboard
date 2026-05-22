@@ -375,7 +375,7 @@ function renderProjects(projects, resort) {
   }
 
   // Build the sessions list DOM (shared between projects and worktrees)
-  function buildSessionsList(fId, visible, older, subagentIndex) {
+  function buildSessionsList(fId, visible, older, subagentIndex, projectPath) {
     const sessionsList = document.createElement('div');
     sessionsList.className = 'project-sessions';
     sessionsList.id = 'sessions-' + fId;
@@ -413,12 +413,24 @@ function renderProjects(projects, resort) {
         }
       }
       if (orphans.length > 0) {
+        // Persist expand/collapse per project. Default = collapsed: this
+        // section is rarely the user's focus and can grow long on long-lived
+        // projects (this very session has 1300+ orphan subagents).
+        const orphanStateKey = 'orphanExpanded:' + projectPath;
+        const expanded = localStorage.getItem(orphanStateKey) === '1';
+
         const orphanGroup = document.createElement('div');
-        orphanGroup.className = 'sidebar-orphan-subagents';
+        orphanGroup.className = 'sidebar-orphan-subagents' + (expanded ? '' : ' collapsed');
+
         const orphanLabel = document.createElement('div');
         orphanLabel.className = 'sidebar-orphan-label';
-        orphanLabel.textContent = 'Orphan subagents';
+        orphanLabel.innerHTML = `<span class="orphan-caret">&#9656;</span> Orphan subagents <span class="orphan-count">${orphans.length}</span>`;
+        orphanLabel.addEventListener('click', () => {
+          const isCollapsed = orphanGroup.classList.toggle('collapsed');
+          localStorage.setItem(orphanStateKey, isCollapsed ? '0' : '1');
+        });
         orphanGroup.appendChild(orphanLabel);
+
         for (const orphan of orphans) {
           orphanGroup.appendChild(buildSubagentItem(orphan));
         }
@@ -435,7 +447,7 @@ function renderProjects(projects, resort) {
 
     const result = processProjectSessions(project, resort);
     if (!result) continue;
-    const { filtered, visible, older, sortOrderEntry } = result;
+    const { filtered, visible, older, subagentIndex, sortOrderEntry } = result;
     newSortedOrder.push(sortOrderEntry);
     const fId = folderId(project.projectPath);
 
@@ -474,7 +486,7 @@ function renderProjects(projects, resort) {
     newBtn.title = 'New session';
     header.appendChild(newBtn);
 
-    const sessionsList = buildSessionsList(fId, visible, older, subagentIndex);
+    const sessionsList = buildSessionsList(fId, visible, older, subagentIndex, project.projectPath);
 
     // Auto-collapse if most recent session is older than threshold, or project matched with no sessions
     if (project._projectMatchedOnly) {
@@ -526,7 +538,7 @@ function renderProjects(projects, resort) {
       wtNewBtn.title = 'New session in worktree';
       wtHeader.appendChild(wtNewBtn);
 
-      const wtSessionsList = buildSessionsList(wtFId, wtResult.visible, wtResult.older, wtResult.subagentIndex);
+      const wtSessionsList = buildSessionsList(wtFId, wtResult.visible, wtResult.older, wtResult.subagentIndex, wt.projectPath);
       wtSessionsList.className = 'worktree-sessions';
 
       // Auto-collapse worktree if stale
