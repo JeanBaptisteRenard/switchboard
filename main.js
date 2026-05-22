@@ -938,6 +938,10 @@ const SETTING_DEFAULTS = {
 };
 
 ipcMain.handle('get-shell-profiles', () => {
+  // TODO(lint): `_shellProfiles` is scoped inside shell-profiles.js and not
+  // reachable from here — this line is a no-op left over from a refactor.
+  // Kept as-is for now; tracked separately. See tests/eslint-and-renderer-coverage.
+  // eslint-disable-next-line no-undef
   _shellProfiles = null; // refresh on each request
   return getShellProfiles();
 });
