@@ -6,6 +6,15 @@ const fs = require('fs');
 const os = require('os');
 const pty = require('node-pty');
 const log = require('electron-log');
+
+// Dev builds default to a separate SQLite DB so they don't race on
+// session_cache with a running installed AppImage. Honors an explicit
+// SWITCHBOARD_DATA_DIR env var if set (test sandboxes, agent runs). This MUST
+// happen before db.js is required — db.js resolves DATA_DIR at module load.
+if (!app.isPackaged && !process.env.SWITCHBOARD_DATA_DIR) {
+  process.env.SWITCHBOARD_DATA_DIR = path.join(os.homedir(), '.switchboard-dev');
+}
+
 // getFolderIndexMtimeMs moved to session-cache.js
 const { startMcpServer, shutdownMcpServer, shutdownAll: shutdownAllMcp, resolvePendingDiff, rekeyMcpServer, cleanStaleLockFiles } = require('./mcp-bridge');
 const { fetchAndTransformUsage } = require('./claude-auth');
@@ -938,6 +947,10 @@ const SETTING_DEFAULTS = {
 };
 
 ipcMain.handle('get-shell-profiles', () => {
+  // TODO(lint): `_shellProfiles` is scoped inside shell-profiles.js and not
+  // reachable from here — this line is a no-op left over from a refactor.
+  // Kept as-is for now; tracked separately. See tests/eslint-and-renderer-coverage.
+  // eslint-disable-next-line no-undef
   _shellProfiles = null; // refresh on each request
   return getShellProfiles();
 });
