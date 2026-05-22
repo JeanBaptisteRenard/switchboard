@@ -3,7 +3,7 @@ const fs = require('fs');
 const { Worker } = require('worker_threads');
 const { getFolderIndexMtimeMs } = require('./folder-index-state');
 const { deriveProjectPath } = require('./derive-project-path');
-const { readSessionFile, enumerateSessionFiles, resolveJsonlPath } = require('./read-session-file');
+const { readSessionFile, readSessionDisplayHeader, enumerateSessionFiles, resolveJsonlPath } = require('./read-session-file');
 const { encodeProjectPath } = require('./encode-project-path');
 
 /**
@@ -90,7 +90,10 @@ function refreshFolder(folder, opts = {}) {
   const filePathToDbId = new Map();
   for (const row of cachedSessions) {
     const filePath = resolveJsonlPath(PROJECTS_DIR, row);
-    cachedMap.set(row.sessionId, { modified: row.modified, filePath });
+    // Keep the full row so refresh can merge display-only header updates with
+    // unchanged fields (created, messageCount, textContent) without re-reading
+    // the file body.
+    cachedMap.set(row.sessionId, { ...row, filePath });
     filePathToDbId.set(filePath, row.sessionId);
   }
 
@@ -129,22 +132,18 @@ function refreshFolder(folder, opts = {}) {
   const namesToSet = [];
   const sessionsToDelete = [];
 
-  // Skip the full re-read for already-cached files above this size. Live
-  // Claude session JSONLs grow without bound (can exceed 200 MB); re-reading
-  // and JSON.parsing the whole thing on every fs.watch flush froze the main
-  // process. The cached metadata (summary, slug, customTitle) was captured
-  // when the file was small enough to read, and rarely changes after the
-  // first turn anyway — bump the mtime in the DB so the sidebar reflects
-  // activity, and trust the next cold-start (or a smaller file) to refresh
-  // the rest. Subagent transcripts are usually small and stay under this
-  // threshold; the host conversation's own JSONL is the typical offender.
-  const HUGE_FILE_BYTES = 5 * 1024 * 1024;
+  // Refresh strategy:
+  //   - NEW file (no cache row): full readSessionFile — small at first turn,
+  //     seeds session_cache + FTS body in one shot.
+  //   - EXISTING file (already cached): header-only read (~256 KB / 500 lines).
+  //     Updates display fields (summary, slug, titles, mtime) without reading
+  //     the full body. Avoids re-reading 200+ MB live host-session JSONLs on
+  //     every watcher flush. Side-effect: FTS body for live sessions goes
+  //     stale until the next cold-start (acceptable trade-off).
+  //   - Header read failing (truncated chunk, partial JSON): fall back to a
+  //     mtime-only DB touch so the sidebar still reflects activity.
 
   for (const { filePath, parentSessionId } of filesToScan) {
-    // Check if file mtime changed.
-    // We need the DB sessionId to look up the cache, but we don't know it until after
-    // readSessionFile — for subagents it's sub:<parent>:<agentId>. Use the file path
-    // to find a matching cached entry instead.
     let stat;
     try { stat = fs.statSync(filePath); } catch { continue; }
     const fileMtime = stat.mtime.toISOString();
@@ -158,18 +157,41 @@ function refreshFolder(folder, opts = {}) {
       continue; // unchanged, skip
     }
 
-    // Huge cached file: bump mtime only, skip the multi-hundred-MB readFileSync.
-    if (cachedEntry && stat.size > HUGE_FILE_BYTES) {
-      touchCachedModified(cachedDbId, fileMtime);
-      cachedEntry.modified = fileMtime;
+    if (cachedEntry) {
+      // EXISTING — header-only refresh.
+      const h = readSessionDisplayHeader(filePath, { parentSessionId });
+      if (h) {
+        // Merge: keep cached body/messageCount/created, overlay fresh display fields.
+        const merged = {
+          ...cachedEntry,
+          folder, projectPath,
+          summary: h.summary || cachedEntry.summary,
+          firstPrompt: h.firstPrompt || cachedEntry.firstPrompt,
+          modified: fileMtime,
+          slug: h.slug || cachedEntry.slug,
+          aiTitle: h.aiTitle || cachedEntry.aiTitle,
+          parentSessionId: h.parentSessionId || cachedEntry.parentSessionId,
+          agentId: h.agentId || cachedEntry.agentId,
+          subagentType: h.subagentType || cachedEntry.subagentType,
+          description: h.description || cachedEntry.description,
+        };
+        sessionsToUpsert.push(merged);
+        if (h.customTitle && h.customTitle !== cachedEntry.customTitle) {
+          namesToSet.push({ id: merged.sessionId, name: h.customTitle });
+        }
+      } else {
+        // Header read couldn't extract signal — just bump mtime so sort order stays current.
+        touchCachedModified(cachedDbId, fileMtime);
+        cachedEntry.modified = fileMtime;
+      }
       changed = true;
       continue;
     }
 
-    // File is new or modified — re-read it
+    // NEW file — full readSessionFile so the FTS index gets seeded.
     const s = readSessionFile(filePath, folder, projectPath, { parentSessionId });
     if (s) {
-      currentIds.add(s.sessionId); // ensure we don't delete a newly-read subagent row
+      currentIds.add(s.sessionId);
       sessionsToUpsert.push(s);
       // Title precedence: user rename (session_meta.name) > JSONL custom-title > JSONL ai-title.
       // Only customTitle (Claude /title) promotes to session_meta.name — AI titles must NEVER

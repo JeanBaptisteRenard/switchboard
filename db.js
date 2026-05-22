@@ -182,7 +182,7 @@ const stmts = {
       subagentType = excluded.subagentType, description = excluded.description
   `),
   cacheGetByParent: db.prepare('SELECT * FROM session_cache WHERE parentSessionId = ? ORDER BY created ASC'),
-  cacheGetByFolder: db.prepare('SELECT sessionId, modified, parentSessionId, agentId FROM session_cache WHERE folder = ?'),
+  cacheGetByFolder: db.prepare('SELECT * FROM session_cache WHERE folder = ?'),
   cacheGetFolder: db.prepare('SELECT folder FROM session_cache WHERE sessionId = ?'),
   cacheGetSession: db.prepare('SELECT * FROM session_cache WHERE sessionId = ?'),
   cacheDeleteSession: db.prepare('DELETE FROM session_cache WHERE sessionId = ?'),
