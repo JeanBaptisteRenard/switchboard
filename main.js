@@ -109,11 +109,12 @@ function createWindow() {
     }
   }
 
+  const appTitle = app.isPackaged ? 'Switchboard' : 'Switchboard (dev)';
   mainWindow = new BrowserWindow({
     ...bounds,
     minWidth: 800,
     minHeight: 500,
-    title: 'Switchboard',
+    title: appTitle,
     icon: path.join(__dirname, 'build', 'icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -1550,6 +1551,12 @@ ipcMain.handle('updater-install', () => {
 });
 
 // --- App lifecycle ---
+// Differentiate the dev build from the released binary in the OS task switcher,
+// dock, and About menu by suffixing the app name. No-op in packaged builds.
+if (!app.isPackaged) {
+  app.setName('Switchboard (dev)');
+}
+
 app.whenReady().then(() => {
   buildMenu();
   createWindow();
