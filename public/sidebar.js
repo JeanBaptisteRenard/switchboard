@@ -514,6 +514,12 @@ function renderProjects(projects, resort) {
       wtHideBtn.innerHTML = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
       wtHeader.appendChild(wtHideBtn);
 
+      const wtDeleteBtn = document.createElement('button');
+      wtDeleteBtn.className = 'worktree-delete-btn';
+      wtDeleteBtn.title = 'Delete worktree from disk';
+      wtDeleteBtn.innerHTML = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>';
+      wtHeader.appendChild(wtDeleteBtn);
+
       const wtNewBtn = document.createElement('button');
       wtNewBtn.className = 'project-new-btn worktree-new-btn';
       wtNewBtn.innerHTML = '<svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="6" y1="2" x2="6" y2="10"/><line x1="2" y1="6" x2="10" y2="6"/></svg>';
@@ -676,8 +682,23 @@ function rebindSidebarEvents(projects) {
         loadProjects();
       };
     }
+    const wtDeleteBtn = wtHeader.querySelector('.worktree-delete-btn');
+    if (wtDeleteBtn) {
+      wtDeleteBtn.onclick = async (e) => {
+        e.stopPropagation();
+        const name = wtProject.projectPath.split('/').pop();
+        if (!confirm(`Delete worktree "${name}" from disk?\n\nThis runs "git worktree remove -f" and permanently removes the working tree. This cannot be undone.`)) return;
+        const result = await window.api.deleteWorktree(wtProject.projectPath);
+        if (result && result.ok) {
+          loadProjects();
+        } else {
+          const msg = (result && result.error) ? result.error : 'Unknown error';
+          alert(`Failed to delete worktree: ${msg}`);
+        }
+      };
+    }
     wtHeader.onclick = (e) => {
-      if (e.target.closest('.worktree-new-btn') || e.target.closest('.worktree-hide-btn')) return;
+      if (e.target.closest('.worktree-new-btn') || e.target.closest('.worktree-hide-btn') || e.target.closest('.worktree-delete-btn')) return;
       wtHeader.classList.toggle('collapsed');
     };
   });
