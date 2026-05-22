@@ -30,13 +30,20 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
     return; // directory doesn't exist yet — normal
   }
 
-  if (!session.knownSubagents) {
+  // First walk for this session: pre-populate knownSubagents with every
+  // existing file silently so we don't flood the renderer with spawn/complete
+  // events for agents that already finished before Switchboard started watching.
+  // Files modified in the last 60s get a normal lifecycle; older ones are
+  // recorded as already-completed without IPC.
+  const isBootstrap = !session.knownSubagents;
+  if (isBootstrap) {
     session.knownSubagents = new Map();
   }
 
   const mainWindow = getMainWindow();
   const now = Date.now();
   const STABLE_MS = 30000; // 30 seconds of no mtime advance → completed
+  const BOOTSTRAP_LIVE_MS = 60000; // file modified in last 60s = still alive at boot
 
   for (const file of files) {
     // agent-<agentId>.jsonl
@@ -52,7 +59,19 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
     const known = session.knownSubagents.get(agentId);
 
     if (!known) {
-      // First sighting — emit subagent-spawned
+      if (isBootstrap) {
+        // Cold-start initialization — record silently without firing IPC.
+        // Treat recently-modified files as still-active so they can complete
+        // through the normal lifecycle; treat older ones as already done.
+        const looksAlive = (now - mtimeMs) < BOOTSTRAP_LIVE_MS;
+        session.knownSubagents.set(agentId, {
+          mtimeMs,
+          completed: !looksAlive,
+          _completedAt: looksAlive ? null : now,
+        });
+        continue;
+      }
+      // First sighting post-bootstrap — real spawn event
       const meta = readSubagentMeta(filePath) || {};
       session.knownSubagents.set(agentId, { mtimeMs, completed: false });
       log.info(`[subagent-spawn] parent=${sessionId} agentId=${agentId} type=${meta.agentType || 'unknown'}`);
