@@ -8,6 +8,34 @@ let currentViewerSessionId = null;
 // Reset on each showJsonlViewer call. Key: "<contextSessionId>|<desc>|<type>"
 let agentMatchCounters = {};
 
+// --- Live subagent tracking ---
+// Set of agentIds that are currently live (spawned but not yet completed).
+// Keyed as "<parentSessionId>:<agentId>" so it's globally unique.
+const liveSubagents = new Set();
+
+// Register IPC listeners for subagent lifecycle events (called once at module load).
+(function initSubagentListeners() {
+  if (!window.api) return; // guard for non-Electron contexts
+  window.api.onSubagentSpawned((payload) => {
+    const key = payload.parentSessionId + ':' + payload.agentId;
+    liveSubagents.add(key);
+  });
+  window.api.onSubagentCompleted((payload) => {
+    const key = payload.parentSessionId + ':' + payload.agentId;
+    liveSubagents.delete(key);
+    // Notify any active watch container so it can stop the watch and hide the indicator
+    document.querySelectorAll('[data-subagent-watch-key="' + key + '"]').forEach(el => {
+      el.dispatchEvent(new CustomEvent('subagent-completed-internal'));
+    });
+  });
+  window.api.onSubagentWatchEvent((payload) => {
+    const key = payload.parentSessionId + ':' + payload.agentId;
+    document.querySelectorAll('[data-subagent-watch-key="' + key + '"]').forEach(el => {
+      el.dispatchEvent(new CustomEvent('subagent-watch-data', { detail: payload }));
+    });
+  });
+})()
+
 function renderJsonlText(text) {
   if (window.marked) {
     // Escape XML/HTML-like tags so they render as visible text,
@@ -237,10 +265,24 @@ const toolRenderers = {
 
     let expanded = false;
     let nestedContainer = null;
+    let activeWatchId = null;
+    let liveIndicator = null;
+
+    function stopWatch() {
+      if (activeWatchId !== null) {
+        window.api.stopSubagentWatch(activeWatchId).catch(() => {});
+        activeWatchId = null;
+      }
+      if (liveIndicator) {
+        liveIndicator.remove();
+        liveIndicator = null;
+      }
+    }
 
     el.addEventListener('click', async () => {
       if (expanded && nestedContainer) {
-        // Collapse
+        // Collapse — stop live watch
+        stopWatch();
         nestedContainer.remove();
         nestedContainer = null;
         expanded = false;
@@ -290,6 +332,53 @@ const toolRenderers = {
       expanded = true;
       const caret = el.querySelector('.jsonl-agent-caret');
       if (caret) caret.innerHTML = '&#9660;';
+
+      // Start live watch if this subagent is still running
+      const watchKey = parentSessionId + ':' + match.agentId;
+      if (liveSubagents.has(watchKey)) {
+        // Attach the watch key to nestedContainer for event routing
+        nestedContainer.dataset.subagentWatchKey = watchKey;
+
+        const watchResult = await window.api.startSubagentWatch(parentSessionId, match.agentId);
+        if (watchResult && watchResult.watchId) {
+          activeWatchId = watchResult.watchId;
+
+          // Show "● live" indicator in the block header
+          liveIndicator = document.createElement('span');
+          liveIndicator.className = 'jsonl-agent-live';
+          liveIndicator.textContent = '● live';
+          const toolHeader = el.querySelector('.jsonl-tool-header');
+          if (toolHeader) toolHeader.appendChild(liveIndicator);
+
+          // Stream new entries into nestedContainer
+          nestedContainer.addEventListener('subagent-watch-data', (evt) => {
+            const { entries: newEntries } = evt.detail;
+            const merged = mergeLocalCommandEntries(newEntries);
+            const appendResultMap = new Map();
+            for (const entry of merged) {
+              const blocks2 = entry.message?.content || entry.content;
+              if (!Array.isArray(blocks2)) continue;
+              for (const b of blocks2) {
+                if (b.type === 'tool_result' && b.tool_use_id) {
+                  appendResultMap.set(b.tool_use_id, b.content || b.output || '');
+                }
+              }
+            }
+            const savedId = currentViewerSessionId;
+            currentViewerSessionId = subSessionId;
+            for (const entry of merged) {
+              const entryEl = renderJsonlEntry(entry, appendResultMap);
+              if (entryEl) nestedContainer.appendChild(entryEl);
+            }
+            currentViewerSessionId = savedId;
+          });
+
+          // Stop watch when subagent completes
+          nestedContainer.addEventListener('subagent-completed-internal', () => {
+            stopWatch();
+          });
+        }
+      }
     });
 
     return el;

@@ -15,8 +15,10 @@ function readFolderFromFilesystem(folder) {
   const indexMtimeMs = getFolderIndexMtimeMs(folderPath);
 
   for (const { filePath, parentSessionId } of enumerateSessionFiles(folderPath)) {
-    const s = readSessionFile(filePath, folder, projectPath, { parentSessionId });
-    if (s) sessions.push(s);
+    try {
+      const s = readSessionFile(filePath, folder, projectPath, { parentSessionId });
+      if (s) sessions.push(s);
+    } catch {}
   }
 
   return { folder, projectPath, sessions, indexMtimeMs };

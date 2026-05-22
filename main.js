@@ -80,6 +80,10 @@ const MAX_BUFFER_SIZE = 256 * 1024;
 const activeSessions = new Map();
 let mainWindow = null;
 
+// Subagent live-tail watchers (watchId → { filePath, parentSessionId, agentId })
+const subagentWatchers = new Map();
+let subagentWatcherSeq = 0;
+
 function createWindow() {
   // Restore saved window bounds
   const savedBounds = getSetting('global')?.windowBounds;
@@ -202,6 +206,11 @@ function createWindow() {
       }
       activeSessions.delete(id);
     }
+    // Release all subagent file watchers
+    for (const [, entry] of subagentWatchers) {
+      try { fs.unwatchFile(entry.filePath); } catch {}
+    }
+    subagentWatchers.clear();
     mainWindow = null;
   });
 }
@@ -938,6 +947,57 @@ ipcMain.handle('list-subagents', (_event, parentSessionId) => {
     modified: r.modified,
     messageCount: r.messageCount,
   }));
+});
+
+// ── Subagent live-tail watchers ──────────────────────────────────────────────
+
+ipcMain.handle('start-subagent-watch', (_event, parentSessionId, agentId) => {
+  const row = getCachedSession('sub:' + parentSessionId + ':' + agentId);
+  if (!row) return { error: 'Subagent not found in cache' };
+  const filePath = path.join(PROJECTS_DIR, row.folder, parentSessionId, 'subagents', 'agent-' + agentId + '.jsonl');
+
+  const watchId = ++subagentWatcherSeq;
+  let offset = 0;
+  // Seek to EOF so we only deliver *new* lines
+  try { offset = fs.statSync(filePath).size; } catch {}
+
+  function readNewEntries() {
+    try {
+      const stat = fs.statSync(filePath);
+      if (stat.size <= offset) return;
+      const buf = Buffer.alloc(stat.size - offset);
+      const fd = fs.openSync(filePath, 'r');
+      const bytesRead = fs.readSync(fd, buf, 0, buf.length, offset);
+      fs.closeSync(fd);
+      if (bytesRead <= 0) return;
+      offset += bytesRead;
+      const text = buf.toString('utf8', 0, bytesRead);
+      const entries = [];
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue;
+        try { entries.push(JSON.parse(line)); } catch {}
+      }
+      if (entries.length > 0 && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('subagent-watch-event', { parentSessionId, agentId, entries });
+      }
+    } catch {}
+  }
+
+  // fs.watchFile gives reliable polling on Linux where inotify can be unreliable for JSONL appends
+  fs.watchFile(filePath, { interval: 1000, persistent: false }, readNewEntries);
+
+  subagentWatchers.set(watchId, { filePath, parentSessionId, agentId });
+  log.info(`[subagent-watch] start watchId=${watchId} parent=${parentSessionId} agentId=${agentId}`);
+  return { watchId };
+});
+
+ipcMain.handle('stop-subagent-watch', (_event, watchId) => {
+  const entry = subagentWatchers.get(watchId);
+  if (!entry) return { ok: false };
+  fs.unwatchFile(entry.filePath);
+  subagentWatchers.delete(watchId);
+  log.info(`[subagent-watch] stop watchId=${watchId}`);
+  return { ok: true };
 });
 
 ipcMain.handle('archive-session', (_event, sessionId, archived) => {
