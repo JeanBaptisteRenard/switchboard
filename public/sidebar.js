@@ -375,7 +375,7 @@ function renderProjects(projects, resort) {
   }
 
   // Build the sessions list DOM (shared between projects and worktrees)
-  function buildSessionsList(fId, visible, older, subagentIndex) {
+  function buildSessionsList(fId, visible, older, subagentIndex, projectPath) {
     const sessionsList = document.createElement('div');
     sessionsList.className = 'project-sessions';
     sessionsList.id = 'sessions-' + fId;
@@ -416,7 +416,7 @@ function renderProjects(projects, resort) {
         // Persist expand/collapse per project. Default = collapsed: this
         // section is rarely the user's focus and can grow long on long-lived
         // projects (this very session has 1300+ orphan subagents).
-        const orphanStateKey = 'orphanExpanded:' + project.projectPath;
+        const orphanStateKey = 'orphanExpanded:' + projectPath;
         const expanded = localStorage.getItem(orphanStateKey) === '1';
 
         const orphanGroup = document.createElement('div');
@@ -486,7 +486,7 @@ function renderProjects(projects, resort) {
     newBtn.title = 'New session';
     header.appendChild(newBtn);
 
-    const sessionsList = buildSessionsList(fId, visible, older, subagentIndex);
+    const sessionsList = buildSessionsList(fId, visible, older, subagentIndex, project.projectPath);
 
     // Auto-collapse if most recent session is older than threshold, or project matched with no sessions
     if (project._projectMatchedOnly) {
@@ -538,7 +538,7 @@ function renderProjects(projects, resort) {
       wtNewBtn.title = 'New session in worktree';
       wtHeader.appendChild(wtNewBtn);
 
-      const wtSessionsList = buildSessionsList(wtFId, wtResult.visible, wtResult.older, wtResult.subagentIndex);
+      const wtSessionsList = buildSessionsList(wtFId, wtResult.visible, wtResult.older, wtResult.subagentIndex, wt.projectPath);
       wtSessionsList.className = 'worktree-sessions';
 
       // Auto-collapse worktree if stale

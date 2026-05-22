@@ -129,6 +129,9 @@ function createWindow() {
   }
 
   mainWindow.loadFile(path.join(__dirname, 'public', 'index.html'));
+  mainWindow.webContents.on('console-message', (_e, level, message, line, sourceId) => {
+    if (level >= 2) log.error(`[renderer:${level}] ${sourceId}:${line} ${message}`);
+  });
 
   // Open external links in the system browser instead of a child BrowserWindow
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
