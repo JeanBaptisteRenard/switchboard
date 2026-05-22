@@ -496,6 +496,21 @@ ipcMain.handle('unwatch-file', (_event, filePath) => {
   return { ok: true };
 });
 
+// Full re-scan triggered from the UI. Re-reads every jsonl file in the worker
+// thread, which is the only path that rebuilds search_fts with the live tail
+// of active sessions (refreshFolder uses a header-only read by design — see
+// session-cache.js). Concurrent callers share the same in-flight worker via
+// populateCacheViaWorker's internal Promise.
+ipcMain.handle('rebuild-cache', async () => {
+  try {
+    await populateCacheViaWorker();
+    return { ok: true };
+  } catch (err) {
+    console.error('Error rebuilding cache:', err);
+    return { ok: false, error: err.message };
+  }
+});
+
 ipcMain.handle('get-projects', async (_event, showArchived) => {
   try {
     const needsPopulate = !isCachePopulated() || !isSearchIndexPopulated();

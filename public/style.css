@@ -341,6 +341,23 @@ body { display: flex; flex-direction: column; }
   color: #ffffff;
 }
 
+#search-refresh-btn {
+  position: absolute;
+  right: 42px;
+  top: 0;
+  height: calc(100% - 14px);
+  display: flex;
+  align-items: center;
+  background: none;
+  border: none;
+  color: #5a5a70;
+  cursor: pointer;
+  padding: 0 4px;
+  transition: color 0.15s;
+}
+#search-refresh-btn:hover { color: #b0b0c4; }
+#search-refresh-btn.spinning svg { animation: spin-dot 0.8s linear infinite; }
+
 
 /* ---- Scrollable content ---- */
 #sidebar-content {
