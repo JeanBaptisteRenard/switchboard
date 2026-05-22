@@ -77,6 +77,7 @@ const {
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
   searchByType, isSearchIndexPopulated, searchFtsRecreated,
   getSetting, setSetting, deleteSetting,
+  getDailyActivity,
   closeDb,
 } = require('./db');
 
@@ -620,108 +621,69 @@ ipcMain.handle('get-stats', () => {
   }
 });
 
-// --- IPC: refresh-stats (run /stats + /usage via PTY) ---
-ipcMain.handle('refresh-stats', async () => {
-  // For stats, use the configured shell profile
-  const globalSettings = getSetting('global') || {};
-  const statsProfileId = globalSettings.shellProfile || SETTING_DEFAULTS.shellProfile;
-  const statsShellProfile = resolveShell(statsProfileId);
-  const statsShell = statsShellProfile.path;
-  const statsShellExtraArgs = statsShellProfile.args || [];
-  const ptyEnv = {
-    ...cleanPtyEnv,
-    TERM: 'xterm-256color',
-    COLORTERM: 'truecolor',
-    TERM_PROGRAM: 'iTerm.app',
-    TERM_PROGRAM_VERSION: '3.6.6',
-    FORCE_COLOR: '3',
-    ITERM_SESSION_ID: '1',
-  };
-
-  // Helper: spawn claude with args, collect output, auto-accept trust, kill when idle
-  // waitFor: optional regex tested against stripped output — finish only when matched
-  function runClaude(args, { timeoutMs = 15000, waitFor = null } = {}) {
-    return new Promise((resolve) => {
-      let output = '';
-      let settled = false;
-      let trustAccepted = false;
-      // Track idle: ✳ in OSC title means Claude is idle and waiting for input
-      let sawActivity = false;
-
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        try { p.kill(); } catch {}
-        resolve(output);
-      };
-
-      const claudeCmd = `claude ${args}`;
-      const p = pty.spawn(statsShell, shellArgs(statsShell, claudeCmd, statsShellExtraArgs), {
-        name: 'xterm-256color',
-        cols: 120,
-        rows: 40,
-        cwd: os.homedir(),
-        env: ptyEnv,
-      });
-
-      const strip = (s) => s
-        .replace(/\x1b\[[^@-~]*[@-~]/g, '')
-        .replace(/\x1b\][^\x07]*\x07/g, '')
-        .replace(/\x1b[^[\]].?/g, '');
-
-      p.onData((data) => {
-        output += data;
-
-        // Auto-accept trust directory prompt (Enter selects "1. Yes")
-        if (!trustAccepted) {
-          if (/trust\s*this\s*folder/i.test(strip(output))) {
-            trustAccepted = true;
-            try { p.write('\r'); } catch {}
-            return;
-          }
-        }
-
-        // If waitFor is set, finish when that pattern appears in stripped output
-        if (waitFor) {
-          if (waitFor.test(strip(output))) {
-            finish();
-          }
-          return;
-        }
-
-        // Default: detect busy→idle transition via OSC title containing ✳
-        if (!sawActivity) {
-          const oscTitle = data.match(/\x1b\]0;([^\x07\x1b]*)/);
-          if (oscTitle) {
-            const first = oscTitle[1].charAt(0);
-            if (first.charCodeAt(0) >= 0x2800 && first.charCodeAt(0) <= 0x28FF) {
-              sawActivity = true;
-            }
-          }
-        } else if (data.includes('\u2733')) {
-          finish();
-        }
-      });
-
-      p.onExit(() => finish());
-      setTimeout(finish, timeoutMs);
-    });
-  }
-
+// --- IPC: get-stats-from-db ---
+// Builds a stats object from session_cache so the heatmap reflects real usage
+// including subagent sessions (which claude /stats silently ignores) and
+// periods where Claude already rotated the parent JSONL files off disk.
+ipcMain.handle('get-stats-from-db', () => {
   try {
-    // Run /stats via PTY (for heatmap/chart data) and fetch usage via API in parallel
-    const [, usage] = await Promise.all([
-      runClaude('"/stats"', { waitFor: /streak/i, timeoutMs: 10000 }),
-      fetchAndTransformUsage().catch(() => ({})),
-    ]);
+    const rows = getDailyActivity(); // [{date, messageCount, sessionCount}]
+    let totalMessages = 0;
+    let totalSessions = 0;
+    let firstSessionDate = null;
+    for (const row of rows) {
+      totalMessages += row.messageCount || 0;
+      totalSessions += row.sessionCount || 0;
+      if (!firstSessionDate) firstSessionDate = row.date;
+    }
+    const lastComputedDate = new Date().toISOString().slice(0, 10);
+    return {
+      dailyActivity: rows, // [{date, messageCount, sessionCount}]
+      totalMessages,
+      totalSessions,
+      firstSessionDate: firstSessionDate || lastComputedDate,
+      lastComputedDate,
+      // dailyModelTokens intentionally omitted — not tracked per-day in session_cache
+      modelUsage: {},
+    };
+  } catch (err) {
+    log.error('Error building stats from DB:', err);
+    return null;
+  }
+});
 
-    // Read refreshed stats cache
+// --- IPC: refresh-stats (fetch /usage + build stats from DB; /stats PTY removed) ---
+ipcMain.handle('refresh-stats', async () => {
+  try {
+    // /stats PTY call removed — heatmap is now sourced from session_cache via
+    // get-stats-from-db. Only /usage is fetched here (rate-limits panel).
+    const usage = await fetchAndTransformUsage().catch(() => ({}));
+
+    // Build stats from DB (same as get-stats-from-db) so the caller gets both
+    // at once and the renderer can update heatmap + usage in a single round-trip.
     let stats = null;
     try {
-      if (fs.existsSync(STATS_CACHE_PATH)) {
-        stats = JSON.parse(fs.readFileSync(STATS_CACHE_PATH, 'utf8'));
+      const rows = getDailyActivity();
+      let totalMessages = 0;
+      let totalSessions = 0;
+      let firstSessionDate = null;
+      for (const row of rows) {
+        totalMessages += row.messageCount || 0;
+        totalSessions += row.sessionCount || 0;
+        if (!firstSessionDate) firstSessionDate = row.date;
       }
-    } catch {}
+      const lastComputedDate = new Date().toISOString().slice(0, 10);
+      stats = {
+        dailyActivity: rows,
+        totalMessages,
+        totalSessions,
+        firstSessionDate: firstSessionDate || lastComputedDate,
+        lastComputedDate,
+        modelUsage: {},
+      };
+    } catch (dbErr) {
+      log.error('Error building stats from DB in refresh-stats:', dbErr);
+    }
 
     return { stats, usage: usage || {} };
   } catch (err) {

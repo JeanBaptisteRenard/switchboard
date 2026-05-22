@@ -408,6 +408,26 @@ function deleteSetting(key) {
   stmts.settingsDelete.run(key);
 }
 
+// --- Daily activity aggregate (for stats heatmap) ---
+
+// Returns [{date: 'YYYY-MM-DD', messageCount, sessionCount}, ...] sorted ASC.
+// Aggregates ALL rows in session_cache (parent sessions + subagents) so the
+// heatmap reflects real usage regardless of whether Claude rotated the parent
+// JSONL files.
+function getDailyActivity() {
+  return db.prepare(`
+    SELECT
+      substr(modified, 1, 10) AS date,
+      SUM(messageCount)       AS messageCount,
+      COUNT(*)                AS sessionCount
+    FROM session_cache
+    WHERE modified IS NOT NULL
+      AND length(modified) >= 10
+    GROUP BY date
+    ORDER BY date ASC
+  `).all();
+}
+
 function closeDb() {
   try { db.close(); } catch {}
 }
@@ -421,5 +441,6 @@ module.exports = {
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
   searchByType, isSearchIndexPopulated, searchFtsRecreated,
   getSetting, setSetting, deleteSetting,
+  getDailyActivity,
   closeDb,
 };
