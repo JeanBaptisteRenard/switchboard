@@ -343,7 +343,7 @@ body { display: flex; flex-direction: column; }
 
 #search-refresh-btn {
   position: absolute;
-  right: 42px;
+  right: 60px;
   top: 0;
   height: calc(100% - 14px);
   display: flex;
