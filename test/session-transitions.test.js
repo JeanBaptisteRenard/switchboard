@@ -27,7 +27,10 @@ function makeMockWindow() {
   };
 }
 
-/** Initialize the module with mocks. Returns the recorded-events array. */
+/** Initialize the module with mocks. Returns the recorded-events array.
+ *  Real stubs (read by detectSubagentTransitions): getMainWindow, log.
+ *  Unused-but-required-by-init: PROJECTS_DIR, activeSessions, rekeyMcpServer
+ *  (only consumed by detectSessionTransitions, which these tests don't exercise). */
 function setupModule() {
   const win = makeMockWindow();
   init({
