@@ -20,8 +20,9 @@ function init(ctx) {
 
 /** Walk <folder>/<sessionId>/subagents/ and detect new or completed subagent files.
  *  Mutates session.knownSubagents (Map<agentId, { mtimeMs, completed }>).
- *  Emits IPC 'subagent-spawned' and 'subagent-completed' via mainWindow. */
-function detectSubagentTransitions(sessionId, session, folderPath) {
+ *  Emits IPC 'subagent-spawned' and 'subagent-completed' via mainWindow.
+ *  `now` is injectable so callers (tests) can freeze the clock for determinism. */
+function detectSubagentTransitions(sessionId, session, folderPath, now = Date.now()) {
   const subagentsDir = path.join(folderPath, sessionId, 'subagents');
   let files;
   try {
@@ -41,7 +42,6 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
   }
 
   const mainWindow = getMainWindow();
-  const now = Date.now();
   const STABLE_MS = 30000; // 30 seconds of no mtime advance → completed
   const BOOTSTRAP_LIVE_MS = 60000; // file modified in last 60s = still alive at boot
 

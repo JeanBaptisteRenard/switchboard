@@ -41,15 +41,15 @@ function setupModule() {
 }
 
 /** Create N agent jsonl files under <folder>/<sessionId>/subagents/ and
- *  set their mtimes to (now - ageMs). Returns the subagents dir. */
-function seedAgents(folder, sessionId, agents) {
+ *  set their mtimes to (anchor - ageMs). Returns the subagents dir. */
+function seedAgents(folder, sessionId, agents, anchor = Date.now()) {
   const subDir = path.join(folder, sessionId, 'subagents');
   fs.mkdirSync(subDir, { recursive: true });
   for (const { id, ageMs = 0, content = '' } of agents) {
     const filePath = path.join(subDir, `agent-${id}.jsonl`);
     fs.writeFileSync(filePath, content, 'utf8');
     if (ageMs) {
-      const t = (Date.now() - ageMs) / 1000;
+      const t = (anchor - ageMs) / 1000;
       fs.utimesSync(filePath, t, t);
     }
   }
@@ -61,12 +61,13 @@ test('bootstrap call with 5 pre-existing subagents emits zero events and populat
   const tmp = mkTmp();
   try {
     const sessionId = 'parent-session';
+    const now = Date.now();
     seedAgents(tmp, sessionId, [
       { id: 'a1' }, { id: 'a2' }, { id: 'a3' }, { id: 'a4' }, { id: 'a5' },
-    ]);
+    ], now);
 
     const session = {}; // knownSubagents undefined → bootstrap
-    detectSubagentTransitions(sessionId, session, tmp);
+    detectSubagentTransitions(sessionId, session, tmp, now);
 
     assert.equal(events.length, 0, 'bootstrap must not emit IPC');
     assert.ok(session.knownSubagents instanceof Map);
@@ -81,10 +82,11 @@ test('bootstrap marks an old-mtime agent (>60s) as completed: true', () => {
   const tmp = mkTmp();
   try {
     const sessionId = 'parent';
-    seedAgents(tmp, sessionId, [{ id: 'oldie', ageMs: 120_000 }]); // 2 minutes old
+    const now = Date.now();
+    seedAgents(tmp, sessionId, [{ id: 'oldie', ageMs: 120_000 }], now); // 2 minutes old
 
     const session = {};
-    detectSubagentTransitions(sessionId, session, tmp);
+    detectSubagentTransitions(sessionId, session, tmp, now);
 
     assert.equal(events.length, 0);
     const entry = session.knownSubagents.get('oldie');
@@ -101,10 +103,11 @@ test('bootstrap marks a fresh-mtime agent as completed: false (lifecycle continu
   const tmp = mkTmp();
   try {
     const sessionId = 'parent';
-    seedAgents(tmp, sessionId, [{ id: 'fresh', ageMs: 5_000 }]); // 5s old, well under 60s
+    const now = Date.now();
+    seedAgents(tmp, sessionId, [{ id: 'fresh', ageMs: 5_000 }], now); // 5s old, well under 60s
 
     const session = {};
-    detectSubagentTransitions(sessionId, session, tmp);
+    detectSubagentTransitions(sessionId, session, tmp, now);
 
     assert.equal(events.length, 0, 'bootstrap must still be silent for fresh agents');
     const entry = session.knownSubagents.get('fresh');
@@ -121,16 +124,17 @@ test('post-bootstrap: a brand-new agent file emits exactly one subagent-spawned 
   const tmp = mkTmp();
   try {
     const sessionId = 'parent';
+    const now = Date.now();
     // First, bootstrap with empty subagents dir
     fs.mkdirSync(path.join(tmp, sessionId, 'subagents'), { recursive: true });
     const session = {};
-    detectSubagentTransitions(sessionId, session, tmp);
+    detectSubagentTransitions(sessionId, session, tmp, now);
     assert.equal(events.length, 0);
     assert.equal(session.knownSubagents.size, 0);
 
     // Now drop in a new agent file and re-run
-    seedAgents(tmp, sessionId, [{ id: 'newcomer' }]);
-    detectSubagentTransitions(sessionId, session, tmp);
+    seedAgents(tmp, sessionId, [{ id: 'newcomer' }], now);
+    detectSubagentTransitions(sessionId, session, tmp, now);
 
     assert.equal(events.length, 1, `expected 1 event, got ${events.length}`);
     assert.equal(events[0].channel, 'subagent-spawned');
@@ -147,17 +151,18 @@ test('post-bootstrap with no new agents emits zero events (IPC-flood regression)
   const tmp = mkTmp();
   try {
     const sessionId = 'parent';
-    seedAgents(tmp, sessionId, [{ id: 'a' }, { id: 'b' }, { id: 'c' }]);
+    const now = Date.now();
+    seedAgents(tmp, sessionId, [{ id: 'a' }, { id: 'b' }, { id: 'c' }], now);
 
     const session = {};
     // Bootstrap absorbs all three silently
-    detectSubagentTransitions(sessionId, session, tmp);
+    detectSubagentTransitions(sessionId, session, tmp, now);
     assert.equal(events.length, 0);
 
     // Subsequent flushes with no new files must stay silent
-    detectSubagentTransitions(sessionId, session, tmp);
-    detectSubagentTransitions(sessionId, session, tmp);
-    detectSubagentTransitions(sessionId, session, tmp);
+    detectSubagentTransitions(sessionId, session, tmp, now);
+    detectSubagentTransitions(sessionId, session, tmp, now);
+    detectSubagentTransitions(sessionId, session, tmp, now);
 
     assert.equal(events.length, 0, 'no events should fire when nothing changed');
   } finally {
@@ -170,7 +175,8 @@ test('completion: agent alive on call N, stable mtime for >30s on call N+1, emit
   const tmp = mkTmp();
   try {
     const sessionId = 'parent';
-    const subDir = seedAgents(tmp, sessionId, [{ id: 'slow' }]);
+    const now = Date.now();
+    const subDir = seedAgents(tmp, sessionId, [{ id: 'slow' }], now);
     const filePath = path.join(subDir, 'agent-slow.jsonl');
     const mtimeMs = fs.statSync(filePath).mtimeMs;
 
@@ -181,10 +187,10 @@ test('completion: agent alive on call N, stable mtime for >30s on call N+1, emit
     session.knownSubagents.set('slow', {
       mtimeMs, // same as file's actual mtime → "mtime stable"
       completed: false,
-      _stableStart: Date.now() - 31_000, // stability started >30s ago
+      _stableStart: now - 31_000, // stability started >30s ago
     });
 
-    detectSubagentTransitions(sessionId, session, tmp);
+    detectSubagentTransitions(sessionId, session, tmp, now);
 
     assert.equal(events.length, 1, `expected 1 completion event, got ${events.length}: ${JSON.stringify(events)}`);
     assert.equal(events[0].channel, 'subagent-completed');
