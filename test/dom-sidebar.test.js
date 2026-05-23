@@ -148,6 +148,30 @@ test('renderProjects: orphan group has stable id for morphdom reconciliation', (
   }
 });
 
+test('getExpandedSubagents: one-time GC prunes stale session ids from localStorage', () => {
+  // Fix 4: on first call to getExpandedSubagents(), stale session ids (not in
+  // sessionMap) are removed from the stored set. This prevents unbounded growth
+  // of the key across long-lived instances.
+  const ctx = setupSidebarDom();
+  try {
+    // Populate sessionMap with one known session.
+    ctx.window.sessionMap.set('live-session', {});
+
+    // Seed localStorage with two entries: one stale, one live.
+    ctx.window.localStorage.setItem('expandedSubagents', JSON.stringify(['stale-id', 'live-session']));
+
+    // Trigger GC by calling getExpandedSubagents (via a render).
+    ctx.sidebar.renderProjects([makeSampleProject()], true);
+
+    // After GC, stale-id must have been removed.
+    const stored = JSON.parse(ctx.window.localStorage.getItem('expandedSubagents') || '[]');
+    assert.ok(!stored.includes('stale-id'), 'stale-id must be pruned by GC');
+    assert.ok(stored.includes('live-session'), 'live-session must survive GC');
+  } finally {
+    ctx.destroy();
+  }
+});
+
 test('renderProjects: result destructure is complete — re-render works (no stale closures)', () => {
   // This test would have caught bug #1 directly: if renderProjects's
   // destructure of processProjectSessions() result is incomplete and the
