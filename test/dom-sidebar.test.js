@@ -125,6 +125,29 @@ test('renderProjects: empty project does not crash, sidebar stays empty', () => 
   }
 });
 
+test('renderProjects: orphan group has stable id for morphdom reconciliation', () => {
+  // Fix 3: orphanGroup.id = 'orphan-' + fId prevents morphdom from rebuilding
+  // the element on every render (which caused minor flicker).
+  const ctx = setupSidebarDom();
+  const projectPath = '/home/dev/myproj';
+  try {
+    ctx.sidebar.renderProjects([makeSampleProject({ projectPath })], true);
+
+    const orphanGroup = ctx.document.querySelector('.sidebar-orphan-subagents');
+    assert.ok(orphanGroup, 'orphan group must exist');
+    assert.ok(orphanGroup.id, 'orphan group must have an id for morphdom keying');
+    assert.match(orphanGroup.id, /^orphan-/, 'id must start with orphan-');
+
+    // Re-render should reuse the same DOM element (morphdom won't recreate it).
+    const idBefore = orphanGroup.id;
+    ctx.sidebar.renderProjects([makeSampleProject({ projectPath })], false);
+    const orphanGroupAfter = ctx.document.querySelector('.sidebar-orphan-subagents');
+    assert.equal(orphanGroupAfter.id, idBefore, 'orphan group id must be stable across re-renders');
+  } finally {
+    ctx.destroy();
+  }
+});
+
 test('renderProjects: result destructure is complete — re-render works (no stale closures)', () => {
   // This test would have caught bug #1 directly: if renderProjects's
   // destructure of processProjectSessions() result is incomplete and the

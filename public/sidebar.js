@@ -421,6 +421,9 @@ function renderProjects(projects, resort) {
 
         const orphanGroup = document.createElement('div');
         orphanGroup.className = 'sidebar-orphan-subagents' + (expanded ? '' : ' collapsed');
+        // Stable id so morphdom reconciles the element instead of rebuilding
+        // it from scratch on every render, preventing minor flicker.
+        orphanGroup.id = 'orphan-' + fId;
 
         const orphanLabel = document.createElement('div');
         orphanLabel.className = 'sidebar-orphan-label';
