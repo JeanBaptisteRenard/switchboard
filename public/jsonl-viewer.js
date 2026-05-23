@@ -259,7 +259,7 @@ const toolRenderers = {
     if (!parentSessionId) return el;
 
     // Determine which Nth match this block is for fanout deduplication
-    const counterKey = parentSessionId + '|' + desc + '|' + type;
+    const counterKey = JSON.stringify([parentSessionId, desc, type]);
     if (agentMatchCounters[counterKey] === undefined) agentMatchCounters[counterKey] = 0;
     const matchIndex = agentMatchCounters[counterKey]++;
 
