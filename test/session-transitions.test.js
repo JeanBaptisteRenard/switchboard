@@ -170,6 +170,40 @@ test('post-bootstrap with no new agents emits zero events (IPC-flood regression)
   }
 });
 
+test('GC: a completed entry older than 5 minutes is purged from knownSubagents', () => {
+  const events = setupModule();
+  const tmp = mkTmp();
+  try {
+    const sessionId = 'parent';
+    const now = Date.now();
+    // Create the subagents dir but leave it empty so the readdir succeeds.
+    // The agent's jsonl file is gone (cleanup after completion) but its
+    // entry still sits in the in-memory Map — that's the GC target.
+    fs.mkdirSync(path.join(tmp, sessionId, 'subagents'), { recursive: true });
+
+    const session = { knownSubagents: new Map() };
+    session.knownSubagents.set('ghost', {
+      mtimeMs: now - 10 * 60_000,
+      completed: true,
+      _completedAt: now - 6 * 60_000, // completed 6 minutes ago → past 5-min TTL
+    });
+    // Also seed one entry inside the TTL window to confirm it survives.
+    session.knownSubagents.set('keeper', {
+      mtimeMs: now - 60_000,
+      completed: true,
+      _completedAt: now - 60_000, // 1 minute ago → within TTL
+    });
+
+    detectSubagentTransitions(sessionId, session, tmp, now);
+
+    assert.equal(events.length, 0, 'GC must not emit IPC');
+    assert.equal(session.knownSubagents.has('ghost'), false, 'expected ghost to be purged');
+    assert.equal(session.knownSubagents.has('keeper'), true, 'expected keeper to survive');
+  } finally {
+    cleanup(tmp);
+  }
+});
+
 test('completion: agent alive on call N, stable mtime for >30s on call N+1, emits subagent-completed', () => {
   const events = setupModule();
   const tmp = mkTmp();
