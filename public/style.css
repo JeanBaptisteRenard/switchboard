@@ -2527,6 +2527,40 @@ body { display: flex; flex-direction: column; }
   margin-bottom: 2px;
 }
 
+.jsonl-subagent-escape-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: rgba(160, 160, 180, 0.08);
+  border: 1px solid rgba(160, 160, 180, 0.2);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.jsonl-subagent-escape-label {
+  color: rgba(255, 255, 255, 0.45);
+  flex: 1;
+}
+
+.jsonl-subagent-resume-btn {
+  padding: 4px 10px;
+  font-size: 11px;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  color: rgba(255, 255, 255, 0.7);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.jsonl-subagent-resume-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
 .jsonl-toggle {
   font-size: 11px;
   font-weight: 500;

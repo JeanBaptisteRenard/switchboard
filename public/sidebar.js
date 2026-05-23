@@ -768,7 +768,13 @@ function rebindSidebarEvents(projects) {
     const session = sessionMap.get(sessionId);
     if (!session) return;
 
-    item.onclick = () => openSession(session);
+    item.onclick = () => {
+      if (item.dataset.subagent && session.parentSessionId) {
+        showSubagentTranscript(session);
+      } else {
+        openSession(session);
+      }
+    };
 
     // Subagent items are read-only: skip pin, rename, stop, fork, archive, jsonl, launchConfig
     if (item.dataset.subagent) return;
