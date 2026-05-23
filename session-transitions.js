@@ -23,11 +23,48 @@ function init(ctx) {
  *  Emits IPC 'subagent-spawned' and 'subagent-completed' via mainWindow. */
 function detectSubagentTransitions(sessionId, session, folderPath) {
   const subagentsDir = path.join(folderPath, sessionId, 'subagents');
-  let files;
+
+  // --- Hot-path cache: avoid readdirSync + N×statSync when dir is quiet ---
+  // With 1000+ subagents, the full scan blocks the main thread ~70 ms per
+  // flush. We cache the dir's mtime; when it hasn't changed, no new files
+  // could have appeared, so we skip readdirSync AND statSync for unknown
+  // files. Known-active entries still get statSync for the stability timer.
+  //
+  // Session-local state:
+  //   _prevDirMtime  — subagentsDir mtime at the last readdirSync
+  //   _subFileList   — .jsonl file list from that scan
+  let dirMtime;
   try {
-    files = fs.readdirSync(subagentsDir).filter(f => f.endsWith('.jsonl'));
+    dirMtime = fs.statSync(subagentsDir).mtimeMs;
   } catch {
     return; // directory doesn't exist yet — normal
+  }
+
+  const isBootstrap = !session.knownSubagents;
+
+  // dirChanged: true when dir mtime moved or we have no prior scan yet.
+  // Also true when the prior scan returned 0 files: the dir mtime may not
+  // advance within the same filesystem-clock tick on fast writes, so we
+  // must rescan until we see at least one file to avoid missing arrivals.
+  const prevFileList = session._subFileList;
+  const dirChanged = isBootstrap
+    || session._prevDirMtime !== dirMtime
+    || !prevFileList
+    || prevFileList.length === 0;
+
+  let files;
+  if (dirChanged) {
+    try {
+      files = fs.readdirSync(subagentsDir).filter(f => f.endsWith('.jsonl'));
+    } catch {
+      return;
+    }
+    session._prevDirMtime = dirMtime;
+    session._subFileList = files;
+  } else {
+    // Dir mtime unchanged and we saw files before — reuse cached list; no
+    // new files can have appeared.
+    files = prevFileList;
   }
 
   // First walk for this session: pre-populate knownSubagents with every
@@ -35,7 +72,6 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
   // events for agents that already finished before Switchboard started watching.
   // Files modified in the last 60s get a normal lifecycle; older ones are
   // recorded as already-completed without IPC.
-  const isBootstrap = !session.knownSubagents;
   if (isBootstrap) {
     session.knownSubagents = new Map();
   }
@@ -52,11 +88,17 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
     const agentId = m[1];
     const filePath = path.join(subagentsDir, file);
 
+    const known = session.knownSubagents.get(agentId);
+
+    // Already completed — nothing more to do, skip statSync.
+    if (known && known.completed) continue;
+
+    // Dir unchanged → no new entries can exist; skip statSync for unknown files.
+    if (!known && !dirChanged) continue;
+
     let stat;
     try { stat = fs.statSync(filePath); } catch { continue; }
     const mtimeMs = stat.mtimeMs;
-
-    const known = session.knownSubagents.get(agentId);
 
     if (!known) {
       if (isBootstrap) {
@@ -69,6 +111,21 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
           completed: !looksAlive,
           _completedAt: looksAlive ? null : now,
         });
+        // Fix 2: emit a synthetic spawn for live bootstrap files so the
+        // renderer's liveSubagents / activeSubagents Maps have an entry and
+        // can correctly handle the subsequent subagent-completed event.
+        // The _bootstrap flag lets the renderer dedupe if it already has state.
+        if (looksAlive && mainWindow && !mainWindow.isDestroyed()) {
+          const meta = readSubagentMeta(filePath) || {};
+          log.info(`[subagent-spawn-bootstrap] parent=${sessionId} agentId=${agentId}`);
+          mainWindow.webContents.send('subagent-spawned', {
+            parentSessionId: sessionId,
+            agentId,
+            subagentType: meta.agentType || null,
+            description: meta.description || null,
+            _bootstrap: true,
+          });
+        }
         continue;
       }
       // First sighting post-bootstrap — real spawn event
