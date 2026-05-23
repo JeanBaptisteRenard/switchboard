@@ -444,6 +444,26 @@ ipcMain.handle('delete-worktree', (_event, worktreePath) => {
   });
 });
 
+// --- IPC: worktree-status ---
+ipcMain.handle('worktree-status', (_event, worktreePath) => {
+  return new Promise((resolve) => {
+    const normalizedPath = worktreePath.replace(/\/$/, '');
+    const match = normalizedPath.match(WORKTREE_PATH_RE);
+    if (!match) {
+      return resolve({ ok: false, error: 'Path does not match a recognized worktree layout' });
+    }
+    const parentRepo = match[1];
+
+    execFile('git', ['-C', parentRepo, '-C', normalizedPath, 'status', '--porcelain'], (err, stdout, stderr) => {
+      if (err) {
+        return resolve({ ok: false, error: (stderr || err.message || String(err)).trim() });
+      }
+      const dirty = stdout.split('\n').map(l => l.trimEnd()).filter(Boolean);
+      resolve({ ok: true, dirty, total: dirty.length });
+    });
+  });
+});
+
 // --- IPC: get-projects ---
 ipcMain.handle('open-external', (_event, url) => {
   log.info('[open-external IPC]', url);

@@ -42,6 +42,7 @@ contextBridge.exposeInMainWorld('api', {
   addProject: (projectPath) => ipcRenderer.invoke('add-project', projectPath),
   removeProject: (projectPath) => ipcRenderer.invoke('remove-project', projectPath),
   deleteWorktree: (worktreePath) => ipcRenderer.invoke('delete-worktree', worktreePath),
+  worktreeStatus: (worktreePath) => ipcRenderer.invoke('worktree-status', worktreePath),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
 
   // Send (fire-and-forget)
