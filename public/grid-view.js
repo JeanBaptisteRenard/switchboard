@@ -33,9 +33,13 @@ function gridSubagentColor(type) {
 (function initSubagentListeners() {
   if (typeof window.api === 'undefined') return;
 
+  // preload.js exposes these listeners with a single-arg signature `cb(payload)`.
+  // The previous `(event, data) => ...` shape made `data` always undefined, so
+  // grid-view pills never updated from spawn/complete events. Match preload's
+  // contract — same as jsonl-viewer.js does.
   if (typeof window.api.onSubagentSpawned === 'function') {
-    window.api.onSubagentSpawned((event, data) => {
-      const { parentSessionId, agentId, subagentType } = data || {};
+    window.api.onSubagentSpawned((payload) => {
+      const { parentSessionId, agentId, subagentType } = payload || {};
       if (!parentSessionId || !agentId) return;
       if (!activeSubagents.has(parentSessionId)) activeSubagents.set(parentSessionId, new Map());
       activeSubagents.get(parentSessionId).set(agentId, { agentId, subagentType, spawnedAt: Date.now() });
@@ -44,8 +48,8 @@ function gridSubagentColor(type) {
   }
 
   if (typeof window.api.onSubagentCompleted === 'function') {
-    window.api.onSubagentCompleted((event, data) => {
-      const { parentSessionId, agentId } = data || {};
+    window.api.onSubagentCompleted((payload) => {
+      const { parentSessionId, agentId } = payload || {};
       if (!parentSessionId || !agentId) return;
       const map = activeSubagents.get(parentSessionId);
       if (map) {

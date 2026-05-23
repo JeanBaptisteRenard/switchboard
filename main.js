@@ -206,9 +206,10 @@ function createWindow() {
       }
       activeSessions.delete(id);
     }
-    // Release all subagent file watchers
+    // Release all subagent file watchers — pass the listener so we only remove
+    // our own poll, not every listener that may be attached to that path.
     for (const [, entry] of subagentWatchers) {
-      try { fs.unwatchFile(entry.filePath); } catch {}
+      try { fs.unwatchFile(entry.filePath, entry.listener); } catch {}
     }
     subagentWatchers.clear();
     mainWindow = null;
@@ -986,7 +987,10 @@ ipcMain.handle('start-subagent-watch', (_event, parentSessionId, agentId) => {
   // fs.watchFile gives reliable polling on Linux where inotify can be unreliable for JSONL appends
   fs.watchFile(filePath, { interval: 1000, persistent: false }, readNewEntries);
 
-  subagentWatchers.set(watchId, { filePath, parentSessionId, agentId });
+  // Store the listener so stop-subagent-watch can remove ONLY this listener,
+  // not every listener on the path. Without the callback arg, fs.unwatchFile
+  // removes all listeners — a second watcher on the same path would also stop.
+  subagentWatchers.set(watchId, { filePath, parentSessionId, agentId, listener: readNewEntries });
   log.info(`[subagent-watch] start watchId=${watchId} parent=${parentSessionId} agentId=${agentId}`);
   return { watchId };
 });
@@ -994,7 +998,7 @@ ipcMain.handle('start-subagent-watch', (_event, parentSessionId, agentId) => {
 ipcMain.handle('stop-subagent-watch', (_event, watchId) => {
   const entry = subagentWatchers.get(watchId);
   if (!entry) return { ok: false };
-  fs.unwatchFile(entry.filePath);
+  fs.unwatchFile(entry.filePath, entry.listener);
   subagentWatchers.delete(watchId);
   log.info(`[subagent-watch] stop watchId=${watchId}`);
   return { ok: true };
