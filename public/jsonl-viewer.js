@@ -13,6 +13,21 @@ let agentMatchCounters = {};
 // Keyed as "<parentSessionId>:<agentId>" so it's globally unique.
 const liveSubagents = new Set();
 
+// Active subagent file watches for the currently-rendered viewer. Each entry
+// is a stopWatch closure created when an Agent block expands and starts a
+// live tail. Drained on viewer dismissal so we don't leak fs.watchFile polls.
+// Attached to `window` so the cross-file hideAllViewers() (in plans-memory-view.js)
+// can drain via the function declaration below — top-level `const` in classic
+// scripts isn't global.
+window.__activeViewerWatches = window.__activeViewerWatches || new Set();
+const activeViewerWatches = window.__activeViewerWatches;
+function drainViewerWatches() {
+  for (const stop of activeViewerWatches) {
+    try { stop(); } catch {}
+  }
+  activeViewerWatches.clear();
+}
+
 // Register IPC listeners for subagent lifecycle events (called once at module load).
 (function initSubagentListeners() {
   if (!window.api) return; // guard for non-Electron contexts
@@ -277,7 +292,9 @@ const toolRenderers = {
         liveIndicator.remove();
         liveIndicator = null;
       }
+      activeViewerWatches.delete(stopWatch);
     }
+    activeViewerWatches.add(stopWatch);
 
     el.addEventListener('click', async () => {
       if (expanded && nestedContainer) {
@@ -718,6 +735,10 @@ function renderJsonlEntry(entry, toolResultMap) {
 }
 
 async function showJsonlViewer(session) {
+  // Drain any watches from the previously-rendered viewer first — the new
+  // render replaces the DOM and we'd otherwise keep polling files for blocks
+  // the user no longer sees.
+  drainViewerWatches();
   const result = await window.api.readSessionJsonl(session.sessionId);
   hideAllViewers();
   placeholder.style.display = 'none';
@@ -782,5 +803,95 @@ async function showJsonlViewer(session) {
   });
 
   // Scroll to the bottom so the most recent messages are visible
+  jsonlViewerBody.scrollTop = jsonlViewerBody.scrollHeight;
+}
+
+// --- Subagent transcript view ---
+// Renders a read-only transcript for a subagent session.
+// Routing decision: the click handler in sidebar.js discriminates on
+// session.parentSessionId (present only on subagent rows) and calls this
+// function instead of openSession(). Doing the branch at the click-handler
+// layer — where we already have the full session object — avoids an extra
+// IPC round-trip and keeps the IPC layer ignorant of UI routing concerns.
+async function showSubagentTranscript(session) {
+  const result = await window.api.readSubagentJsonl(session.parentSessionId, session.agentId);
+  hideAllViewers();
+  placeholder.style.display = 'none';
+  terminalArea.style.display = 'none';
+  jsonlViewer.style.display = 'flex';
+
+  // Set viewer context for nested Agent block expansion
+  currentViewerSessionId = session.sessionId;
+  agentMatchCounters = {};
+
+  const displayName = session.description || session.summary || session.aiTitle || session.sessionId;
+  const subagentLabel = session.subagentType ? '[' + session.subagentType + '] ' : '[subagent] ';
+  jsonlViewerTitle.textContent = subagentLabel + displayName;
+  jsonlViewerSessionId.textContent = session.sessionId;
+  jsonlViewerBody.innerHTML = '';
+
+  // Escape hatch: let the user resume this session in a terminal tab if needed
+  const escapeBanner = document.createElement('div');
+  escapeBanner.className = 'jsonl-subagent-escape-banner';
+  escapeBanner.innerHTML = '<span class="jsonl-subagent-escape-label">Read-only transcript — subagents cannot be re-entered.</span>';
+  const resumeBtn = document.createElement('button');
+  resumeBtn.className = 'jsonl-subagent-resume-btn';
+  resumeBtn.textContent = 'Resume in terminal anyway';
+  resumeBtn.addEventListener('click', () => openSession(session));
+  escapeBanner.appendChild(resumeBtn);
+  jsonlViewerBody.appendChild(escapeBanner);
+
+  if (result.error) {
+    const errEl = document.createElement('div');
+    errEl.className = 'plans-empty';
+    errEl.textContent = 'Error loading transcript: ' + result.error;
+    jsonlViewerBody.appendChild(errEl);
+    return;
+  }
+
+  const rawEntries = result.entries || [];
+  const entries = mergeLocalCommandEntries(rawEntries);
+
+  // Build tool_use_id → result content map
+  const toolResultMap = new Map();
+  for (const entry of entries) {
+    const blocks = entry.message?.content || entry.content;
+    if (!Array.isArray(blocks)) continue;
+    for (const block of blocks) {
+      if (block.type === 'tool_result' && block.tool_use_id) {
+        toolResultMap.set(block.tool_use_id, block.content || block.output || '');
+      }
+    }
+  }
+
+  let rendered = 0;
+  for (const entry of entries) {
+    const el = renderJsonlEntry(entry, toolResultMap);
+    if (el) {
+      jsonlViewerBody.appendChild(el);
+      rendered++;
+    }
+  }
+
+  if (rendered === 0) {
+    const emptyEl = document.createElement('div');
+    emptyEl.className = 'plans-empty';
+    emptyEl.textContent = 'No messages found in this subagent transcript.';
+    jsonlViewerBody.appendChild(emptyEl);
+  }
+
+  // Click-to-fullscreen for inline images
+  jsonlViewerBody.querySelectorAll('.jsonl-clickable-img').forEach(img => {
+    img.onclick = () => {
+      const overlay = document.createElement('div');
+      overlay.className = 'jsonl-screenshot-fullscreen';
+      const fullImg = document.createElement('img');
+      fullImg.src = img.src;
+      overlay.appendChild(fullImg);
+      overlay.onclick = () => overlay.remove();
+      document.body.appendChild(overlay);
+    };
+  });
+
   jsonlViewerBody.scrollTop = jsonlViewerBody.scrollHeight;
 }
