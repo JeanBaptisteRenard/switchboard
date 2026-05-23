@@ -720,7 +720,8 @@ function rebindSidebarEvents(projects) {
       wtDeleteBtn.onclick = async (e) => {
         e.stopPropagation();
         const name = wtProject.projectPath.split('/').pop();
-        if (!confirm(`Delete worktree "${name}" from disk?\n\nThis runs "git worktree remove -f" and permanently removes the working tree. This cannot be undone.`)) return;
+        const confirmed = await showDeleteWorktreeDialog(name, wtProject.projectPath);
+        if (!confirmed) return;
         const result = await window.api.deleteWorktree(wtProject.projectPath);
         if (result && result.ok) {
           loadProjects();
@@ -1023,5 +1024,77 @@ function startRename(summaryEl, session) {
       });
       input.replaceWith(restored);
     }
+  });
+}
+
+// --- Delete worktree confirmation dialog ---
+// Returns a Promise<boolean> — true if the user confirmed deletion.
+async function showDeleteWorktreeDialog(name, worktreePath) {
+  // Fetch worktree status (dirty files) while the dialog is shown
+  const statusPromise = window.api.worktreeStatus(worktreePath);
+
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'new-session-overlay';
+
+    const dialog = document.createElement('div');
+    dialog.className = 'new-session-dialog delete-worktree-dialog';
+
+    dialog.innerHTML = `
+      <h3>Delete worktree "${escapeHtml(name)}"?</h3>
+      <div class="delete-worktree-warning">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;margin-top:1px"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span>Any uncommitted changes in this worktree will be permanently lost.</span>
+      </div>
+      <div class="delete-worktree-status" id="dwt-status">
+        <span class="dwt-loading">Checking worktree status…</span>
+      </div>
+      <div class="new-session-actions">
+        <button class="new-session-cancel-btn" id="dwt-cancel">Cancel</button>
+        <button class="delete-worktree-confirm-btn" id="dwt-confirm">Delete anyway</button>
+      </div>
+    `;
+
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    const statusEl = dialog.querySelector('#dwt-status');
+
+    // Populate status once the IPC resolves
+    statusPromise.then((status) => {
+      if (!overlay.isConnected) return; // dialog already closed
+      if (!status || !status.ok) {
+        const errMsg = (status && status.error) ? escapeHtml(status.error) : 'Unknown error';
+        statusEl.innerHTML = `<span class="dwt-error">Unable to read worktree status: ${errMsg}</span>`;
+        return;
+      }
+      if (status.total === 0) {
+        statusEl.innerHTML = `<span class="dwt-clean">Worktree is clean — no uncommitted changes.</span>`;
+        return;
+      }
+      const shown = status.dirty.slice(0, 10);
+      const overflow = status.total - shown.length;
+      const lines = shown.map(l => escapeHtml(l)).join('\n');
+      const extra = overflow > 0 ? `\n+ ${overflow} more…` : '';
+      statusEl.innerHTML = `<div class="dwt-dirty-label">${status.total} uncommitted file${status.total !== 1 ? 's' : ''}:</div><pre class="dwt-dirty-list">${lines}${extra}</pre>`;
+    }).catch((err) => {
+      if (!overlay.isConnected) return;
+      statusEl.innerHTML = `<span class="dwt-error">Unable to read worktree status: ${escapeHtml(String(err))}</span>`;
+    });
+
+    function close(confirmed) {
+      overlay.remove();
+      document.removeEventListener('keydown', onKey);
+      resolve(confirmed);
+    }
+
+    dialog.querySelector('#dwt-cancel').onclick = () => close(false);
+    dialog.querySelector('#dwt-confirm').onclick = () => close(true);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(false); });
+
+    function onKey(e) {
+      if (e.key === 'Escape') close(false);
+    }
+    document.addEventListener('keydown', onKey);
   });
 }
