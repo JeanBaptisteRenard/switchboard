@@ -132,14 +132,22 @@ test('post-bootstrap: a brand-new agent file emits exactly one subagent-spawned 
     assert.equal(events.length, 0);
     assert.equal(session.knownSubagents.size, 0);
 
-    // Now drop in a new agent file and re-run
-    seedAgents(tmp, sessionId, [{ id: 'newcomer' }], now);
+    // Now drop in a new agent file plus its sidecar .meta.json so the spawn
+    // IPC payload carries the real agentType/description through.
+    const subDir = seedAgents(tmp, sessionId, [{ id: 'newcomer' }], now);
+    fs.writeFileSync(
+      path.join(subDir, 'agent-newcomer.meta.json'),
+      JSON.stringify({ agentType: 'general-purpose', description: 'investigate the thing' }),
+      'utf8',
+    );
     detectSubagentTransitions(sessionId, session, tmp, now);
 
     assert.equal(events.length, 1, `expected 1 event, got ${events.length}`);
     assert.equal(events[0].channel, 'subagent-spawned');
     assert.equal(events[0].payload.parentSessionId, sessionId);
     assert.equal(events[0].payload.agentId, 'newcomer');
+    assert.equal(events[0].payload.subagentType, 'general-purpose');
+    assert.equal(events[0].payload.description, 'investigate the thing');
     assert.equal(session.knownSubagents.get('newcomer').completed, false);
   } finally {
     cleanup(tmp);
