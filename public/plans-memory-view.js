@@ -98,6 +98,11 @@ function hideAllViewers() {
   settingsViewer.style.display = 'none';
   jsonlViewer.style.display = 'none';
   terminalArea.style.display = '';
+  // Stop any subagent file-watches kept alive by Agent blocks that the user
+  // was viewing — without this, fs.watchFile keeps polling indefinitely.
+  // `drainViewerWatches` lives in jsonl-viewer.js; we reach it via window
+  // because top-level function declarations in classic scripts attach there.
+  if (typeof window.drainViewerWatches === 'function') window.drainViewerWatches();
 }
 
 function hidePlanViewer() {
