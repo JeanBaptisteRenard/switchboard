@@ -33,6 +33,12 @@ test('subagentSessionId formats parent and agent ids into the expected colon-del
   assert.equal(parts[2], agent);
 });
 
+test('subagentSessionId throws TypeError when agentId or parentSessionId contains a colon', () => {
+  assert.throws(() => subagentSessionId('parent:bad', 'agent'), TypeError);
+  assert.throws(() => subagentSessionId('parent', 'agent:bad'), TypeError);
+  assert.throws(() => subagentSessionId('par:ent', 'age:nt'), TypeError);
+});
+
 test('resolveJsonlPath returns top-level path when row has no parent/agent', () => {
   const projectsDir = '/projects';
   const row = { folder: 'foo', sessionId: 'session-1' };
