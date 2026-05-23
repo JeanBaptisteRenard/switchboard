@@ -18,7 +18,25 @@ function folderId(projectPath) {
 }
 
 // --- Subagent localStorage helpers ---
+
+// One-time GC: prune sessionIds that no longer exist in sessionMap.
+// Runs once per page load (lazily on first read) to keep the stored set
+// from growing indefinitely across long-lived Switchboard instances.
+let _expandedSubagentsGCDone = false;
+function _gcExpandedSubagentsOnce() {
+  if (_expandedSubagentsGCDone) return;
+  _expandedSubagentsGCDone = true;
+  try {
+    const raw = new Set(JSON.parse(localStorage.getItem('expandedSubagents') || '[]'));
+    const pruned = new Set([...raw].filter(id => sessionMap.has(id)));
+    if (pruned.size !== raw.size) {
+      localStorage.setItem('expandedSubagents', JSON.stringify([...pruned]));
+    }
+  } catch {} // eslint: allowEmptyCatch
+}
+
 function getExpandedSubagents() {
+  _gcExpandedSubagentsOnce();
   try {
     return new Set(JSON.parse(localStorage.getItem('expandedSubagents') || '[]'));
   } catch (e) { return new Set(); }
@@ -421,6 +439,9 @@ function renderProjects(projects, resort) {
 
         const orphanGroup = document.createElement('div');
         orphanGroup.className = 'sidebar-orphan-subagents' + (expanded ? '' : ' collapsed');
+        // Stable id so morphdom reconciles the element instead of rebuilding
+        // it from scratch on every render, preventing minor flicker.
+        orphanGroup.id = 'orphan-' + fId;
 
         const orphanLabel = document.createElement('div');
         orphanLabel.className = 'sidebar-orphan-label';

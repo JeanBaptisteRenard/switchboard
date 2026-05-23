@@ -56,19 +56,31 @@ function seedAgents(folder, sessionId, agents) {
   return subDir;
 }
 
-test('bootstrap call with 5 pre-existing subagents emits zero events and populates the map', () => {
+test('bootstrap call with 5 pre-existing subagents: old agents silent, fresh agents get synthetic spawn', () => {
+  // Updated for Fix 2: looksAlive bootstrap files now emit subagent-spawned
+  // with _bootstrap:true so the renderer can track their lifecycle. Old
+  // agents (>60s) stay silent to avoid flooding on startup.
   const events = setupModule();
   const tmp = mkTmp();
   try {
     const sessionId = 'parent-session';
+    // 3 fresh (looksAlive) + 2 old (completed-at-boot)
     seedAgents(tmp, sessionId, [
-      { id: 'a1' }, { id: 'a2' }, { id: 'a3' }, { id: 'a4' }, { id: 'a5' },
+      { id: 'a1', ageMs: 120_000 }, // 2 min old — silent
+      { id: 'a2', ageMs: 120_000 }, // 2 min old — silent
+      { id: 'a3', ageMs: 5_000 },   // fresh — gets synthetic spawn
+      { id: 'a4', ageMs: 5_000 },   // fresh — gets synthetic spawn
+      { id: 'a5', ageMs: 5_000 },   // fresh — gets synthetic spawn
     ]);
 
     const session = {}; // knownSubagents undefined → bootstrap
     detectSubagentTransitions(sessionId, session, tmp);
 
-    assert.equal(events.length, 0, 'bootstrap must not emit IPC');
+    assert.equal(events.length, 3, 'exactly 3 synthetic spawns for fresh bootstrap agents');
+    for (const ev of events) {
+      assert.equal(ev.channel, 'subagent-spawned');
+      assert.equal(ev.payload._bootstrap, true, 'bootstrap spawn must carry _bootstrap flag');
+    }
     assert.ok(session.knownSubagents instanceof Map);
     assert.equal(session.knownSubagents.size, 5);
   } finally {
@@ -96,7 +108,8 @@ test('bootstrap marks an old-mtime agent (>60s) as completed: true', () => {
   }
 });
 
-test('bootstrap marks a fresh-mtime agent as completed: false (lifecycle continues)', () => {
+test('bootstrap marks a fresh-mtime agent as completed: false and emits synthetic spawn', () => {
+  // Fix 2: fresh bootstrap files now emit subagent-spawned with _bootstrap:true.
   const events = setupModule();
   const tmp = mkTmp();
   try {
@@ -106,7 +119,10 @@ test('bootstrap marks a fresh-mtime agent as completed: false (lifecycle continu
     const session = {};
     detectSubagentTransitions(sessionId, session, tmp);
 
-    assert.equal(events.length, 0, 'bootstrap must still be silent for fresh agents');
+    assert.equal(events.length, 1, 'bootstrap emits exactly 1 synthetic spawn for fresh agent');
+    assert.equal(events[0].channel, 'subagent-spawned');
+    assert.equal(events[0].payload._bootstrap, true);
+    assert.equal(events[0].payload.agentId, 'fresh');
     const entry = session.knownSubagents.get('fresh');
     assert.ok(entry);
     assert.equal(entry.completed, false);
@@ -142,17 +158,26 @@ test('post-bootstrap: a brand-new agent file emits exactly one subagent-spawned 
   }
 });
 
-test('post-bootstrap with no new agents emits zero events (IPC-flood regression)', () => {
+test('post-bootstrap with no new agents emits no additional events (IPC-flood regression)', () => {
+  // Fix 2: bootstrap for fresh (ageMs:0) agents now emits synthetic spawns.
+  // The regression guard is that *subsequent* flushes with no new files must
+  // not re-emit — the event count must not increase after the first call.
   const events = setupModule();
   const tmp = mkTmp();
   try {
     const sessionId = 'parent';
-    seedAgents(tmp, sessionId, [{ id: 'a' }, { id: 'b' }, { id: 'c' }]);
+    // Use old agents (ageMs > 60s) so bootstrap stays silent — keeps the
+    // test focused purely on the "no subsequent events" regression.
+    seedAgents(tmp, sessionId, [
+      { id: 'a', ageMs: 120_000 },
+      { id: 'b', ageMs: 120_000 },
+      { id: 'c', ageMs: 120_000 },
+    ]);
 
     const session = {};
-    // Bootstrap absorbs all three silently
+    // Bootstrap absorbs all three silently (all old → no synthetic spawns)
     detectSubagentTransitions(sessionId, session, tmp);
-    assert.equal(events.length, 0);
+    assert.equal(events.length, 0, 'old-agent bootstrap must be silent');
 
     // Subsequent flushes with no new files must stay silent
     detectSubagentTransitions(sessionId, session, tmp);
