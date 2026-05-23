@@ -291,6 +291,7 @@ sessionCache.init({
 });
 const { readSessionFile, readFolderFromFilesystem, refreshFolder, populateCacheFromFilesystem,
         buildProjectsFromCache, notifyRendererProjectsChanged, sendStatus, populateCacheViaWorker } = sessionCache;
+const { resolveJsonlPath } = require('./read-session-file');
 
 
 // --- IPC: browse-folder ---
@@ -441,6 +442,26 @@ ipcMain.handle('delete-worktree', (_event, worktreePath) => {
       notifyRendererProjectsChanged();
       resolve({ ok: true, removed });
     }
+  });
+});
+
+// --- IPC: worktree-status ---
+ipcMain.handle('worktree-status', (_event, worktreePath) => {
+  return new Promise((resolve) => {
+    const normalizedPath = worktreePath.replace(/\/$/, '');
+    const match = normalizedPath.match(WORKTREE_PATH_RE);
+    if (!match) {
+      return resolve({ ok: false, error: 'Path does not match a recognized worktree layout' });
+    }
+    const parentRepo = match[1];
+
+    execFile('git', ['-C', parentRepo, '-C', normalizedPath, 'status', '--porcelain'], (err, stdout, stderr) => {
+      if (err) {
+        return resolve({ ok: false, error: (stderr || err.message || String(err)).trim() });
+      }
+      const dirty = stdout.split('\n').map(l => l.trimEnd()).filter(Boolean);
+      resolve({ ok: true, dirty, total: dirty.length });
+    });
   });
 });
 
@@ -997,7 +1018,7 @@ ipcMain.handle('read-session-jsonl', (_event, sessionId) => {
 ipcMain.handle('read-subagent-jsonl', (_event, parentSessionId, agentId) => {
   const row = getCachedSession('sub:' + parentSessionId + ':' + agentId);
   if (!row) return { error: 'Subagent session not found in cache' };
-  const jsonlPath = path.join(PROJECTS_DIR, row.folder, parentSessionId, 'subagents', 'agent-' + agentId + '.jsonl');
+  const jsonlPath = resolveJsonlPath(PROJECTS_DIR, row);
   try {
     const content = fs.readFileSync(jsonlPath, 'utf-8');
     const entries = [];
@@ -1027,7 +1048,7 @@ ipcMain.handle('list-subagents', (_event, parentSessionId) => {
 ipcMain.handle('start-subagent-watch', (_event, parentSessionId, agentId) => {
   const row = getCachedSession('sub:' + parentSessionId + ':' + agentId);
   if (!row) return { error: 'Subagent not found in cache' };
-  const filePath = path.join(PROJECTS_DIR, row.folder, parentSessionId, 'subagents', 'agent-' + agentId + '.jsonl');
+  const filePath = resolveJsonlPath(PROJECTS_DIR, row);
 
   const watchId = ++subagentWatcherSeq;
   let offset = 0;
