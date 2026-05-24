@@ -2837,6 +2837,42 @@ body { display: flex; flex-direction: column; }
   transform: rotate(-90deg);
 }
 
+/* ========== WORK FILES TAB ========== */
+
+#work-files-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0 16px;
+}
+
+#work-files-content::-webkit-scrollbar { width: 5px; }
+#work-files-content::-webkit-scrollbar-track { background: transparent; }
+#work-files-content::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.06); border-radius: 3px; }
+
+#work-files-viewer {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: #111118;
+}
+
+.work-file-icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  margin-top: 5px;
+  color: #7a9aaa;
+}
+
+/* Collapse/expand for work-files groups */
+#work-files-content .project-group.collapsed .project-sessions {
+  display: none;
+}
+#work-files-content .project-group.collapsed .arrow {
+  transform: rotate(-90deg);
+}
+
 /* ========== ADD PROJECT BUTTON ========== */
 #grid-toggle-btn,
 #resort-btn,
