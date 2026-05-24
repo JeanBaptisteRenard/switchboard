@@ -1598,60 +1598,79 @@ if (!app.isPackaged) {
   app.setName('Switchboard (dev)');
 }
 
-app.whenReady().then(() => {
-  buildMenu();
-  createWindow();
-  startProjectsWatcher();
-  scheduleIpc.ensureScheduleCreatorCommand();
-
-  // Shared runCommand for both cron scheduler and manual "run now"
-  const { spawn: cpSpawn } = require('child_process');
-  function runScheduleCommand(cmd, cwd, name, onDone) {
-    const globalSettings = getSetting('global') || {};
-    const profileId = globalSettings.shellProfile || SETTING_DEFAULTS.shellProfile;
-    const profile = resolveShell(profileId);
-    const shell = profile.path;
-    const args = shellArgs(shell, cmd, profile.args || []);
-
-    log.info(`[schedule] Running: ${shell} ${args.join(' ')}`);
-    const child = cpSpawn(shell, args, {
-      cwd,
-      stdio: ['ignore', 'ignore', 'pipe'],
-      env: { ...cleanPtyEnv, FORCE_COLOR: '0' },
-    });
-
-    let stderr = '';
-    child.stderr.on('data', (data) => { stderr += data.toString(); });
-
-    child.on('exit', (code) => {
-      if (stderr.trim()) log.error(`[schedule] ${name} stderr:\n${stderr.trim()}`);
-      log.info(`[schedule] ${name} finished (exit ${code})`);
-      if (onDone) onDone();
-    });
-
-    child.on('error', (err) => {
-      log.error(`[schedule] ${name} error:`, err.message);
-      if (onDone) onDone();
-    });
-  }
-
-  scheduleIpc.init(log, runScheduleCommand);
-  startScheduler(log, runScheduleCommand);
-
-  // Re-index search if FTS table was recreated (e.g. tokenizer config change)
-  if (searchFtsRecreated) populateCacheViaWorker();
-
-  // Check for updates after launch
-  if (autoUpdater) {
-    setTimeout(() => autoUpdater.checkForUpdates().catch(e => log.error('[updater] check failed:', e?.message || String(e))), 5000);
-    // Re-check every 4 hours for long-running sessions
-    setInterval(() => autoUpdater.checkForUpdates().catch(e => log.error('[updater] check failed:', e?.message || String(e))), 4 * 60 * 60 * 1000);
-  }
-
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+// Prevent a second Electron instance from killing active PTY sessions.
+// This happens when the user replaces the AppImage while Switchboard is running:
+// the OS spawns the new binary, which would otherwise initialise a second process
+// and leave the first one's node-pty sessions orphaned or killed.
+// requestSingleInstanceLock ensures only one instance runs at a time. The second
+// launch quits immediately; the first brings its window to the front.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  // Focus the existing window when a second launch is attempted.
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
   });
-});
+
+  app.whenReady().then(() => {
+    buildMenu();
+    createWindow();
+    startProjectsWatcher();
+    scheduleIpc.ensureScheduleCreatorCommand();
+
+    // Shared runCommand for both cron scheduler and manual "run now"
+    const { spawn: cpSpawn } = require('child_process');
+    function runScheduleCommand(cmd, cwd, name, onDone) {
+      const globalSettings = getSetting('global') || {};
+      const profileId = globalSettings.shellProfile || SETTING_DEFAULTS.shellProfile;
+      const profile = resolveShell(profileId);
+      const shell = profile.path;
+      const args = shellArgs(shell, cmd, profile.args || []);
+
+      log.info(`[schedule] Running: ${shell} ${args.join(' ')}`);
+      const child = cpSpawn(shell, args, {
+        cwd,
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: { ...cleanPtyEnv, FORCE_COLOR: '0' },
+      });
+
+      let stderr = '';
+      child.stderr.on('data', (data) => { stderr += data.toString(); });
+
+      child.on('exit', (code) => {
+        if (stderr.trim()) log.error(`[schedule] ${name} stderr:\n${stderr.trim()}`);
+        log.info(`[schedule] ${name} finished (exit ${code})`);
+        if (onDone) onDone();
+      });
+
+      child.on('error', (err) => {
+        log.error(`[schedule] ${name} error:`, err.message);
+        if (onDone) onDone();
+      });
+    }
+
+    scheduleIpc.init(log, runScheduleCommand);
+    startScheduler(log, runScheduleCommand);
+
+    // Re-index search if FTS table was recreated (e.g. tokenizer config change)
+    if (searchFtsRecreated) populateCacheViaWorker();
+
+    // Check for updates after launch
+    if (autoUpdater) {
+      setTimeout(() => autoUpdater.checkForUpdates().catch(e => log.error('[updater] check failed:', e?.message || String(e))), 5000);
+      // Re-check every 4 hours for long-running sessions
+      setInterval(() => autoUpdater.checkForUpdates().catch(e => log.error('[updater] check failed:', e?.message || String(e))), 4 * 60 * 60 * 1000);
+    }
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+  }); // end app.whenReady
+} // end gotSingleInstanceLock else-branch
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
