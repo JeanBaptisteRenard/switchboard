@@ -891,6 +891,131 @@ ipcMain.handle('save-memory', (_event, filePath, content) => {
   }
 });
 
+// --- IPC: get-work-files ---
+// Walks <projectPath>/.work-files/ recursively for all known projects.
+// Returns { projects: WorkFilesProject[] } — empty projects are skipped.
+// Caps at WORK_FILES_CAP files per project (most recent by mtime) to guard
+// against huge .work-files trees (e.g. tagpay has ~39k files).
+const WORK_FILES_CAP = 200;
+
+function walkWorkFiles(dir, baseDir, results) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    const fullPath = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      walkWorkFiles(fullPath, baseDir, results);
+    } else if (e.isFile()) {
+      try {
+        const stat = fs.statSync(fullPath);
+        const relativePath = path.relative(baseDir, fullPath);
+        results.push({
+          filename: e.name,
+          filePath: fullPath,
+          relativePath,
+          modified: stat.mtime.toISOString(),
+          size: stat.size,
+        });
+      } catch {}
+    }
+  }
+}
+
+ipcMain.handle('get-work-files', () => {
+  const global = getSetting('global') || {};
+  const hiddenProjects = new Set(global.hiddenProjects || []);
+  const projects = [];
+
+  try {
+    if (fs.existsSync(PROJECTS_DIR)) {
+      const folders = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })
+        .filter(d => d.isDirectory() && d.name !== '.git')
+        .map(d => d.name);
+
+      for (const folder of folders) {
+        const folderPath = path.join(PROJECTS_DIR, folder);
+        const projectPath = deriveProjectPath(folderPath, folder);
+        if (!projectPath) continue;
+        if (hiddenProjects.has(projectPath)) continue;
+
+        const workFilesDir = path.join(projectPath, '.work-files');
+        if (!fs.existsSync(workFilesDir)) continue;
+
+        const shortName = projectPath.split('/').filter(Boolean).slice(-2).join('/');
+
+        const allFiles = [];
+        walkWorkFiles(workFilesDir, workFilesDir, allFiles);
+
+        // Sort by modified desc
+        allFiles.sort((a, b) => new Date(b.modified) - new Date(a.modified));
+
+        const totalCount = allFiles.length;
+        const files = allFiles.slice(0, WORK_FILES_CAP);
+
+        if (files.length > 0) {
+          projects.push({ projectPath, shortName, files, totalCount });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Error scanning work-files:', err);
+  }
+
+  // Sort projects by most recent file modified date
+  projects.sort((a, b) => {
+    const aMax = a.files.length > 0 ? new Date(a.files[0].modified).getTime() : 0;
+    const bMax = b.files.length > 0 ? new Date(b.files[0].modified).getTime() : 0;
+    return bMax - aMax;
+  });
+
+  // Index for FTS — text files ≤ 64KB, skip .jsonl
+  try {
+    deleteSearchType('work-file');
+    const TEXT_MAX = 64 * 1024;
+    const entries = projects.flatMap(proj =>
+      proj.files.map(f => {
+        let body = '';
+        if (!f.relativePath.endsWith('.jsonl') && f.size <= TEXT_MAX) {
+          try { body = fs.readFileSync(f.filePath, 'utf8'); } catch {}
+        }
+        return {
+          id: f.filePath, type: 'work-file', folder: null,
+          title: proj.shortName + ' ' + f.relativePath,
+          body,
+        };
+      })
+    );
+    upsertSearchEntries(entries);
+  } catch {}
+
+  return { projects };
+});
+
+// --- IPC: read-work-file ---
+ipcMain.handle('read-work-file', (_event, filePath) => {
+  try {
+    const resolved = path.resolve(filePath);
+    // Security: path must contain /.work-files/ segment
+    if (!resolved.includes('/.work-files/') && !resolved.includes('\\.work-files\\')) {
+      return '[access denied]';
+    }
+    if (!fs.existsSync(resolved)) return '';
+    const stat = fs.statSync(resolved);
+    if (stat.size > 2 * 1024 * 1024) return '[file too large to display]';
+    // Detect binary: try reading as utf8; if it fails or contains null bytes, treat as binary
+    const buf = fs.readFileSync(resolved);
+    if (buf.includes(0)) return '[binary file]';
+    return buf.toString('utf8');
+  } catch (err) {
+    console.error('Error reading work file:', err);
+    return '';
+  }
+});
+
 // --- IPC: search ---
 ipcMain.handle('search', (_event, type, query, titleOnly) => {
   return searchByType(type, query, 50, !!titleOnly);
