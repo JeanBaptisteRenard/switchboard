@@ -928,6 +928,11 @@ function walkWorkFiles(dir, baseDir, results) {
 ipcMain.handle('get-work-files', () => {
   const global = getSetting('global') || {};
   const hiddenProjects = new Set(global.hiddenProjects || []);
+  // Dedupe by projectPath: multiple ~/.claude/projects/ folders (e.g. worktrees
+  // of the same repo) can derive to the same projectPath via
+  // resolveWorktreePath, which would otherwise produce N copies of the same
+  // header+file list in the UI.
+  const seen = new Set();
   const projects = [];
 
   try {
@@ -941,6 +946,8 @@ ipcMain.handle('get-work-files', () => {
         const projectPath = deriveProjectPath(folderPath, folder);
         if (!projectPath) continue;
         if (hiddenProjects.has(projectPath)) continue;
+        if (seen.has(projectPath)) continue;
+        seen.add(projectPath);
 
         const workFilesDir = path.join(projectPath, '.work-files');
         if (!fs.existsSync(workFilesDir)) continue;
