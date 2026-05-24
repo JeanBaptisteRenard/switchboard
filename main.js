@@ -1023,6 +1023,23 @@ ipcMain.handle('read-work-file', (_event, filePath) => {
   }
 });
 
+// --- IPC: delete-work-file ---
+ipcMain.handle('delete-work-file', (_event, filePath) => {
+  try {
+    const resolved = path.resolve(filePath);
+    if (!resolved.includes('/.work-files/') && !resolved.includes('\\.work-files\\')) {
+      return { ok: false, error: 'access denied' };
+    }
+    if (!fs.existsSync(resolved)) return { ok: false, error: 'not found' };
+    fs.unlinkSync(resolved);
+    // FTS entry is cleaned up on the next get-work-files call (full type rebuild)
+    return { ok: true };
+  } catch (err) {
+    console.error('Error deleting work file:', err);
+    return { ok: false, error: err.message };
+  }
+});
+
 // --- IPC: search ---
 ipcMain.handle('search', (_event, type, query, titleOnly) => {
   return searchByType(type, query, 50, !!titleOnly);

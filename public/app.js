@@ -41,6 +41,19 @@ const workFilesViewer = document.getElementById('work-files-viewer');
 const workFilesPanel = new ViewerPanel(workFilesViewer, {
   copyPath: true, copyContent: true,
   language: 'auto', storageKey: 'workFilesPreviewMode',
+  format: true,
+  onDelete: async (filePath) => {
+    const result = await window.api.deleteWorkFile(filePath);
+    if (result && result.ok) {
+      // Hide the panel and reload the list
+      workFilesViewer.style.display = 'none';
+      if (typeof loadWorkFiles === 'function') loadWorkFiles();
+    }
+    return result;
+  },
+  onClose: () => {
+    workFilesViewer.style.display = 'none';
+  },
 });
 const terminalArea = document.getElementById('terminal-area');
 const settingsViewer = document.getElementById('settings-viewer');
