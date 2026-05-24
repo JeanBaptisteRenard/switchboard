@@ -178,6 +178,7 @@ const rendererCrossFileGlobals = {
   renderMemories: 'readonly',
   loadWorkFiles: 'readonly',
   renderWorkFiles: 'readonly',
+  removeWorkFileFromCache: 'readonly',
   openWorkFile: 'readonly',
   clearNotifications: 'readonly',
   setSessionMcpActive: 'readonly',

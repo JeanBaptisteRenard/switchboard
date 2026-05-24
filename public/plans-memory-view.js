@@ -297,6 +297,22 @@ async function loadWorkFiles() {
   renderWorkFiles();
 }
 
+// Remove a single deleted file from the in-memory model and re-render.
+// Avoids re-running the (sometimes slow) full disk scan in get-work-files.
+function removeWorkFileFromCache(filePath) {
+  for (const proj of cachedWorkFilesData) {
+    const idx = proj.files.findIndex(f => f.filePath === filePath);
+    if (idx !== -1) {
+      proj.files.splice(idx, 1);
+      if (typeof proj.totalCount === 'number') proj.totalCount = Math.max(0, proj.totalCount - 1);
+      break;
+    }
+  }
+  // Drop projects that no longer have files
+  cachedWorkFilesData = cachedWorkFilesData.filter(p => p.files.length > 0);
+  renderWorkFiles();
+}
+
 function renderWorkFiles(filterIds) {
   workFilesContent.innerHTML = '';
   if (cachedWorkFilesData.length === 0) {
