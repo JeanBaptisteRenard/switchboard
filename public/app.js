@@ -45,9 +45,11 @@ const workFilesPanel = new ViewerPanel(workFilesViewer, {
   onDelete: async (filePath) => {
     const result = await window.api.deleteWorkFile(filePath);
     if (result && result.ok) {
-      // Hide the panel and reload the list
+      // Hide the panel and surgically remove the entry from the cached list.
+      // We avoid loadWorkFiles() because the full disk re-scan can freeze the
+      // UI on projects with large .work-files/ trees (e.g. tagpay = 39k files).
       workFilesViewer.style.display = 'none';
-      if (typeof loadWorkFiles === 'function') loadWorkFiles();
+      if (typeof removeWorkFileFromCache === 'function') removeWorkFileFromCache(filePath);
     }
     return result;
   },
