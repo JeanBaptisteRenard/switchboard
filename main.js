@@ -291,7 +291,7 @@ sessionCache.init({
 });
 const { readSessionFile, readFolderFromFilesystem, refreshFolder, populateCacheFromFilesystem,
         buildProjectsFromCache, notifyRendererProjectsChanged, sendStatus, populateCacheViaWorker } = sessionCache;
-const { resolveJsonlPath } = require('./read-session-file');
+const { resolveJsonlPath, enumerateSessionFiles } = require('./read-session-file');
 
 
 // --- IPC: browse-folder ---
@@ -360,6 +360,84 @@ ipcMain.handle('remove-project', (_event, projectPath) => {
     deleteSearchFolder(folder);
     deleteSetting('project:' + projectPath);
 
+    notifyRendererProjectsChanged();
+    return { ok: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// --- IPC: remap-project ---
+
+/**
+ * Atomically rewrite cwd occurrences of oldPath → newPath in a single JSONL
+ * file. Uses a .tmp sibling + rename for crash safety. On any failure the .tmp
+ * orphan is cleaned up so it cannot block a future remap attempt.
+ */
+function rewriteJsonlAtomic(filePath, oldPath, newPath) {
+  const tmp = filePath + '.tmp';
+  try {
+    const content = fs.readFileSync(filePath, 'utf8');
+    const updated = content.split('\n').map(line => {
+      if (!line) return line;
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.cwd === oldPath) {
+          parsed.cwd = newPath;
+          return JSON.stringify(parsed);
+        }
+      } catch {}
+      return line;
+    }).join('\n');
+    fs.writeFileSync(tmp, updated);
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw err;
+  }
+}
+
+ipcMain.handle('remap-project', (_event, oldPath, newPath) => {
+  try {
+    // Validate oldPath/newPath are strings (basic sanitisation)
+    if (typeof oldPath !== 'string' || typeof newPath !== 'string') {
+      return { error: 'Invalid arguments' };
+    }
+
+    // Re-check at handler entry: if oldPath came back, no remap is needed
+    if (fs.existsSync(oldPath)) {
+      return { error: 'Project path now exists — remap no longer needed' };
+    }
+
+    // Validate the new path exists and is a directory
+    let stat;
+    try { stat = fs.lstatSync(newPath); } catch { return { error: 'Path does not exist' }; }
+    if (!stat.isDirectory()) return { error: 'Path is not a directory' };
+
+    // Find the session folder for the old project path using the same encoding the CLI uses
+    const folder = encodeProjectPath(oldPath);
+    const folderPath = path.join(PROJECTS_DIR, folder);
+    if (!fs.existsSync(folderPath)) return { error: 'No session data found for this project' };
+
+    // Refuse if any active PTY session is running for this folder — rewriting
+    // files while a live claude process is appending them risks data loss
+    // (our snapshot + rename would silently drop lines appended between read
+    // and rename). The user must stop all sessions for this project first.
+    for (const [, session] of activeSessions) {
+      if (!session.exited && encodeProjectPath(session.projectPath) === folder) {
+        return { error: 'Active sessions for this project — stop them first' };
+      }
+    }
+
+    // Rewrite cwd in all session JSONL files (top-level + subagents) so
+    // `claude --resume` from CLI also picks up the new path.
+    const sessionFiles = enumerateSessionFiles(folderPath);
+    for (const { filePath } of sessionFiles) {
+      rewriteJsonlAtomic(filePath, oldPath, newPath);
+    }
+
+    // Refresh the folder cache so the new path takes effect in the UI
+    refreshFolder(folder);
     notifyRendererProjectsChanged();
     return { ok: true };
   } catch (err) {
