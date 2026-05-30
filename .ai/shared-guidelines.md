@@ -1,6 +1,18 @@
 # Switchboard — Notes for Claude (and other AI agents)
 
+@~/.skaleet-ai/conventions/rules.md
+
 This is JB's fork (`JeanBaptisteRenard/switchboard`) of `doctly/switchboard`. The fork carries features not (yet) upstream — read this before editing anything.
+
+**Caveat on the universal rules import above**: Switchboard is an **Electron desktop app**, not a Skaleet backend service. The following sections from `rules.md` do NOT apply here:
+- DDD/CQRS architecture (no Domain/Application/Infrastructure layers — this is a renderer + main-process app)
+- `docker compose exec` runtime gating (we run npm / node directly on the host; only deps for the *target* repos are Dockerised)
+- `monitor-ci` skill (we use GitHub Actions, not GitLab CI; check status via `gh pr checks`)
+- `glab` rules (replaced by `gh` CLI for this fork)
+- `/pre-commit` skill (husky pre-commit runs `task check` automatically; the skill is for Skaleet PHP projects)
+- Conventional Commits — we use a looser style (`feat(scope): ...`, `fix(scope): ...`, but no strict footer rules)
+
+Everything else (HANDOFF protocol, agent dispatch rules, sub-agent model gate, worktree isolation requirement, no Co-Authored-By, shell-command pitfalls, memory hygiene) **does apply**.
 
 ## Quick orientation
 
