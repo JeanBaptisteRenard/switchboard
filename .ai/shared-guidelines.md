@@ -18,12 +18,16 @@ Everything else (HANDOFF protocol, agent dispatch rules, sub-agent model gate, w
 
 | You want to… | Read first |
 |---|---|
-| Run / build the app | [README.md "Tooling"](README.md) (task commands) |
-| Change Electron main / IPC | `main.js`, `preload.js` |
-| Change the renderer (sidebar, tabs, terminal) | `public/*.js` — entry is `app.js` |
-| Change the SQLite cache | `db.js`, `session-cache.js` |
-| Change a viewer panel (plans, memory, .work-files) | `public/viewer-panel.js` + `public/viewer-toolbar.js` |
+| Run / build the app | [README.md "Tooling"](../README.md) (task commands) |
+| Change Electron main / IPC | [contexts/ipc-bridge.md](contexts/ipc-bridge.md), then `main.js`, `preload.js` |
+| Change SQLite, indexing, watcher, FTS, heatmap | [contexts/session-cache.md](contexts/session-cache.md) |
+| Change schedule cron / `.md` files / schedule spawn | [contexts/schedule-runner.md](contexts/schedule-runner.md) |
+| Change subagent grouping, transcript view, parent→child | [contexts/subagent-observability.md](contexts/subagent-observability.md) |
+| Change Plans/Memory/.work-files panels (CodeMirror) | [contexts/viewer-panel.md](contexts/viewer-panel.md) |
+| Change the renderer (sidebar, terminal, app.js) | `public/*.js` — entry is `app.js` |
 | Write a test | `test/*.test.js` — node:test + jsdom for renderer files |
+
+For a guided tour of the codebase architecture, start at [contexts/README.md](contexts/README.md).
 
 ## Critical invariants for AI agents
 

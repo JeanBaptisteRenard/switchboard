@@ -36,6 +36,13 @@
     "test_in_primary_checkout": "Worktree node_modules can be incomplete; tests requiring native modules (morphdom etc.) may give false negatives. Run final test pass from ~/workspace/switchboard.",
     "ai_config_location": ".ai/shared-guidelines.md"
   },
+  "contexts": {
+    "session-cache": ".ai/contexts/session-cache.md",
+    "schedule-runner": ".ai/contexts/schedule-runner.md",
+    "subagent-observability": ".ai/contexts/subagent-observability.md",
+    "viewer-panel": ".ai/contexts/viewer-panel.md",
+    "ipc-bridge": ".ai/contexts/ipc-bridge.md"
+  },
   "remotes": {
     "origin": "https://github.com/JeanBaptisteRenard/switchboard.git",
     "upstream": "https://github.com/doctly/switchboard.git"
