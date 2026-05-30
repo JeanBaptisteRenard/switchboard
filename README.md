@@ -118,6 +118,18 @@ npm start      # bundles CodeMirror then launches Electron
 npm run electron
 ```
 
+### Working alongside a running AppImage
+
+If your `~/Applications/Switchboard.AppImage` is open while you develop:
+
+- **Dev DB isolation** — `task dev` sets `SWITCHBOARD_DATA_DIR=~/.switchboard-dev` automatically so the dev electron uses its own SQLite database. The AppImage keeps using `~/.switchboard/switchboard.db`. They never collide.
+- **Single-instance lock** — if you double-click `Switchboard.AppImage` while it's already open, the second launch quits immediately and focuses the existing window instead of spawning a duplicate process. This was a real data-loss bug (PTYs orphaned) before the fix landed.
+- **Rebuilding is safe** — `task build` writes to `dist/`. Replacing `~/Applications/Switchboard.AppImage` via `cp` does **not** kill the running instance: the live process extracted the AppImage to `/tmp/.mount_*/` at startup and no longer needs the on-disk file. The new code takes effect only on next launch (after you quit fully).
+
+### For AI agents
+
+If you're an AI working in this repo, read [CLAUDE.md](CLAUDE.md) at the project root — it documents the fork-specific features, invariants (no double Electron, no `Co-Authored-By`, worktree isolation pattern), and the helpers worth reusing (`enumerateSessionFiles`, `encodeProjectPath`, `ViewerPanel`).
+
 ## Building
 
 All build commands bundle CodeMirror first, then invoke electron-builder.
