@@ -367,6 +367,55 @@ ipcMain.handle('remove-project', (_event, projectPath) => {
   }
 });
 
+// --- IPC: remap-project ---
+ipcMain.handle('remap-project', (_event, oldPath, newPath) => {
+  try {
+    // Validate the new path exists and is a directory
+    let stat;
+    try { stat = fs.statSync(newPath); } catch { return { error: 'Path does not exist' }; }
+    if (!stat.isDirectory()) return { error: 'Path is not a directory' };
+
+    // Validate oldPath is a string (basic sanitisation)
+    if (typeof oldPath !== 'string' || typeof newPath !== 'string') {
+      return { error: 'Invalid arguments' };
+    }
+
+    // Find the session folder for the old project path using the same encoding the CLI uses
+    const folder = encodeProjectPath(oldPath);
+    const folderPath = path.join(PROJECTS_DIR, folder);
+    if (!fs.existsSync(folderPath)) return { error: 'No session data found for this project' };
+
+    // Rewrite cwd in all session JSONL files so `claude --resume` from CLI also works
+    const jsonlFiles = fs.readdirSync(folderPath).filter(f => f.endsWith('.jsonl'));
+    for (const file of jsonlFiles) {
+      const filePath = path.join(folderPath, file);
+      const content = fs.readFileSync(filePath, 'utf8');
+      const updated = content.split('\n').map(line => {
+        if (!line) return line;
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed.cwd === oldPath) {
+            parsed.cwd = newPath;
+            return JSON.stringify(parsed);
+          }
+        } catch {}
+        return line;
+      }).join('\n');
+      // Atomic write: write to tmp then rename to avoid partial updates
+      const tmp = filePath + '.tmp';
+      fs.writeFileSync(tmp, updated);
+      fs.renameSync(tmp, filePath);
+    }
+
+    // Refresh the folder cache so the new path takes effect in the UI
+    refreshFolder(folder);
+    notifyRendererProjectsChanged();
+    return { ok: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
 // --- IPC: delete-worktree ---
 // Validated path pattern: <project>/.<segment>/[worktrees/]<name>
 // Matches .claude/worktrees/<n>, .claude-worktrees/<n>, .worktrees/<n>
