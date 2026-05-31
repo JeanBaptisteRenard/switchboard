@@ -39,6 +39,9 @@ const silentLog = {
 function makeCtx(sessionId, isBusyFn = () => false, opts = {}) {
   const written = [];
   const ptyProcess = {
+    // pid points at the running node test process so the default liveness check
+    // (signal-0 probe) sees a real, alive pid in existing tests.
+    pid: process.pid,
     write(data) {
       if (opts.ptyThrows) throw new Error('PTY closed');
       written.push(data);
@@ -47,6 +50,8 @@ function makeCtx(sessionId, isBusyFn = () => false, opts = {}) {
 
   // Support dynamic session removal for W5 test
   let sessionPresent = true;
+  // Support dynamic liveness flip for W7 tests
+  let alive = opts.alive !== undefined ? opts.alive : true;
 
   return {
     log: silentLog,
@@ -57,9 +62,11 @@ function makeCtx(sessionId, isBusyFn = () => false, opts = {}) {
     isSessionBusy(id) {
       return id === sessionId ? isBusyFn() : false;
     },
+    isPtyAlive() { return alive; },
     _written: written,
     _ptyProcess: ptyProcess,
     _removeSession() { sessionPresent = false; },
+    _killPty() { alive = false; },
   };
 }
 
@@ -878,6 +885,108 @@ test('W6 timeout_ms absent: falls back to env-var; env-var absent → falls back
     assert.equal(result.ok, false);
     assert.match(result.error, /timeout/i, 'should time out using env-var timeout');
     assert.deepEqual(ctx._written, [], 'no PTY write on env-var timeout');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// ── W7 — child-process liveness ───────────────────────────────────────────────
+
+// W7-1: pty dead at lookup time → ok:false before any wait
+test('W7 dead on arrival: liveness false at lookup → ok:false, no wait, no write', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR             = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS  = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-dead-' + Date.now();
+    const ctx = makeCtx(SESSION_ID, () => false, { alive: false });
+    const watcher = start(ctx);
+
+    const uuid = 'dead-' + Date.now();
+    const startedAt = Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', wait: 'idle' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const elapsed = Date.now() - startedAt;
+    const result  = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'target process not running');
+    assert.deepEqual(ctx._written, [], 'no PTY write when child is dead');
+    assert.ok(elapsed < 1500, `should fail fast, not wait idle timeout; got ${elapsed}ms`);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W7-2: pty dies during idle wait → ok:false at the pre-write recheck
+test('W7 dies during wait: alive at lookup, dead before write → ok:false with waited_ms', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR             = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS  = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-dies-' + Date.now();
+    let busy = true;
+    const ctx = makeCtx(SESSION_ID, () => busy);
+    setTimeout(() => { busy = false; ctx._killPty(); }, 300);
+
+    const watcher = start(ctx);
+    const uuid = 'dies-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', wait: 'idle' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'target process not running');
+    assert.ok(typeof result.waited_ms === 'number' && result.waited_ms >= 200,
+      `waited_ms should reflect the wait that happened; got ${result.waited_ms}`);
+    assert.deepEqual(ctx._written, [], 'no PTY write when child died during wait');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W7-3: default liveness helper sees the real test-process pid as alive → happy path unchanged
+test('W7 default helper: real-pid mock passes default signal-0 probe → happy path unchanged', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR             = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS  = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-default-alive-' + Date.now();
+    const ctx = makeCtx(SESSION_ID);
+    delete ctx.isPtyAlive; // force the default signal-0 path
+
+    const watcher = start(ctx);
+    const uuid = 'default-alive-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/help', wait: 'idle' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true, 'live pid → default helper returns true → ok');
+    assert.deepEqual(ctx._written, ['/help\r']);
 
     watcher.close();
   } finally {
