@@ -7,6 +7,16 @@
 // then deleted.
 //
 // Exports: start(ctx) where ctx = { getPtyForSession, isSessionBusy, log }
+//
+// Security limits (defense-in-depth):
+//   - Max trigger file size: 64 KB (C1)
+//   - Symlinks rejected via lstat (C2)
+//   - Max command length: 4 KB (W2)
+//   - Forbidden control chars in command: \r \n \0 \x1b (W3)
+//   - Max concurrent in-flight triggers: 8 (W4)
+//
+// Platform note: fs.watch is Linux-only reliable (I2). On macOS, inotify
+// events may be coalesced or delayed; not blocked but not tested.
 'use strict';
 
 const fs   = require('fs');
@@ -17,18 +27,29 @@ const DEFAULT_TRIGGERS_DIR   = path.join(os.homedir(), '.switchboard', 'triggers
 const DEFAULT_IDLE_TIMEOUT   = 30_000; // ms
 const IDLE_POLL_INTERVAL     = 100;   // ms
 
+const MAX_TRIGGER_SIZE  = 64 * 1024;  // 64 KB  (C1)
+const MAX_COMMAND_LEN   = 4 * 1024;   // 4 KB   (W2)
+const MAX_INFLIGHT      = 8;          // concurrency cap (W4)
+// Control chars forbidden in command: CR, LF, NUL, ESC (W3)
+const FORBIDDEN_COMMAND_RE = /[\r\n\0\x1b]/;
+
 function getTriggersDir() {
   return process.env.SWITCHBOARD_TRIGGERS_DIR || DEFAULT_TRIGGERS_DIR;
 }
 
 function getIdleTimeout() {
   const v = process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
-  return v ? parseInt(v, 10) : DEFAULT_IDLE_TIMEOUT;
+  if (v !== undefined) {
+    const parsed = parseInt(v, 10);
+    return Number.isFinite(parsed) ? parsed : DEFAULT_IDLE_TIMEOUT; // I4: NaN guard
+  }
+  return DEFAULT_IDLE_TIMEOUT;
 }
 
 /**
- * Poll until isSessionBusy(sessionId) returns false, or the timeout expires.
- * Returns { timedOut: boolean, waited_ms: number }.
+ * Poll until isSessionBusy(sessionId) returns false, or the timeout expires,
+ * or the session exits (PTY no longer available).
+ * Returns { timedOut: boolean, sessionExited: boolean, waited_ms: number }.
  */
 function waitForIdle(sessionId, ctx) {
   return new Promise((resolve) => {
@@ -37,11 +58,17 @@ function waitForIdle(sessionId, ctx) {
 
     function check() {
       const waited_ms = Date.now() - start;
+
+      // W5: detect PTY closure during wait
+      if (!ctx.getPtyForSession(sessionId)) {
+        return resolve({ timedOut: false, sessionExited: true, waited_ms });
+      }
+
       if (!ctx.isSessionBusy(sessionId)) {
-        return resolve({ timedOut: false, waited_ms });
+        return resolve({ timedOut: false, sessionExited: false, waited_ms });
       }
       if (waited_ms >= timeout) {
-        return resolve({ timedOut: true, waited_ms });
+        return resolve({ timedOut: true, sessionExited: false, waited_ms });
       }
       setTimeout(check, IDLE_POLL_INTERVAL);
     }
@@ -62,10 +89,14 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
   const triggerPath = path.join(triggersDir, name);
   const uuid        = name.slice(0, -5); // strip ".json"
   const resultPath  = path.join(processedDir, uuid + '.result.json');
+  const resultTmp   = resultPath + '.tmp'; // I1: atomic write temp path
 
+  // I1: atomic result write — write to .tmp then rename so pollers never
+  // observe a partial JSON file.
   async function writeResult(result) {
     try {
-      fs.writeFileSync(resultPath, JSON.stringify(result) + '\n', 'utf8');
+      fs.writeFileSync(resultTmp, JSON.stringify(result) + '\n', 'utf8');
+      fs.renameSync(resultTmp, resultPath);
     } catch (err) {
       ctx.log.error('[trigger-watcher] Failed to write result file:', err.message);
     }
@@ -77,18 +108,59 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     }
   }
 
-  // ── 1. Read + parse ───────────────────────────────────────────────────────
-  let trigger;
+  // ── 1. lstat + size guard (C1 + C2) ──────────────────────────────────────
+  let stat;
   try {
-    const raw = fs.readFileSync(triggerPath, 'utf8');
-    trigger   = JSON.parse(raw);
-  } catch (err) {
-    ctx.log.warn('[trigger-watcher] Unreadable/unparseable trigger:', name, err.message);
-    await writeResult({ ok: false, error: 'invalid JSON: ' + err.message });
+    stat = fs.lstatSync(triggerPath); // C2: lstat does NOT follow symlinks
+  } catch {
+    // File gone between access check and here — skip silently
     return;
   }
 
-  // ── 2. Validate shape ─────────────────────────────────────────────────────
+  if (!stat.isFile()) {
+    // C2: reject symlinks, directories, device nodes, etc.
+    ctx.log.warn('[trigger-watcher] Non-regular-file trigger rejected:', name);
+    await writeResult({ ok: false, error: 'trigger must be a regular file' });
+    return;
+  }
+
+  if (stat.size > MAX_TRIGGER_SIZE) {
+    // C1: reject oversized files before reading
+    ctx.log.warn('[trigger-watcher] Oversized trigger rejected:', name, stat.size);
+    await writeResult({ ok: false, error: 'trigger too large (max 64 KB)' });
+    return;
+  }
+
+  // ── 2. Read + parse (with SyntaxError retry for W1 partial-write race) ───
+  let trigger;
+  let lastParseErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    // W1: on second attempt, wait 50 ms (partial-write window) then retry
+    if (attempt === 1) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+    try {
+      const raw = fs.readFileSync(triggerPath, 'utf8');
+      trigger   = JSON.parse(raw);
+      lastParseErr = null;
+      break; // success
+    } catch (err) {
+      lastParseErr = err;
+      if (!(err instanceof SyntaxError)) {
+        // ENOENT or other I/O error — no retry useful
+        break;
+      }
+      // SyntaxError on attempt 0: retry once after 50 ms (W1)
+    }
+  }
+
+  if (lastParseErr) {
+    ctx.log.warn('[trigger-watcher] Unreadable/unparseable trigger:', name, lastParseErr.message);
+    await writeResult({ ok: false, error: 'invalid JSON: ' + lastParseErr.message });
+    return;
+  }
+
+  // ── 3. Validate shape ─────────────────────────────────────────────────────
   const { sessionId, command, wait = 'none' } = trigger;
 
   if (typeof sessionId !== 'string' || !sessionId) {
@@ -100,7 +172,19 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     return;
   }
 
-  // ── 3. Look up session ────────────────────────────────────────────────────
+  // W2: command length cap
+  if (command.length > MAX_COMMAND_LEN) {
+    await writeResult({ ok: false, error: 'command too long (max 4 KB)', sessionId });
+    return;
+  }
+
+  // W3: reject forbidden control characters
+  if (FORBIDDEN_COMMAND_RE.test(command)) {
+    await writeResult({ ok: false, error: 'command contains forbidden control characters (\\r \\n \\0 \\x1b)', sessionId });
+    return;
+  }
+
+  // ── 4. Look up session ────────────────────────────────────────────────────
   const sessionEntry = ctx.getPtyForSession(sessionId);
   if (!sessionEntry) {
     ctx.log.warn('[trigger-watcher] Session not found:', sessionId);
@@ -110,11 +194,19 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
 
   const { ptyProcess } = sessionEntry;
 
-  // ── 4. Idle wait ──────────────────────────────────────────────────────────
+  // ── 5. Idle wait ──────────────────────────────────────────────────────────
   let waited_ms = 0;
   if (wait === 'idle') {
     const result = await waitForIdle(sessionId, ctx);
     waited_ms    = result.waited_ms;
+
+    // W5: session exited during wait
+    if (result.sessionExited) {
+      ctx.log.warn('[trigger-watcher] Session exited during wait:', sessionId);
+      await writeResult({ ok: false, error: 'session exited during wait', sessionId, waited_ms });
+      return;
+    }
+
     if (result.timedOut) {
       ctx.log.warn('[trigger-watcher] Idle timeout for session:', sessionId);
       await writeResult({ ok: false, error: 'timeout waiting for idle', sessionId, waited_ms });
@@ -122,7 +214,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     }
   }
 
-  // ── 5. Write to PTY ───────────────────────────────────────────────────────
+  // ── 6. Write to PTY ───────────────────────────────────────────────────────
   try {
     ptyProcess.write(command + '\r');
   } catch (err) {
@@ -166,8 +258,28 @@ function start(ctx) {
 
   ctx.log.info('[trigger-watcher] Watching:', triggersDir);
 
-  // Track in-flight processing to avoid double-processing on noisy fs events
+  // Track in-flight processing to avoid double-processing on noisy fs events.
+  // W4: also enforces the MAX_INFLIGHT concurrency cap.
   const inFlight = new Set();
+  // W4: queue of filenames awaiting an in-flight slot
+  const waitQueue = [];
+
+  function scheduleNext() {
+    while (waitQueue.length > 0 && inFlight.size < MAX_INFLIGHT) {
+      const filename = waitQueue.shift();
+      // Dedup: may have been enqueued twice before a slot opened
+      if (inFlight.has(filename)) continue;
+      dispatch(filename);
+    }
+  }
+
+  function dispatch(filename) {
+    inFlight.add(filename);
+    processTriggerFile(filename, ctx, triggersDir, processedDir).finally(() => {
+      inFlight.delete(filename);
+      scheduleNext();
+    });
+  }
 
   let watcher;
   try {
@@ -188,10 +300,12 @@ function start(ctx) {
         return; // File gone or not readable yet — skip
       }
 
-      inFlight.add(filename);
-      processTriggerFile(filename, ctx, triggersDir, processedDir).finally(() => {
-        inFlight.delete(filename);
-      });
+      if (inFlight.size >= MAX_INFLIGHT) {
+        // W4: backpressure — queue for later
+        waitQueue.push(filename);
+        return;
+      }
+      dispatch(filename);
     });
 
     watcher.on('error', (err) => {
