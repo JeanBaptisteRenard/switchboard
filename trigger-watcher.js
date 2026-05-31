@@ -15,6 +15,7 @@
 //   - Forbidden control chars in command: \r \n \0 \x1b (W3)
 //   - Max concurrent in-flight triggers: 8 (W4)
 //   - Per-trigger timeout_ms capped at 600 000 ms (W6)
+//   - Child-process liveness check before write (W7)
 //
 // Platform note: fs.watch is Linux-only reliable (I2). On macOS, inotify
 // events may be coalesced or delayed; not blocked but not tested.
@@ -41,6 +42,22 @@ const MAX_COMMAND_LEN   = 4 * 1024;   // 4 KB   (W2)
 const MAX_INFLIGHT      = 8;          // concurrency cap (W4)
 // Control chars forbidden in command: CR, LF, NUL, ESC (W3)
 const FORBIDDEN_COMMAND_RE = /[\r\n\0\x1b]/;
+
+// W7 — child-process liveness check.
+// node-pty's ptyProcess.write() is silent on a dead child: the bytes land in
+// the kernel PTY buffer and are never consumed.  Without this check the watcher
+// would happily report ok:true on writes nobody will ever read.  We use
+// signal 0 (POSIX no-op probe) — throws ESRCH if the process is gone,
+// throws EPERM if it exists but we can't signal it (still alive, treat as alive).
+function defaultIsPtyAlive(ptyProcess) {
+  if (!ptyProcess || typeof ptyProcess.pid !== 'number') return false;
+  try {
+    process.kill(ptyProcess.pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
 
 function getTriggersDir() {
   return process.env.SWITCHBOARD_TRIGGERS_DIR || DEFAULT_TRIGGERS_DIR;
@@ -227,6 +244,18 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
   }
 
   const { ptyProcess } = sessionEntry;
+  const isPtyAlive = ctx.isPtyAlive || defaultIsPtyAlive;
+
+  // W7 — pre-flight liveness check.  main.js may keep a stale entry in its
+  // activeSessions map after a Claude process exited "cleanly" (Ctrl+D, /exit)
+  // without the Switchboard window closing.  Without this guard we'd wait the
+  // full idle-timeout for a busy flag that will never flip, then write into a
+  // dead PTY and report ok:true.
+  if (!isPtyAlive(ptyProcess)) {
+    ctx.log.warn('[trigger-watcher] Target process not running:', sessionId);
+    await writeResult({ ok: false, error: 'target process not running', sessionId });
+    return;
+  }
 
   // ── 5. Idle wait ──────────────────────────────────────────────────────────
   let waited_ms = 0;
@@ -249,6 +278,16 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
   }
 
   // ── 6. Write to PTY ───────────────────────────────────────────────────────
+  // W7 — re-check liveness right before writing.  The idle wait can be up to
+  // 10 min (MAX_TRIGGER_TIMEOUT); the child may have exited during that window
+  // while busy-was-true never flipped.  Without this re-check we'd write into a
+  // dead PTY and claim ok:true.
+  if (!isPtyAlive(ptyProcess)) {
+    ctx.log.warn('[trigger-watcher] Target process exited during wait:', sessionId);
+    await writeResult({ ok: false, error: 'target process not running', sessionId, waited_ms });
+    return;
+  }
+
   try {
     ptyProcess.write(command + '\r');
   } catch (err) {
@@ -274,6 +313,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
  * @param {object} ctx
  * @param {function} ctx.getPtyForSession  (sessionId: string) => { ptyProcess } | null
  * @param {function} ctx.isSessionBusy     (sessionId: string) => boolean
+ * @param {function} [ctx.isPtyAlive]      (ptyProcess) => boolean (default: signal 0 probe)
  * @param {object}   ctx.log               electron-log compatible logger
  * @returns {{ close(): void }}
  */
