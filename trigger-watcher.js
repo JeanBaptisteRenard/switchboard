@@ -16,6 +16,7 @@
 //   - Max concurrent in-flight triggers: 8 (W4)
 //   - Per-trigger timeout_ms capped at 600 000 ms (W6)
 //   - Child-process liveness check before write (W7)
+//   - Max chain length: 20 steps (W8)
 //
 // Platform note: fs.watch is Linux-only reliable (I2). On macOS, inotify
 // events may be coalesced or delayed; not blocked but not tested.
@@ -40,6 +41,11 @@ const IDLE_POLL_INTERVAL     = 100;   // ms
 const MAX_TRIGGER_SIZE  = 64 * 1024;  // 64 KB  (C1)
 const MAX_COMMAND_LEN   = 4 * 1024;   // 4 KB   (W2)
 const MAX_INFLIGHT      = 8;          // concurrency cap (W4)
+const MAX_CHAIN_LENGTH  = 20;         // max steps per chain (W8)
+// Max time to wait for busy=true after injecting a command.
+// Claude may answer so fast that we never observe the rising edge;
+// after BUSY_RISE_TIMEOUT_MS we assume the turn completed instantly and move on.
+const BUSY_RISE_TIMEOUT_MS   = 2000; // ms
 // Control chars forbidden in command: CR, LF, NUL, ESC (W3)
 const FORBIDDEN_COMMAND_RE = /[\r\n\0\x1b]/;
 
@@ -106,6 +112,104 @@ function waitForIdle(sessionId, ctx, timeoutMs) {
 
     check();
   });
+}
+
+/**
+ * After injecting a command, wait for the session's busy state to go:
+ *   true (turn started) → false (turn finished).
+ *
+ * TOCTOU note: Claude may answer so fast that busy=true is never observed
+ * between IDLE_POLL_INTERVAL (100ms) ticks.  We wait up to BUSY_RISE_TIMEOUT_MS
+ * (2s) for the rising edge; if it doesn't arrive within that window (but
+ * before the global deadline), we assume the turn completed instantly and
+ * return immediately.
+ *
+ * Known risk of the instant-reply heuristic: if the model takes longer than
+ * 2 s to start tokenizing (cold start, network stall, paused mid-stream),
+ * Phase 1 wrongly returns success and the next chain step's input will be
+ * appended to the previous turn rather than starting a new prompt.  This is
+ * accepted as the lesser of two evils — the alternative (longer wait) penalises
+ * the common fast-reply case.  Callers that need stronger guarantees should
+ * set a per-step `timeout_ms` and inspect `waited_ms` to detect the rare
+ * "near-2000ms then declared instant" pattern.
+ *
+ * If the global deadline fires first, we return {timedOut: true}.
+ *
+ * @param {string} sessionId
+ * @param {object} ctx
+ * @param {number} deadlineMs  absolute epoch-ms deadline (shared global deadline)
+ * Returns { timedOut: boolean, sessionExited: boolean, waited_ms: number }.
+ */
+function waitForTurnComplete(sessionId, ctx, deadlineMs) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    // busyRiseDeadline is the earliest of: 2s from now, or the global deadline.
+    // If the global deadline is sooner, Phase 1 times out → timedOut:true.
+    // If BUSY_RISE_TIMEOUT_MS fires first, we assume instant-reply → timedOut:false.
+    const busyRiseAt = start + BUSY_RISE_TIMEOUT_MS;
+
+    // Phase 1: wait for busy=true (turn started accepting our injected command)
+    function waitForBusy() {
+      const now = Date.now();
+
+      if (now >= deadlineMs) {
+        return resolve({ timedOut: true, sessionExited: false, waited_ms: now - start });
+      }
+
+      if (!ctx.getPtyForSession(sessionId)) {
+        return resolve({ timedOut: false, sessionExited: true, waited_ms: now - start });
+      }
+
+      if (ctx.isSessionBusy(sessionId)) {
+        // Rising edge observed — proceed to Phase 2
+        return waitForIdle2();
+      }
+
+      if (now >= busyRiseAt) {
+        // TOCTOU: BUSY_RISE_TIMEOUT_MS elapsed without busy rising;
+        // assume the turn completed so quickly we missed the rising edge.
+        return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
+      }
+
+      setTimeout(waitForBusy, IDLE_POLL_INTERVAL);
+    }
+
+    // Phase 2: wait for busy=false (turn finished)
+    function waitForIdle2() {
+      const now = Date.now();
+      if (now >= deadlineMs) {
+        return resolve({ timedOut: true, sessionExited: false, waited_ms: now - start });
+      }
+
+      if (!ctx.getPtyForSession(sessionId)) {
+        return resolve({ timedOut: false, sessionExited: true, waited_ms: now - start });
+      }
+
+      if (!ctx.isSessionBusy(sessionId)) {
+        return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
+      }
+
+      setTimeout(waitForIdle2, IDLE_POLL_INTERVAL);
+    }
+
+    waitForBusy();
+  });
+}
+
+/**
+ * Validate a single timeout_ms value (for top-level or per-step).
+ * Returns null if valid, or an error string if invalid.
+ */
+function validateTimeoutMs(value) {
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value <= 0 ||
+    value > MAX_TRIGGER_TIMEOUT
+  ) {
+    return 'invalid timeout_ms';
+  }
+  return null;
 }
 
 /**
@@ -192,41 +296,94 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
   }
 
   // ── 3. Validate shape ─────────────────────────────────────────────────────
-  const { sessionId, command, wait = 'none', timeout_ms } = trigger;
+  const { sessionId, command, chain, wait = 'none', timeout_ms } = trigger;
 
   if (typeof sessionId !== 'string' || !sessionId) {
     await writeResult({ ok: false, error: 'missing required field: sessionId', sessionId: sessionId || null });
     return;
   }
-  if (typeof command !== 'string' || !command) {
-    await writeResult({ ok: false, error: 'missing required field: command', sessionId });
+
+  // Mutual exclusion: command and chain cannot both be present
+  if (command !== undefined && chain !== undefined) {
+    await writeResult({ ok: false, error: 'command and chain are mutually exclusive', sessionId });
     return;
   }
 
-  // W2: command length cap
-  if (command.length > MAX_COMMAND_LEN) {
-    await writeResult({ ok: false, error: 'command too long (max 4 KB)', sessionId });
+  // Must have either command or chain
+  if (command === undefined && chain === undefined) {
+    await writeResult({ ok: false, error: 'missing required field: command or chain', sessionId });
     return;
   }
 
-  // W3: reject forbidden control characters
-  if (FORBIDDEN_COMMAND_RE.test(command)) {
-    await writeResult({ ok: false, error: 'command contains forbidden control characters (\\r \\n \\0 \\x1b)', sessionId });
-    return;
+  // ── 3a. Validate single-command path ─────────────────────────────────────
+  if (command !== undefined) {
+    if (typeof command !== 'string' || !command) {
+      await writeResult({ ok: false, error: 'missing required field: command', sessionId });
+      return;
+    }
+
+    // W2: command length cap
+    if (command.length > MAX_COMMAND_LEN) {
+      await writeResult({ ok: false, error: 'command too long (max 4 KB)', sessionId });
+      return;
+    }
+
+    // W3: reject forbidden control characters
+    if (FORBIDDEN_COMMAND_RE.test(command)) {
+      await writeResult({ ok: false, error: 'command contains forbidden control characters (\\r \\n \\0 \\x1b)', sessionId });
+      return;
+    }
   }
 
-  // W6: validate optional per-trigger timeout_ms
-  // Precedence: timeout_ms (per-trigger) > SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS (env) > default.
-  // Must be a positive integer not exceeding MAX_TRIGGER_TIMEOUT (600 000 ms).
-  // Reject and release semaphore immediately on invalid value — do NOT inject.
+  // ── 3b. Validate chain path ───────────────────────────────────────────────
+  if (chain !== undefined) {
+    // W8: chain must be a non-empty array, length ≤ MAX_CHAIN_LENGTH
+    if (!Array.isArray(chain) || chain.length === 0) {
+      await writeResult({ ok: false, error: 'chain must be a non-empty array', sessionId });
+      return;
+    }
+    if (chain.length > MAX_CHAIN_LENGTH) {
+      await writeResult({ ok: false, error: `chain too long (max ${MAX_CHAIN_LENGTH} steps)`, sessionId });
+      return;
+    }
+
+    // Validate each step
+    for (let i = 0; i < chain.length; i++) {
+      const step = chain[i];
+
+      if (typeof step.command !== 'string' || !step.command) {
+        await writeResult({ ok: false, error: `step[${i}]: missing required command string`, sessionId });
+        return;
+      }
+
+      // W2: step command length cap
+      if (step.command.length > MAX_COMMAND_LEN) {
+        await writeResult({ ok: false, error: `step[${i}]: command too long (max 4 KB)`, sessionId });
+        return;
+      }
+
+      // W3: reject forbidden control characters in step command
+      if (FORBIDDEN_COMMAND_RE.test(step.command)) {
+        await writeResult({ ok: false, error: `step[${i}]: command contains forbidden control characters (\\r \\n \\0 \\x1b)`, sessionId });
+        return;
+      }
+
+      // W6: validate optional per-step timeout_ms
+      if (step.timeout_ms !== undefined) {
+        const err = validateTimeoutMs(step.timeout_ms);
+        if (err) {
+          await writeResult({ ok: false, error: `step[${i}]: invalid step timeout_ms`, sessionId });
+          return;
+        }
+      }
+    }
+  }
+
+  // W6: validate optional top-level timeout_ms
   let resolvedTimeoutMs;
   if (timeout_ms !== undefined) {
-    if (
-      typeof timeout_ms !== 'number' ||
-      !Number.isInteger(timeout_ms) ||
-      timeout_ms <= 0 ||
-      timeout_ms > MAX_TRIGGER_TIMEOUT
-    ) {
+    const err = validateTimeoutMs(timeout_ms);
+    if (err) {
       await writeResult({ ok: false, error: 'invalid timeout_ms', sessionId });
       return;
     }
@@ -257,53 +414,171 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     return;
   }
 
-  // ── 5. Idle wait ──────────────────────────────────────────────────────────
-  let waited_ms = 0;
+  // ── 5. Single-command path ────────────────────────────────────────────────
+  if (command !== undefined) {
+    let waited_ms = 0;
+    if (wait === 'idle') {
+      const result = await waitForIdle(sessionId, ctx, resolvedTimeoutMs);
+      waited_ms    = result.waited_ms;
+
+      // W5: session exited during wait
+      if (result.sessionExited) {
+        ctx.log.warn('[trigger-watcher] Session exited during wait:', sessionId);
+        await writeResult({ ok: false, error: 'session exited during wait', sessionId, waited_ms });
+        return;
+      }
+
+      if (result.timedOut) {
+        ctx.log.warn('[trigger-watcher] Idle timeout for session:', sessionId);
+        await writeResult({ ok: false, error: 'timeout waiting for idle', sessionId, waited_ms });
+        return;
+      }
+    }
+
+    // W7 — re-check liveness right before writing.  The idle wait can be up to
+    // 10 min (MAX_TRIGGER_TIMEOUT); the child may have exited during that
+    // window while busy-was-true never flipped.  Without this re-check we'd
+    // write into a dead PTY and claim ok:true.
+    if (!isPtyAlive(ptyProcess)) {
+      ctx.log.warn('[trigger-watcher] Target process exited during wait:', sessionId);
+      await writeResult({ ok: false, error: 'target process not running', sessionId, waited_ms });
+      return;
+    }
+
+    // Write to PTY
+    try {
+      ptyProcess.write(command + '\r');
+    } catch (err) {
+      ctx.log.error('[trigger-watcher] PTY write failed:', err.message);
+      await writeResult({ ok: false, error: 'pty write failed: ' + err.message, sessionId });
+      return;
+    }
+
+    ctx.log.info(`[trigger-watcher] Sent command to ${sessionId}: ${command}`);
+
+    await writeResult({
+      ok:        true,
+      sessionId,
+      command,
+      sent_at:   new Date().toISOString(),
+      waited_ms,
+    });
+    return;
+  }
+
+  // ── 6. Chain path ─────────────────────────────────────────────────────────
+  // Global deadline for the whole chain
+  const globalTimeout = (resolvedTimeoutMs !== undefined) ? resolvedTimeoutMs : getIdleTimeout();
+  const globalDeadline = Date.now() + globalTimeout;
+
+  const steps = [];
+  let totalWaitedMs = 0;
+  let step0SentAt = null;
+
+  // Step 0: initial wait (respects `wait` field)
   if (wait === 'idle') {
-    const result = await waitForIdle(sessionId, ctx, resolvedTimeoutMs);
-    waited_ms    = result.waited_ms;
+    const remainingMs = globalDeadline - Date.now();
+    const result = await waitForIdle(sessionId, ctx, remainingMs);
+    totalWaitedMs += result.waited_ms;
 
-    // W5: session exited during wait
     if (result.sessionExited) {
-      ctx.log.warn('[trigger-watcher] Session exited during wait:', sessionId);
-      await writeResult({ ok: false, error: 'session exited during wait', sessionId, waited_ms });
+      ctx.log.warn('[trigger-watcher] Session exited during chain initial wait:', sessionId);
+      await writeResult({ ok: false, error: 'session exited during wait', partial: true, steps_completed: 0, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
       return;
     }
 
-    if (result.timedOut) {
-      ctx.log.warn('[trigger-watcher] Idle timeout for session:', sessionId);
-      await writeResult({ ok: false, error: 'timeout waiting for idle', sessionId, waited_ms });
+    if (result.timedOut || Date.now() >= globalDeadline) {
+      ctx.log.warn('[trigger-watcher] Chain timeout during initial idle wait:', sessionId);
+      await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: 0, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
       return;
     }
   }
 
-  // ── 6. Write to PTY ───────────────────────────────────────────────────────
-  // W7 — re-check liveness right before writing.  The idle wait can be up to
-  // 10 min (MAX_TRIGGER_TIMEOUT); the child may have exited during that window
-  // while busy-was-true never flipped.  Without this re-check we'd write into a
-  // dead PTY and claim ok:true.
-  if (!isPtyAlive(ptyProcess)) {
-    ctx.log.warn('[trigger-watcher] Target process exited during wait:', sessionId);
-    await writeResult({ ok: false, error: 'target process not running', sessionId, waited_ms });
-    return;
-  }
+  for (let i = 0; i < chain.length; i++) {
+    const step = chain[i];
 
-  try {
-    ptyProcess.write(command + '\r');
-  } catch (err) {
-    ctx.log.error('[trigger-watcher] PTY write failed:', err.message);
-    await writeResult({ ok: false, error: 'pty write failed: ' + err.message, sessionId });
-    return;
-  }
+    // Check deadline before each step
+    if (Date.now() >= globalDeadline) {
+      ctx.log.warn(`[trigger-watcher] Chain global timeout before step ${i}:`, sessionId);
+      await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      return;
+    }
 
-  ctx.log.info(`[trigger-watcher] Sent command to ${sessionId}: ${command}`);
+    // Re-check session still present
+    const entry = ctx.getPtyForSession(sessionId);
+    if (!entry) {
+      ctx.log.warn(`[trigger-watcher] Session exited before chain step ${i}:`, sessionId);
+      await writeResult({ ok: false, error: 'session exited during wait', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      return;
+    }
+
+    // W7 — liveness check before each step's write.  The previous step's turn
+    // wait may have spanned several minutes; the child could have exited while
+    // main.js still has a stale activeSessions entry.  See also the
+    // liveness→write TOCTOU window: an exit between this probe and
+    // `entry.ptyProcess.write()` below is bounded by the try/catch on write.
+    if (!isPtyAlive(entry.ptyProcess)) {
+      ctx.log.warn(`[trigger-watcher] Target process not running at chain step ${i}:`, sessionId);
+      await writeResult({ ok: false, error: 'target process not running', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      return;
+    }
+
+    // Inject the step command
+    const stepSentAt = new Date().toISOString();
+    if (i === 0) step0SentAt = stepSentAt;
+
+    try {
+      entry.ptyProcess.write(step.command + '\r');
+    } catch (err) {
+      ctx.log.error(`[trigger-watcher] PTY write failed at chain step ${i}:`, err.message);
+      await writeResult({ ok: false, error: 'pty write failed: ' + err.message, partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      return;
+    }
+
+    ctx.log.info(`[trigger-watcher] Chain step ${i} sent to ${sessionId}: ${step.command}`);
+
+    // Wait for the turn to complete (except after the last step — no need to wait)
+    let stepWaitedMs = 0;
+    if (i < chain.length - 1) {
+      // Determine timeout for this step's turn completion.
+      // Per-step timeout_ms (if set) is the deadline for THIS step's turn wait only.
+      // It is capped by the remaining global deadline.
+      let stepTimeoutMs;
+      if (step.timeout_ms !== undefined) {
+        stepTimeoutMs = Math.min(step.timeout_ms, globalDeadline - Date.now());
+      } else {
+        stepTimeoutMs = globalDeadline - Date.now();
+      }
+
+      const stepDeadline = Date.now() + stepTimeoutMs;
+      const result = await waitForTurnComplete(sessionId, ctx, stepDeadline);
+      stepWaitedMs = result.waited_ms;
+      totalWaitedMs += stepWaitedMs;
+
+      if (result.sessionExited) {
+        ctx.log.warn(`[trigger-watcher] Session exited during chain step ${i} turn wait:`, sessionId);
+        steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs });
+        await writeResult({ ok: false, error: 'session exited during wait', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+        return;
+      }
+
+      if (result.timedOut) {
+        ctx.log.warn(`[trigger-watcher] Chain timeout at step ${i}:`, sessionId);
+        steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs });
+        await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+        return;
+      }
+    }
+
+    steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs });
+  }
 
   await writeResult({
-    ok:        true,
+    ok:               true,
     sessionId,
-    command,
-    sent_at:   new Date().toISOString(),
-    waited_ms,
+    sent_at:          step0SentAt,
+    steps,
+    total_waited_ms:  totalWaitedMs,
   });
 }
 

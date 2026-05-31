@@ -995,3 +995,596 @@ test('W7 default helper: real-pid mock passes default signal-0 probe → happy p
     cleanup(tmp);
   }
 });
+
+// ── chain field tests ──────────────────────────────────────────────────────────
+
+/**
+ * Build a ctx that simulates sequential turns for a chain test.
+ *
+ * When opts.noAutoTurn is true, no busy/idle simulation happens automatically
+ * on write — the test controls state manually via ctx._setBusy().
+ * Otherwise, each write schedules: busy after 50ms, idle after 200ms.
+ */
+function makeChainCtx(sessionId, opts = {}) {
+  const written = [];
+  let busy = opts.initiallyBusy || false;
+  let sessionPresent = true;
+
+  const ptyProcess = {
+    pid: process.pid,
+    write(data) {
+      if (opts.ptyThrows) throw new Error('PTY closed');
+      written.push(data);
+      // Auto-simulate a turn: become busy after 50ms, then idle after 200ms
+      if (!opts.noAutoTurn) {
+        setTimeout(() => { busy = true; }, 50);
+        setTimeout(() => { busy = false; }, 200);
+      }
+    },
+  };
+
+  let alive = opts.alive !== undefined ? opts.alive : true;
+
+  return {
+    log: silentLog,
+    getPtyForSession(id) {
+      if (!sessionPresent) return null;
+      return id === sessionId ? { ptyProcess } : null;
+    },
+    isSessionBusy(id) {
+      return id === sessionId ? busy : false;
+    },
+    isPtyAlive() { return alive; },
+    _written: written,
+    _ptyProcess: ptyProcess,
+    _removeSession() { sessionPresent = false; },
+    _setBusy(v) { busy = v; },
+    _killPty() { alive = false; },
+  };
+}
+
+// CHAIN-1: happy path — 3-step chain, all succeed, result shape correct
+test('chain happy path: 3-step chain → 3 PTY writes, result ok:true with steps array', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-happy-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    const watcher = start(ctx);
+
+    const uuid = 'chain-happy-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'idle',
+      chain: [
+        { command: '/compact' },
+        { command: 'verify result file and commit' },
+        { command: 'open the PR' },
+      ],
+      timeout_ms: 5000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true, 'result.ok should be true');
+    assert.equal(result.sessionId, SESSION_ID);
+    assert.ok(result.sent_at, 'sent_at should be set');
+    assert.ok(Array.isArray(result.steps), 'steps should be an array');
+    assert.equal(result.steps.length, 3, 'steps should have 3 entries');
+    assert.equal(result.steps[0].idx, 0);
+    assert.equal(result.steps[0].command, '/compact');
+    assert.ok(result.steps[0].sent_at, 'steps[0].sent_at should be set');
+    assert.equal(typeof result.steps[0].waited_ms, 'number');
+    assert.equal(result.steps[1].idx, 1);
+    assert.equal(result.steps[1].command, 'verify result file and commit');
+    assert.equal(result.steps[2].idx, 2);
+    assert.equal(result.steps[2].command, 'open the PR');
+    assert.equal(typeof result.total_waited_ms, 'number');
+
+    // All 3 writes happened in order
+    assert.deepEqual(ctx._written, ['/compact\r', 'verify result file and commit\r', 'open the PR\r']);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// CHAIN-2: validation — command and chain both present → rejected before MAX_INFLIGHT
+test('chain+command mutually exclusive: both present → ok:false, error mentions mutually exclusive', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-both-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    const watcher = start(ctx);
+
+    const uuid = 'chain-both-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      command: '/compact',
+      chain: [{ command: '/compact' }],
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /mutually exclusive/i);
+    assert.deepEqual(ctx._written, [], 'no PTY write');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// CHAIN-3: validation — chain is empty array → rejected
+test('chain validation: empty array → ok:false, error mentions chain', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-empty-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    const watcher = start(ctx);
+
+    const uuid = 'chain-empty-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, chain: [] });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /chain/i);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// CHAIN-4: validation — chain too long (> 20) → rejected
+test('chain validation: length > 20 → ok:false, error mentions chain', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-long-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    const watcher = start(ctx);
+
+    const uuid = 'chain-long-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      chain: Array.from({ length: 21 }, (_, i) => ({ command: `step-${i}` })),
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /chain/i);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// CHAIN-5: validation — step missing command → rejected
+test('chain validation: step without command string → ok:false', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-badstep-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    const watcher = start(ctx);
+
+    const uuid = 'chain-badstep-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      chain: [{ command: '/compact' }, { notcommand: 'oops' }],
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /step/i);
+    assert.deepEqual(ctx._written, [], 'no PTY write for invalid chain step');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// CHAIN-6: validation — step command too long → rejected
+test('chain validation: step command too long → ok:false, no PTY write', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-longcmd-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    const watcher = start(ctx);
+
+    const uuid = 'chain-longcmd-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      chain: [{ command: '/compact' }, { command: 'x'.repeat(4097) }],
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /too long/i);
+    assert.deepEqual(ctx._written, [], 'no PTY write for oversized step command');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// CHAIN-7: validation — step command with forbidden chars → rejected
+test('chain validation: step command with forbidden chars → ok:false, no PTY write', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-ctrlcmd-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    const watcher = start(ctx);
+
+    const uuid = 'chain-ctrlcmd-' + Date.now();
+    const payload = JSON.stringify({
+      sessionId: SESSION_ID,
+      chain: [{ command: '/compact' }, { command: '/clear\rstep2' }],
+    });
+    fs.writeFileSync(path.join(tmp, uuid + '.json'), payload, 'utf8');
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /forbidden control/i);
+    assert.deepEqual(ctx._written, [], 'no PTY write for chain step with control chars');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// CHAIN-8: global timeout fires mid-chain → ok:false, partial:true, steps_completed=1
+// Uses a 3-step chain where step 1 (middle) stays busy, blocking step 2 from firing.
+// The global timeout fires while waiting for step 1's turn to complete.
+// Step 0's busy window (50ms→350ms) is intentionally wider than the 100ms poll interval
+// to ensure the poll catches busy=true and enters Phase 2 reliably.
+test('chain timeout mid-chain: global timeout fires → ok:false, partial:true, steps_completed=1', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-timeout-' + Date.now();
+    let busy = false;
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function(data) {
+      origWrite(data);
+      writeCount++;
+      if (writeCount === 1) {
+        // Step 0: busy window 50ms→350ms (wider than poll interval so phase 2 is reliably entered)
+        setTimeout(() => { busy = true; }, 50);
+        setTimeout(() => { busy = false; }, 350);
+      }
+      // Step 1 (middle step): immediately busy, never goes idle → global timeout fires
+      if (writeCount === 2) {
+        busy = true; // set immediately so phase 1 catches it on first poll
+        // Never goes idle → global deadline fires
+      }
+    };
+    ctx.isSessionBusy = (id) => id === SESSION_ID ? busy : false;
+
+    const watcher = start(ctx);
+
+    const uuid = 'chain-timeout-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [
+        { command: '/compact' },
+        { command: 'step-two' },   // stuck — never goes idle
+        { command: 'step-three' }, // never reached
+      ],
+      timeout_ms: 1200, // global timeout: step 0 takes ~350ms, step 1 eats the rest
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false, 'result.ok should be false on timeout');
+    assert.equal(result.partial, true, 'partial should be true');
+    assert.match(result.error, /timeout/i, 'error should mention timeout');
+    assert.equal(result.steps_completed, 1, 'steps_completed should be 1 (step 0 done, step 1 failed)');
+
+    assert.equal(ctx._written[0], '/compact\r', 'step 0 should be written');
+    assert.equal(ctx._written[1], 'step-two\r', 'step 1 should be written (it was sent, just stuck)');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// CHAIN-9: session exits mid-chain → ok:false, partial:true, stops cleanly
+test('chain session exit mid-chain: session exits during step 1 turn wait → ok:false, partial:true', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-exit-' + Date.now();
+    let busy = false;
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function(data) {
+      origWrite(data);
+      writeCount++;
+      if (writeCount === 1) {
+        // Step 0: completes quickly
+        setTimeout(() => { busy = true; }, 20);
+        setTimeout(() => { busy = false; }, 100);
+      }
+      if (writeCount === 2) {
+        // Step 1: session exits during turn wait
+        setTimeout(() => { busy = true; }, 20);
+        setTimeout(() => { ctx._removeSession(); }, 100);
+      }
+    };
+    ctx.isSessionBusy = (id) => id === SESSION_ID ? busy : false;
+
+    const watcher = start(ctx);
+
+    const uuid = 'chain-exit-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'idle',
+      chain: [
+        { command: '/compact' },
+        { command: 'step-two' },
+        { command: 'step-three' },
+      ],
+      timeout_ms: 5000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false, 'result.ok should be false on session exit');
+    assert.equal(result.partial, true, 'partial should be true');
+    assert.match(result.error, /session exited/i);
+    assert.equal(typeof result.steps_completed, 'number');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// CHAIN-10: per-step timeout_ms overrides global for that step (step stays busy → step times out)
+// Uses a 3-step chain so step 1 (middle) has a between-step turn wait that can timeout.
+test('chain per-step timeout_ms: step with short per-step timeout fires before global', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-steptmout-' + Date.now();
+    let busy = false;
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function(data) {
+      origWrite(data);
+      writeCount++;
+      if (writeCount === 1) {
+        // Step 0 completes quickly
+        setTimeout(() => { busy = true; }, 20);
+        setTimeout(() => { busy = false; }, 100);
+      }
+      // Step 1 (middle step): goes busy but never idle → per-step timeout_ms=300 fires
+      if (writeCount === 2) {
+        setTimeout(() => { busy = true; }, 20);
+        // Never goes idle
+      }
+    };
+    ctx.isSessionBusy = (id) => id === SESSION_ID ? busy : false;
+
+    const watcher = start(ctx);
+
+    const uuid = 'chain-steptmout-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'idle',
+      chain: [
+        { command: '/compact' },
+        { command: 'step-two', timeout_ms: 300 }, // short per-step timeout
+        { command: 'step-three' },                // never reached
+      ],
+      timeout_ms: 5000, // generous global timeout — per-step fires first
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false, 'result.ok should be false (step timeout)');
+    assert.equal(result.partial, true);
+    assert.match(result.error, /timeout/i);
+    assert.equal(result.steps_completed, 1);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// CHAIN-11: invalid per-step timeout_ms → rejected before session lookup
+test('chain validation: invalid per-step timeout_ms → ok:false, no PTY write', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-badtmout-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    const watcher = start(ctx);
+
+    const uuid = 'chain-badtmout-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      chain: [
+        { command: '/compact' },
+        { command: 'step-two', timeout_ms: -100 }, // invalid
+      ],
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /step.*timeout_ms|invalid.*step/i);
+    assert.deepEqual(ctx._written, [], 'no PTY write for invalid step timeout_ms');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// CHAIN-12: instant-reply path on a mid-chain step (i>0) — busy never rises within
+// BUSY_RISE_TIMEOUT_MS so the watcher must declare the turn complete and proceed.
+test('chain instant-reply mid-chain: step 1 never sets busy → proceeds to step 2 after ~2s', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '10000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-instant-' + Date.now();
+    let busy = false;
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function(data) {
+      origWrite(data);
+      writeCount++;
+      if (writeCount === 1) {
+        // Step 0: busy window wider than IDLE_POLL_INTERVAL (100ms) so polling
+        // definitely observes both rising and falling edges
+        setTimeout(() => { busy = true; }, 20);
+        setTimeout(() => { busy = false; }, 350);
+      }
+      // writeCount === 2 (step 1): NEVER sets busy → instant-reply path must trigger
+      // (step 2 has no turn wait — it's the last step)
+    };
+    ctx.isSessionBusy = (id) => id === SESSION_ID ? busy : false;
+
+    const watcher = start(ctx);
+
+    const uuid = 'chain-instant-' + Date.now();
+    const startedAt = Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'no-idle',
+      chain: [
+        { command: '/first' },
+        { command: '/second' },  // step 1 never sets busy
+        { command: '/third' },
+      ],
+      timeout_ms: 10000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+    const elapsed = Date.now() - startedAt;
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true, 'chain should succeed via instant-reply path');
+    assert.equal(result.steps.length, 3, 'all 3 steps must have run');
+    assert.deepEqual(ctx._written, ['/first\r', '/second\r', '/third\r']);
+    // Step 1's instant-reply path should have spent ~2s (BUSY_RISE_TIMEOUT_MS)
+    assert.ok(result.steps[1].waited_ms >= 1900 && result.steps[1].waited_ms <= 2400,
+      `step 1 should have waited ~2000ms for the rising edge; got ${result.steps[1].waited_ms}ms`);
+    // Total elapsed dominated by step 1's instant-reply wait
+    assert.ok(elapsed >= 2000 && elapsed <= 3500,
+      `total elapsed should reflect the ~2s busy-rise wait; got ${elapsed}ms`);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
