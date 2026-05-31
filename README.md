@@ -124,7 +124,7 @@ If your `~/Applications/Switchboard.AppImage` is open while you develop:
 
 - **Dev DB isolation** — `task dev` sets `SWITCHBOARD_DATA_DIR=~/.switchboard-dev` automatically so the dev electron uses its own SQLite database. The AppImage keeps using `~/.switchboard/switchboard.db`. They never collide.
 - **Single-instance lock** — if you double-click `Switchboard.AppImage` while it's already open, the second launch quits immediately and focuses the existing window instead of spawning a duplicate process. This was a real data-loss bug (PTYs orphaned) before the fix landed.
-- **Rebuilding is safe** — `task build` writes to `dist/`. Replacing `~/Applications/Switchboard.AppImage` via `cp` does **not** kill the running instance: the live process extracted the AppImage to `/tmp/.mount_*/` at startup and no longer needs the on-disk file. The new code takes effect only on next launch (after you quit fully).
+- **Rebuilding is risky, replacing is safe** — `task build` invokes `electron-builder`, which rebuilds native modules (`better-sqlite3`, `node-pty`) by default. Those `.node` files are loaded by your running AppImage; replacing them mid-run can kill the process (witnessed 2026-05-31). **Quit Switchboard before running `task build`** unless you've confirmed `--config.npmRebuild=false` is in effect. **However**, replacing `~/Applications/Switchboard.AppImage` via `cp` AFTER the build is safe — the live process is fully extracted to `/tmp/.mount_*/` and doesn't need the on-disk file. The new code takes effect only on next launch.
 
 ### For AI agents
 
