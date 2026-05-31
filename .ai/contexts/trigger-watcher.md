@@ -36,14 +36,18 @@ Drop a file at `SWITCHBOARD_TRIGGERS_DIR/<uuid>.json` (default `~/.switchboard/t
 {
   "sessionId": "abc-123-def",
   "command": "/compact",
-  "wait": "idle"
+  "wait": "idle",
+  "timeout_ms": 120000
 }
 ```
 
 Fields:
 - `sessionId` — must match a key in `activeSessions` (`main.js`)
 - `command` — written verbatim as `command + '\r'` to the PTY
-- `wait` — `"none"` (default) | `"idle"`.  `"idle"` polls `isSessionBusy` every 100 ms, up to `SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS` (default 30 000 ms).
+- `wait` — `"none"` (default) | `"idle"`.  `"idle"` polls `isSessionBusy` every 100 ms until the session goes idle or the timeout fires.
+- `timeout_ms` — optional positive integer, ≤ 600 000 ms.  Overrides both the env var and the default for this trigger only.  On invalid value → `{ok:false, error:"invalid timeout_ms"}`, semaphore released, no PTY write.
+
+**Timeout precedence**: per-trigger `timeout_ms` > `SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS` env var > compiled default (300 000 ms).
 
 Result written to `SWITCHBOARD_TRIGGERS_DIR/processed/<uuid>.result.json`:
 
@@ -60,6 +64,7 @@ Trigger file is **deleted** after processing (success or failure).
 - **Deduplication via `inFlight` Set** — noisy `rename` events for the same file (common on Linux inotify) are coalesced; a file is processed at most once per appearance.
 - **`accessSync` guard** — the `rename` event fires both on file creation and deletion; the existence check prevents processing a deletion event.
 - **Directories ignored** — non-`*.json` filenames and any name containing `/` or `path.sep` are skipped.
+- **Invalid `timeout_ms` releases the semaphore** — validation happens before the session look-up and before acquiring an idle-wait slot; a bad value produces a result file and returns without counting against `MAX_INFLIGHT`.
 
 ## Non-obvious behaviors
 

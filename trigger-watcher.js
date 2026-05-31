@@ -14,6 +14,7 @@
 //   - Max command length: 4 KB (W2)
 //   - Forbidden control chars in command: \r \n \0 \x1b (W3)
 //   - Max concurrent in-flight triggers: 8 (W4)
+//   - Per-trigger timeout_ms capped at 600 000 ms (W6)
 //
 // Platform note: fs.watch is Linux-only reliable (I2). On macOS, inotify
 // events may be coalesced or delayed; not blocked but not tested.
@@ -24,7 +25,15 @@ const path = require('path');
 const os   = require('os');
 
 const DEFAULT_TRIGGERS_DIR   = path.join(os.homedir(), '.switchboard', 'triggers');
-const DEFAULT_IDLE_TIMEOUT   = 30_000; // ms
+// Default idle-wait timeout: 5 minutes.
+// Rationale: agentic Claude CLI turns can run 10-20 min between idle states.
+// 30 s (the original default) was too short and would time-out healthy long
+// turns.  300 000 ms (5 min) is the practical upper bound for a genuine wait;
+// anything longer than that without going idle is considered stuck and the
+// harness should escalate instead.  The env var and per-trigger timeout_ms
+// field both override this default (precedence: timeout_ms > env var > default).
+const DEFAULT_IDLE_TIMEOUT   = 300_000; // ms — 5 minutes
+const MAX_TRIGGER_TIMEOUT    = 600_000; // ms — hard cap for per-trigger timeout_ms (W6)
 const IDLE_POLL_INTERVAL     = 100;   // ms
 
 const MAX_TRIGGER_SIZE  = 64 * 1024;  // 64 KB  (C1)
@@ -49,11 +58,16 @@ function getIdleTimeout() {
 /**
  * Poll until isSessionBusy(sessionId) returns false, or the timeout expires,
  * or the session exits (PTY no longer available).
+ *
+ * @param {string} sessionId
+ * @param {object} ctx
+ * @param {number} [timeoutMs]  explicit timeout in ms; falls back to
+ *                              getIdleTimeout() (env var → default) when absent.
  * Returns { timedOut: boolean, sessionExited: boolean, waited_ms: number }.
  */
-function waitForIdle(sessionId, ctx) {
+function waitForIdle(sessionId, ctx, timeoutMs) {
   return new Promise((resolve) => {
-    const timeout  = getIdleTimeout();
+    const timeout  = (timeoutMs !== undefined) ? timeoutMs : getIdleTimeout();
     const start    = Date.now();
 
     function check() {
@@ -161,7 +175,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
   }
 
   // ── 3. Validate shape ─────────────────────────────────────────────────────
-  const { sessionId, command, wait = 'none' } = trigger;
+  const { sessionId, command, wait = 'none', timeout_ms } = trigger;
 
   if (typeof sessionId !== 'string' || !sessionId) {
     await writeResult({ ok: false, error: 'missing required field: sessionId', sessionId: sessionId || null });
@@ -184,6 +198,26 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     return;
   }
 
+  // W6: validate optional per-trigger timeout_ms
+  // Precedence: timeout_ms (per-trigger) > SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS (env) > default.
+  // Must be a positive integer not exceeding MAX_TRIGGER_TIMEOUT (600 000 ms).
+  // Reject and release semaphore immediately on invalid value — do NOT inject.
+  let resolvedTimeoutMs;
+  if (timeout_ms !== undefined) {
+    if (
+      typeof timeout_ms !== 'number' ||
+      !Number.isInteger(timeout_ms) ||
+      timeout_ms <= 0 ||
+      timeout_ms > MAX_TRIGGER_TIMEOUT
+    ) {
+      await writeResult({ ok: false, error: 'invalid timeout_ms', sessionId });
+      return;
+    }
+    resolvedTimeoutMs = timeout_ms;
+  }
+  // When timeout_ms is absent, resolvedTimeoutMs stays undefined and waitForIdle
+  // falls back to getIdleTimeout() (env var → compiled default).
+
   // ── 4. Look up session ────────────────────────────────────────────────────
   const sessionEntry = ctx.getPtyForSession(sessionId);
   if (!sessionEntry) {
@@ -197,7 +231,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
   // ── 5. Idle wait ──────────────────────────────────────────────────────────
   let waited_ms = 0;
   if (wait === 'idle') {
-    const result = await waitForIdle(sessionId, ctx);
+    const result = await waitForIdle(sessionId, ctx, resolvedTimeoutMs);
     waited_ms    = result.waited_ms;
 
     // W5: session exited during wait

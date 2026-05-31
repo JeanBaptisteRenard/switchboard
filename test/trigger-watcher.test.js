@@ -647,7 +647,7 @@ test('I4 NaN timeout: invalid SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS uses default (
       wait:      'idle',
     });
 
-    // With NaN guard the default 30s timeout fires; but that's too slow for a test.
+    // With NaN guard the default 300s timeout fires; but that's too slow for a test.
     // Instead confirm the module at least computes a finite timeout (no immediate hang):
     // we close the watcher and clean up after 1s — if it was still polling forever
     // the result file would never appear after 1 s; but with a normal default timeout
@@ -655,6 +655,231 @@ test('I4 NaN timeout: invalid SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS uses default (
     await new Promise(r => setTimeout(r, 200));
     watcher.close();
     // No assertion on result needed — the goal is no crash / unhandled rejection.
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// ── timeout_ms field tests ─────────────────────────────────────────────────────
+
+// W6-1: per-trigger timeout_ms honored end-to-end
+// The trigger carries timeout_ms=500; session is busy for 150ms then idle.
+// The per-trigger timeout should govern (not the env var), and injection succeeds.
+test('W6 timeout_ms: per-trigger timeout_ms honored, overrides env-var fallback', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    // env var set to 50 ms — without per-trigger override this would time out
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '50';
+
+    const { start } = require('../trigger-watcher');
+    let busy = true;
+    const SESSION_ID = 'sess-tmout-override-' + Date.now();
+    const ctx = makeCtx(SESSION_ID, () => busy);
+    const watcher = start(ctx);
+
+    const uuid = 'tmout-override-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId:  SESSION_ID,
+      command:    '/compact',
+      wait:       'idle',
+      timeout_ms: 1000, // per-trigger override: 1 s (50 ms env var would time out first)
+    });
+
+    // Flip idle after 150 ms — env var (50 ms) would have timed out, but timeout_ms=1000 still waits
+    setTimeout(() => { busy = false; }, 150);
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true, 'result should be ok when timeout_ms overrides short env var');
+    assert.ok(result.waited_ms >= 100, `waited_ms (${result.waited_ms}) should be >= 100ms`);
+    assert.deepEqual(ctx._written, ['/compact\r'], 'PTY write should happen');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W6-2: invalid timeout_ms — negative value
+test('W6 timeout_ms invalid: negative → ok:false, error "invalid timeout_ms", no PTY write', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-neg-tmout-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    const watcher    = start(ctx);
+
+    const uuid = 'neg-tmout-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId:  SESSION_ID,
+      command:    '/compact',
+      timeout_ms: -1,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /invalid timeout_ms/);
+    assert.deepEqual(ctx._written, [], 'no PTY write for invalid timeout_ms');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W6-3: invalid timeout_ms — non-integer float
+test('W6 timeout_ms invalid: non-integer float (1.5) → ok:false, no PTY write', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-float-tmout-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    const watcher    = start(ctx);
+
+    const uuid = 'float-tmout-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId:  SESSION_ID,
+      command:    '/compact',
+      timeout_ms: 1.5,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /invalid timeout_ms/);
+    assert.deepEqual(ctx._written, [], 'no PTY write for float timeout_ms');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W6-4: invalid timeout_ms — exceeds cap (> 600 000)
+test('W6 timeout_ms invalid: value > 600000 → ok:false, no PTY write', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-cap-tmout-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    const watcher    = start(ctx);
+
+    const uuid = 'cap-tmout-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId:  SESSION_ID,
+      command:    '/compact',
+      timeout_ms: 600001,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /invalid timeout_ms/);
+    assert.deepEqual(ctx._written, [], 'no PTY write for over-cap timeout_ms');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W6-5: invalid timeout_ms — string type (not a JSON number)
+test('W6 timeout_ms invalid: string type ("500") → ok:false, no PTY write', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-str-tmout-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    const watcher    = start(ctx);
+
+    // Write raw JSON so we control the type exactly (writeTrigger uses JSON.stringify
+    // which would coerce, but here we need a JSON string value)
+    const uuid = 'str-tmout-' + Date.now();
+    fs.writeFileSync(
+      path.join(tmp, uuid + '.json'),
+      JSON.stringify({ sessionId: SESSION_ID, command: '/compact', timeout_ms: '500' }),
+      'utf8',
+    );
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /invalid timeout_ms/);
+    assert.deepEqual(ctx._written, [], 'no PTY write for string timeout_ms');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W6-6: absent timeout_ms → falls back to env-var
+test('W6 timeout_ms absent: falls back to env-var; env-var absent → falls back to default (300 000 ms)', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '300'; // env var: 300 ms
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-fallback-' + Date.now();
+    // Always busy — with the env-var 300 ms timeout this should time out
+    const ctx = makeCtx(SESSION_ID, () => true);
+    const watcher = start(ctx);
+
+    const uuid = 'fallback-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      command:   '/compact',
+      wait:      'idle',
+      // No timeout_ms — should use env-var (300 ms)
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    // Env-var timeout (300 ms) should have fired → ok:false
+    assert.equal(result.ok, false);
+    assert.match(result.error, /timeout/i, 'should time out using env-var timeout');
+    assert.deepEqual(ctx._written, [], 'no PTY write on env-var timeout');
+
+    watcher.close();
   } finally {
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
