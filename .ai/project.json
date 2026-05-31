@@ -43,6 +43,7 @@
     "viewer-panel": ".ai/contexts/viewer-panel.md",
     "ipc-bridge": ".ai/contexts/ipc-bridge.md"
   },
+  "context_engineering_profile": "electron-flat",
   "remotes": {
     "origin": "https://github.com/JeanBaptisteRenard/switchboard.git",
     "upstream": "https://github.com/doctly/switchboard.git"
