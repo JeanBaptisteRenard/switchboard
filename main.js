@@ -1891,6 +1891,21 @@ if (!gotSingleInstanceLock) {
     scheduleIpc.init(log, runScheduleCommand);
     startScheduler(log, runScheduleCommand);
 
+    // File-trigger watcher — allows harness scripts to inject input into open
+    // PTY sessions by dropping a JSON file in ~/.switchboard/triggers/.
+    require('./trigger-watcher').start({
+      log,
+      getPtyForSession(sessionId) {
+        const session = activeSessions.get(sessionId);
+        if (!session || session.exited) return null;
+        return { ptyProcess: session.pty };
+      },
+      isSessionBusy(sessionId) {
+        const session = activeSessions.get(sessionId);
+        return session ? !!session._cliBusy : false;
+      },
+    });
+
     // Re-index search if FTS table was recreated (e.g. tokenizer config change)
     if (searchFtsRecreated) populateCacheViaWorker();
 
