@@ -44,11 +44,20 @@ task dev   # Taskfile already sets SWITCHBOARD_DATA_DIR=~/.switchboard-dev by de
 
 The AppImage uses `~/.switchboard/switchboard.db`. The dev electron uses `~/.switchboard-dev/switchboard.db`. They cannot collide.
 
-### 2. Building does NOT kill the running instance
+### 2. Running `npm run build:linux` CAN kill the running instance — `cp` does not
 
-`npm run build:linux` writes to `dist/`. Replacing `~/Applications/Switchboard.AppImage` with `cp dist/*.AppImage ~/Applications/...` is safe because the running process already extracted the AppImage to `/tmp/.mount_*/` at launch — it doesn't need the file on disk anymore.
+**Corrected 2026-05-31** — the previous version of this section claimed the build was safe. It isn't.
 
-The new code takes effect on **next launch only** (after the user fully quits). Until then, the running process is on the old code.
+`npm run build:linux` invokes `electron-builder`, which by default runs `@electron/rebuild` against the native modules (`better-sqlite3`, `node-pty`). Those `.node` files are `dlopen()`-loaded by the running AppImage. If the rebuild replaces them via `truncate+write` (instead of atomic `rename`), the running process loses access to its native binding at the next call → segfault → kernel SIGKILL with no app-level trace in `~/.config/switchboard/logs/main.log`.
+
+**Witnessed 2026-05-31** — running AppImage went silent in main.log between `13:49:42` and `13:58:42` during a background `npm run build:linux`. No SIGTERM logged. User noticed the death and relaunched manually.
+
+**Rules**:
+- **NEVER run `npm run build:linux` (or `task build`) while the user's AppImage is running** without explicit confirmation. Ask first. The user may need to quit before you start the build.
+- The **`cp dist/*.AppImage ~/Applications/Switchboard.AppImage`** step on its own IS safe — the running AppImage is fully extracted to `/tmp/.mount_*` at launch and never pages back from the on-disk file. Verified 2026-05-31 at 17:36 — process kept running through the swap.
+- Investigation candidates if you have to build while running: `--config.npmRebuild=false` on electron-builder, dedicated build worktree with its own `node_modules/`, or `electron-builder --linux AppImage --dir` (skips packaging step).
+
+The new code takes effect on **next launch only** (after the user fully quits and relaunches).
 
 ### 3. Use worktree isolation for parallel agents
 

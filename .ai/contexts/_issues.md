@@ -70,6 +70,19 @@ Captured 2026-05-30 while writing the .ai/contexts/*.md files. None are blockers
 - **No integration test for the full schedule-fire pathway** — `scanSchedules` is tested, `cronMatches` is tested, but the wired-up `setInterval + runScheduleCommand` path is not.
 - **Worktree node_modules can have missing native modules** (morphdom-umd.js encountered 2026-05-30) — confused a code-reviewer agent into reporting false "pre-existing fails". Could be fixed by `npm install` after worktree creation as a harness step.
 
+## Build pitfalls
+
+- **`npm run build:linux` while Switchboard is running can kill the running instance.** Witnessed 2026-05-31 ~13:49 — the AppImage process stopped logging mid-window during a background `npm run build:linux`, no SIGTERM trace in `~/.config/switchboard/logs/main.log`, just a 9-minute silence then a fresh launch by the user. Confirmed harmless: the file `cp dist/*.AppImage ~/Applications/` AFTER the build completes (the cp itself is safe — the running process is mmap'd from `/tmp/.mount_*`).
+
+  **Suspected mechanism**: electron-builder invokes `@electron/rebuild` for native modules (`better-sqlite3`, `node-pty`). These modules are `dlopen()`-loaded by the running AppImage. If electron-rebuild uses `truncate+write` instead of `atomic rename`, the running process loses access to its `better_sqlite3.node` binding at the next SQLite call → segfault → kernel SIGKILL with no app-level trace. Not confirmed without sudo dmesg access.
+
+  **Mitigations to consider**:
+  1. **Skip native rebuild when running locally**: `npm config set npm_config_skip_electron_rebuild true` before build, or use `--config.npmRebuild=false` on electron-builder, or build only the asar (`electron-builder --linux AppImage --dir`).
+  2. **Build in a dedicated worktree with its own `node_modules/`**: full isolation, slower (extra `npm install`).
+  3. **Document loudly and tell the user before any background build**: lowest tech, highest reliability.
+
+  **The `cp` step itself is safe** — confirmed by replacing the file while the process kept running (mtime 17:36, PID 2620410 still alive). The running AppImage is fully extracted to `/tmp/.mount_*` at launch and does not page back from the on-disk file.
+
 ## Security
 
 - **`clipboard-write-text` accepts any string from any renderer** — fine given the single-renderer, single-user threat model, but worth a sentence in the security model doc if one exists.
