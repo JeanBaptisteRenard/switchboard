@@ -127,6 +127,26 @@ const migrations = [
     try { db.exec('DELETE FROM session_cache'); } catch {}
     try { db.exec('DELETE FROM cache_meta'); } catch {}
   },
+  // v5: per-(session,date,model) metrics for the stats screen (tokens, tool calls,
+  // messages bucketed by message timestamp). Populated on next cold-start rebuild
+  // (the scan worker re-reads every JSONL), so no separate backfill is needed.
+  (db) => {
+    try {
+      db.exec(`CREATE TABLE IF NOT EXISTS session_metrics (
+        sessionId TEXT NOT NULL,
+        date TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT '',
+        messageCount INTEGER DEFAULT 0,
+        toolCallCount INTEGER DEFAULT 0,
+        inputTokens INTEGER DEFAULT 0,
+        outputTokens INTEGER DEFAULT 0,
+        cacheReadTokens INTEGER DEFAULT 0,
+        cacheCreationTokens INTEGER DEFAULT 0,
+        PRIMARY KEY (sessionId, date, model)
+      )`);
+      db.exec('CREATE INDEX IF NOT EXISTS idx_session_metrics_date ON session_metrics(date)');
+    } catch {}
+  },
 ];
 
 const currentDbVersion = (() => {
@@ -198,6 +218,14 @@ const stmts = {
   cacheDeleteSession: db.prepare('DELETE FROM session_cache WHERE sessionId = ?'),
   cacheDeleteFolder: db.prepare('DELETE FROM session_cache WHERE folder = ?'),
   cacheTouchModified: db.prepare('UPDATE session_cache SET modified = ? WHERE sessionId = ?'),
+  // Session metrics statements (per-(session,date,model) token/tool/message counts)
+  metricsDeleteBySession: db.prepare('DELETE FROM session_metrics WHERE sessionId = ?'),
+  metricsDeleteByFolder: db.prepare('DELETE FROM session_metrics WHERE sessionId IN (SELECT sessionId FROM session_cache WHERE folder = ?)'),
+  metricsInsert: db.prepare(`
+    INSERT INTO session_metrics
+      (sessionId, date, model, messageCount, toolCallCount, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `),
   // Cache meta statements
   metaGet: db.prepare('SELECT * FROM cache_meta WHERE folder = ?'),
   metaGetAll: db.prepare('SELECT * FROM cache_meta'),
@@ -285,6 +313,25 @@ const upsertCachedSessionsBatch = db.transaction((sessions) => {
   }
 });
 
+// Replace all metric rows for a session in one transaction: delete-by-session
+// then insert the fresh per-(date,model) rows. Called whenever a session is read
+// in full (cold-start rebuild + NEW-file branch of the incremental refresh).
+const replaceSessionMetricsBatch = db.transaction((sessionId, rows) => {
+  stmts.metricsDeleteBySession.run(sessionId);
+  for (const r of rows || []) {
+    stmts.metricsInsert.run(
+      sessionId, r.date, r.model || '',
+      r.messageCount | 0, r.toolCallCount | 0,
+      r.inputTokens | 0, r.outputTokens | 0,
+      r.cacheReadTokens | 0, r.cacheCreationTokens | 0
+    );
+  }
+});
+
+function replaceSessionMetrics(sessionId, rows) {
+  replaceSessionMetricsBatch(sessionId, rows);
+}
+
 function getCachedByParent(parentSessionId) {
   return stmts.cacheGetByParent.all(parentSessionId);
 }
@@ -307,10 +354,14 @@ function getCachedSession(sessionId) {
 }
 
 function deleteCachedSession(sessionId) {
+  stmts.metricsDeleteBySession.run(sessionId);
   stmts.cacheDeleteSession.run(sessionId);
 }
 
 function deleteCachedFolder(folder) {
+  // Delete metrics first — metricsDeleteByFolder sub-selects on session_cache,
+  // so it must run before the session_cache rows for this folder are gone.
+  stmts.metricsDeleteByFolder.run(folder);
   stmts.cacheDeleteFolder.run(folder);
   stmts.metaDelete.run(folder);
 }
@@ -428,6 +479,84 @@ function getDailyActivity() {
   `).all();
 }
 
+// --- Session metrics aggregates (for the stats screen) ---
+
+// One row per day, summed across all models. Powers the heatmap + daily bars.
+// messageCount/toolCallCount/tokens come from session_metrics (bucketed by the
+// per-message timestamp, not the session mtime); sessionCount counts distinct
+// sessions active that day.
+function getDailyMetrics() {
+  return db.prepare(`
+    SELECT date,
+           SUM(messageCount)            AS messageCount,
+           SUM(toolCallCount)           AS toolCallCount,
+           SUM(inputTokens + outputTokens) AS tokens,
+           COUNT(DISTINCT sessionId)    AS sessionCount
+    FROM session_metrics
+    GROUP BY date
+    ORDER BY date ASC
+  `).all();
+}
+
+// [{date, tokensByModel: {model: tokens}}] sorted by date. Excludes the '' model
+// bucket (synthetic / model-less assistant turns carry no tokens anyway).
+function getDailyModelTokens() {
+  const rows = db.prepare(`
+    SELECT date, model, SUM(inputTokens + outputTokens) AS tokens
+    FROM session_metrics
+    WHERE model != ''
+    GROUP BY date, model
+  `).all();
+  const byDate = new Map();
+  for (const r of rows) {
+    let entry = byDate.get(r.date);
+    if (!entry) {
+      entry = { date: r.date, tokensByModel: {} };
+      byDate.set(r.date, entry);
+    }
+    entry.tokensByModel[r.model] = r.tokens;
+  }
+  return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
+}
+
+// {model: {inputTokens, outputTokens}} across all time. Excludes '' model.
+function getModelUsage() {
+  const rows = db.prepare(`
+    SELECT model,
+           SUM(inputTokens)  AS inputTokens,
+           SUM(outputTokens) AS outputTokens
+    FROM session_metrics
+    WHERE model != ''
+    GROUP BY model
+  `).all();
+  const out = {};
+  for (const r of rows) {
+    out[r.model] = { inputTokens: r.inputTokens, outputTokens: r.outputTokens };
+  }
+  return out;
+}
+
+// {totalSessions, totalMessages, totalToolCalls, totalTokens}. totalSessions
+// counts ONLY parent (human) sessions — subagents would otherwise inflate it.
+function getTotalCounts() {
+  const sessions = db.prepare(
+    'SELECT COUNT(*) AS cnt FROM session_cache WHERE parentSessionId IS NULL'
+  ).get();
+  const metrics = db.prepare(`
+    SELECT
+      SUM(messageCount)            AS totalMessages,
+      SUM(toolCallCount)           AS totalToolCalls,
+      SUM(inputTokens + outputTokens) AS totalTokens
+    FROM session_metrics
+  `).get();
+  return {
+    totalSessions: sessions.cnt || 0,
+    totalMessages: metrics.totalMessages || 0,
+    totalToolCalls: metrics.totalToolCalls || 0,
+    totalTokens: metrics.totalTokens || 0,
+  };
+}
+
 function closeDb() {
   try { db.close(); } catch {}
 }
@@ -437,10 +566,12 @@ module.exports = {
   isCachePopulated, getAllCached, getCachedByFolder, getCachedByParent, getCachedFolder, getCachedSession, upsertCachedSessions,
   touchCachedModified: (sessionId, modified) => stmts.cacheTouchModified.run(modified, sessionId),
   deleteCachedSession, deleteCachedFolder,
+  replaceSessionMetrics,
   getFolderMeta, getAllFolderMeta, setFolderMeta,
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
   searchByType, isSearchIndexPopulated, searchFtsRecreated,
   getSetting, setSetting, deleteSetting,
   getDailyActivity,
+  getDailyMetrics, getDailyModelTokens, getModelUsage, getTotalCounts,
   closeDb,
 };

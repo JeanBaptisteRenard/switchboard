@@ -426,12 +426,24 @@ function buildStatsSummary(stats, dailyMap) {
 
   const totalSessions = stats.totalSessions || Object.keys(dailyMap).length;
 
+  // Compact number formatting (K/M/B) shared by the total-tokens, tool-calls,
+  // and per-model token cards.
+  const fmtNum = (n) => {
+    n = n || 0;
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    return n.toLocaleString();
+  };
+
   // Model usage — values are objects with token counts, show as cards
   const models = stats.modelUsage || {};
 
   const cards = [
     { value: totalSessions.toLocaleString(), label: 'Total Sessions' },
     { value: totalMessages.toLocaleString(), label: 'Total Messages' },
+    { value: fmtNum(stats.totalTokens), label: 'Total Tokens' },
+    { value: fmtNum(stats.totalToolCalls), label: 'Tool Calls' },
     { value: currentStreak + 'd', label: 'Current Streak' },
     { value: longestStreak + 'd', label: 'Longest Streak' },
   ];
@@ -439,14 +451,7 @@ function buildStatsSummary(stats, dailyMap) {
   for (const [model, usage] of Object.entries(models)) {
     const shortName = model.replace(/^claude-/, '').replace(/-\d{8}$/, '');
     const tokens = (usage?.inputTokens || 0) + (usage?.outputTokens || 0);
-    const label = shortName;
-    // Format token count in millions/thousands
-    let valueStr;
-    if (tokens >= 1e9) valueStr = (tokens / 1e9).toFixed(1) + 'B';
-    else if (tokens >= 1e6) valueStr = (tokens / 1e6).toFixed(1) + 'M';
-    else if (tokens >= 1e3) valueStr = (tokens / 1e3).toFixed(1) + 'K';
-    else valueStr = tokens.toLocaleString();
-    cards.push({ value: valueStr, label: label + ' tokens' });
+    cards.push({ value: fmtNum(tokens), label: shortName + ' tokens' });
   }
 
   for (const card of cards) {

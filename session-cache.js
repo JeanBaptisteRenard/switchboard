@@ -11,7 +11,7 @@ const { encodeProjectPath } = require('./encode-project-path');
  * Call init(ctx) once with the shared context object.
  */
 let PROJECTS_DIR, activeSessions, getMainWindow, log;
-let deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession, touchCachedModified;
+let deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession, touchCachedModified, replaceSessionMetrics;
 let deleteSearchFolder, deleteSearchSession, upsertSearchEntries;
 let setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName;
 
@@ -26,6 +26,7 @@ function init(ctx) {
   upsertCachedSessions = ctx.db.upsertCachedSessions;
   touchCachedModified = ctx.db.touchCachedModified;
   deleteCachedSession = ctx.db.deleteCachedSession;
+  replaceSessionMetrics = ctx.db.replaceSessionMetrics;
   deleteSearchFolder = ctx.db.deleteSearchFolder;
   deleteSearchSession = ctx.db.deleteSearchSession;
   upsertSearchEntries = ctx.db.upsertSearchEntries;
@@ -193,6 +194,11 @@ function refreshFolder(folder, opts = {}) {
     if (s) {
       currentIds.add(s.sessionId);
       sessionsToUpsert.push(s);
+      // Per-(date,model) metrics only exist on the full-read path. The header-only
+      // refresh branch above doesn't produce dailyMetrics, so this is the sole
+      // write point for an incremental refresh — short transaction, fine to run
+      // outside the upsert batch.
+      replaceSessionMetrics(s.sessionId, s.dailyMetrics);
       // Title precedence: user rename (session_meta.name) > JSONL custom-title > JSONL ai-title.
       // Only customTitle (Claude /title) promotes to session_meta.name — AI titles must NEVER
       // be written there or they'd overwrite the user's UI rename on the next index pass.
@@ -474,6 +480,8 @@ function populateCacheViaWorker() {
           // Only JSONL custom-title (genuine user title) promotes to the DB name column.
           // AI titles must not — see refreshFolder for the rationale.
           if (s.customTitle) setName(s.sessionId, s.customTitle);
+          // Worker called readSessionFile, so dailyMetrics is present.
+          replaceSessionMetrics(s.sessionId, s.dailyMetrics);
         }
         upsertSearchEntries(sessions.map(s => {
           // Search title precedence matches the sidebar: user rename > custom-title > ai-title.

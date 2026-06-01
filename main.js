@@ -77,7 +77,7 @@ const {
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
   searchByType, isSearchIndexPopulated, searchFtsRecreated,
   getSetting, setSetting, deleteSetting,
-  getDailyActivity,
+  getDailyMetrics, getDailyModelTokens, getModelUsage, getTotalCounts,
   closeDb,
 } = require('./db');
 
@@ -734,30 +734,33 @@ ipcMain.handle('get-stats', () => {
 // periods where Claude already rotated the parent JSONL files off disk.
 ipcMain.handle('get-stats-from-db', () => {
   try {
-    const rows = getDailyActivity(); // [{date, messageCount, sessionCount}]
-    let totalMessages = 0;
-    let totalSessions = 0;
-    let firstSessionDate = null;
-    for (const row of rows) {
-      totalMessages += row.messageCount || 0;
-      totalSessions += row.sessionCount || 0;
-      if (!firstSessionDate) firstSessionDate = row.date;
-    }
-    const lastComputedDate = new Date().toISOString().slice(0, 10);
-    return {
-      dailyActivity: rows, // [{date, messageCount, sessionCount}]
-      totalMessages,
-      totalSessions,
-      firstSessionDate: firstSessionDate || lastComputedDate,
-      lastComputedDate,
-      // dailyModelTokens intentionally omitted — not tracked per-day in session_cache
-      modelUsage: {},
-    };
+    return buildStatsFromDb();
   } catch (err) {
     log.error('Error building stats from DB:', err);
     return null;
   }
 });
+
+// Build the full stats object the renderer consumes. Sourced from
+// session_metrics (per-(session,date,model) tokens/tool-calls/messages bucketed
+// by message timestamp) so tokens, tool calls, and per-model usage are all real
+// data — not the hardcoded {} the heatmap-only path used to return.
+function buildStatsFromDb() {
+  const daily = getDailyMetrics();       // [{date, messageCount, toolCallCount, tokens, sessionCount}]
+  const totals = getTotalCounts();
+  const lastComputedDate = new Date().toISOString().slice(0, 10);
+  return {
+    dailyActivity: daily,
+    dailyModelTokens: getDailyModelTokens(),
+    modelUsage: getModelUsage(),
+    totalMessages: totals.totalMessages,
+    totalSessions: totals.totalSessions,
+    totalToolCalls: totals.totalToolCalls,
+    totalTokens: totals.totalTokens,
+    firstSessionDate: daily[0]?.date || lastComputedDate,
+    lastComputedDate,
+  };
+}
 
 // --- IPC: refresh-stats (fetch /usage + build stats from DB; /stats PTY removed) ---
 ipcMain.handle('refresh-stats', async () => {
@@ -770,24 +773,7 @@ ipcMain.handle('refresh-stats', async () => {
     // at once and the renderer can update heatmap + usage in a single round-trip.
     let stats = null;
     try {
-      const rows = getDailyActivity();
-      let totalMessages = 0;
-      let totalSessions = 0;
-      let firstSessionDate = null;
-      for (const row of rows) {
-        totalMessages += row.messageCount || 0;
-        totalSessions += row.sessionCount || 0;
-        if (!firstSessionDate) firstSessionDate = row.date;
-      }
-      const lastComputedDate = new Date().toISOString().slice(0, 10);
-      stats = {
-        dailyActivity: rows,
-        totalMessages,
-        totalSessions,
-        firstSessionDate: firstSessionDate || lastComputedDate,
-        lastComputedDate,
-        modelUsage: {},
-      };
+      stats = buildStatsFromDb();
     } catch (dbErr) {
       log.error('Error building stats from DB in refresh-stats:', dbErr);
     }
