@@ -46,6 +46,15 @@ const MAX_CHAIN_LENGTH  = 20;         // max steps per chain (W8)
 // Claude may answer so fast that we never observe the rising edge;
 // after BUSY_RISE_TIMEOUT_MS we assume the turn completed instantly and move on.
 const BUSY_RISE_TIMEOUT_MS   = 2000; // ms
+// Delay (ms) between writing a command's text and the Enter keypress that
+// submits it. The Enter MUST arrive as a discrete PTY read — concatenated onto
+// the text in a single write, Claude Code (kitty keyboard protocol) absorbs it
+// as a literal newline in the composer and the command never submits. xterm.js
+// sends every keypress as its own write, which is why the web terminal submits
+// correctly; we mirror that. Reproduced 2026-06-02: free-text trigger commands
+// landed in the composer but did not submit; only the short menu-driven
+// /compact path submitted. Override via SWITCHBOARD_SUBMIT_ENTER_DELAY_MS.
+const DEFAULT_SUBMIT_ENTER_DELAY_MS = 50; // ms
 // Control chars forbidden in command: CR, LF, NUL, ESC (W3)
 const FORBIDDEN_COMMAND_RE = /[\r\n\0\x1b]/;
 
@@ -63,6 +72,21 @@ function defaultIsPtyAlive(ptyProcess) {
   } catch (e) {
     return e.code === 'EPERM';
   }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Submit a command to a PTY the way a human terminal does: write the text,
+// then send Enter as a SEPARATE write so it is read as a discrete "submit"
+// keypress rather than a trailing newline. See DEFAULT_SUBMIT_ENTER_DELAY_MS.
+async function submitToPty(ptyProcess, command) {
+  ptyProcess.write(command);
+  const envMs = Number(process.env.SWITCHBOARD_SUBMIT_ENTER_DELAY_MS);
+  const ms = Number.isFinite(envMs) && envMs >= 0 ? envMs : DEFAULT_SUBMIT_ENTER_DELAY_MS;
+  await delay(ms);
+  ptyProcess.write('\r');
 }
 
 function getTriggersDir() {
@@ -445,9 +469,9 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
       return;
     }
 
-    // Write to PTY
+    // Write to PTY: text, then Enter as a discrete keypress (see submitToPty).
     try {
-      ptyProcess.write(command + '\r');
+      await submitToPty(ptyProcess, command);
     } catch (err) {
       ctx.log.error('[trigger-watcher] PTY write failed:', err.message);
       await writeResult({ ok: false, error: 'pty write failed: ' + err.message, sessionId });
@@ -528,7 +552,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     if (i === 0) step0SentAt = stepSentAt;
 
     try {
-      entry.ptyProcess.write(step.command + '\r');
+      await submitToPty(entry.ptyProcess, step.command);
     } catch (err) {
       ctx.log.error(`[trigger-watcher] PTY write failed at chain step ${i}:`, err.message);
       await writeResult({ ok: false, error: 'pty write failed: ' + err.message, partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });

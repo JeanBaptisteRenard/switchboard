@@ -1912,7 +1912,18 @@ if (!gotSingleInstanceLock) {
       log.error('[trigger-watcher] Failed to start trigger watcher:', err.message);
     }
 
-    // Re-index search if FTS table was recreated (e.g. tokenizer config change)
+    // Full cache rebuild on every startup — prunes stale rows for deleted
+    // transcripts (sub-agent/workflow runs cleaned up between sessions leave
+    // ghost rows in session_cache that show in the sidebar but are
+    // inaccessible on open). populateCacheViaWorker runs in a Worker thread
+    // and is non-blocking; concurrent callers share the same in-flight
+    // Promise so the FTS-recreated path below (if also triggered) is free.
+    populateCacheViaWorker();
+
+    // Re-index search if FTS table was recreated (e.g. tokenizer config change).
+    // populateCacheViaWorker is already running above; the guard inside it
+    // (populatePromise !== null) means this is a no-op on the same tick and
+    // returns the shared Promise — no double scan.
     if (searchFtsRecreated) populateCacheViaWorker();
 
     // Check for updates after launch

@@ -4,6 +4,10 @@
 // No mocks — ctx provides a concrete in-memory PTY stand-in.
 'use strict';
 
+// Keep the discrete-Enter submit delay tiny so the suite stays fast and the
+// turn-completion timing in makeChainCtx is not perturbed by a 50ms wait.
+process.env.SWITCHBOARD_SUBMIT_ENTER_DELAY_MS = '1';
+
 const test   = require('node:test');
 const assert = require('node:assert/strict');
 const fs     = require('fs');
@@ -129,7 +133,7 @@ test('happy path: trigger → pty.write called, result ok:true, trigger deleted'
     assert.equal(typeof result.waited_ms, 'number', 'waited_ms should be a number');
 
     // pty.write called with command + \r
-    assert.deepEqual(ctx._written, ['/compact\r'], 'pty.write called with command + \\r');
+    assert.deepEqual(ctx._written, ['/compact', '\r'], 'pty.write: command text then discrete Enter');
 
     // Trigger file deleted
     assert.equal(fs.existsSync(triggerPath), false, 'trigger file should be deleted');
@@ -272,7 +276,7 @@ test('wait:idle while busy → flips to idle after 150ms → write happens, wait
       result.waited_ms >= 100,
       `waited_ms (${result.waited_ms}) should be >= 100ms`,
     );
-    assert.deepEqual(ctx._written, ['/compact\r'], 'PTY write should happen after idle');
+    assert.deepEqual(ctx._written, ['/compact', '\r'], 'PTY write should happen after idle');
 
     watcher.close();
   } finally {
@@ -522,7 +526,7 @@ test('W4 concurrency cap: 12 simultaneous triggers all get processed', async () 
     }
 
     // 12 PTY writes should have happened
-    assert.equal(ctx._written.length, COUNT, `expected ${COUNT} PTY writes`);
+    assert.equal(ctx._written.filter((w) => w === '\r').length, COUNT, `expected ${COUNT} submitted commands`);
 
     watcher.close();
   } finally {
@@ -624,7 +628,7 @@ test('inFlight dedup: same filename event fired twice → processed at most once
     assert.equal(result.ok, true);
     // The trigger file is deleted after first processing, so any second fs.watch
     // event for the same name finds no file and is silently skipped.
-    assert.equal(ctx._written.length, 1, 'pty.write called exactly once');
+    assert.equal(ctx._written.filter((w) => w === '\r').length, 1, 'command submitted exactly once');
 
     watcher.close();
   } finally {
@@ -704,7 +708,7 @@ test('W6 timeout_ms: per-trigger timeout_ms honored, overrides env-var fallback'
     const result = readResult(path.join(tmp, 'processed'), uuid);
     assert.equal(result.ok, true, 'result should be ok when timeout_ms overrides short env var');
     assert.ok(result.waited_ms >= 100, `waited_ms (${result.waited_ms}) should be >= 100ms`);
-    assert.deepEqual(ctx._written, ['/compact\r'], 'PTY write should happen');
+    assert.deepEqual(ctx._written, ['/compact', '\r'], 'PTY write should happen');
 
     watcher.close();
   } finally {
@@ -986,7 +990,7 @@ test('W7 default helper: real-pid mock passes default signal-0 probe → happy p
 
     const result = readResult(path.join(tmp, 'processed'), uuid);
     assert.equal(result.ok, true, 'live pid → default helper returns true → ok');
-    assert.deepEqual(ctx._written, ['/help\r']);
+    assert.deepEqual(ctx._written, ['/help', '\r']);
 
     watcher.close();
   } finally {
@@ -1015,8 +1019,9 @@ function makeChainCtx(sessionId, opts = {}) {
     write(data) {
       if (opts.ptyThrows) throw new Error('PTY closed');
       written.push(data);
-      // Auto-simulate a turn: become busy after 50ms, then idle after 200ms
-      if (!opts.noAutoTurn) {
+      // A turn only starts on submit (the discrete Enter), not when the command
+      // text lands. Auto-simulate: busy after 50ms, then idle after 200ms.
+      if (!opts.noAutoTurn && data === '\r') {
         setTimeout(() => { busy = true; }, 50);
         setTimeout(() => { busy = false; }, 200);
       }
@@ -1087,7 +1092,7 @@ test('chain happy path: 3-step chain → 3 PTY writes, result ok:true with steps
     assert.equal(typeof result.total_waited_ms, 'number');
 
     // All 3 writes happened in order
-    assert.deepEqual(ctx._written, ['/compact\r', 'verify result file and commit\r', 'open the PR\r']);
+    assert.deepEqual(ctx._written, ['/compact', '\r', 'verify result file and commit', '\r', 'open the PR', '\r']);
 
     watcher.close();
   } finally {
@@ -1354,8 +1359,10 @@ test('chain timeout mid-chain: global timeout fires → ok:false, partial:true, 
     assert.match(result.error, /timeout/i, 'error should mention timeout');
     assert.equal(result.steps_completed, 1, 'steps_completed should be 1 (step 0 done, step 1 failed)');
 
-    assert.equal(ctx._written[0], '/compact\r', 'step 0 should be written');
-    assert.equal(ctx._written[1], 'step-two\r', 'step 1 should be written (it was sent, just stuck)');
+    assert.equal(ctx._written[0], '/compact', 'step 0 text should be written');
+    assert.equal(ctx._written[1], '\r', 'step 0 Enter should be written');
+    assert.equal(ctx._written[2], 'step-two', 'step 1 should be written (it was sent, just stuck)');
+    assert.equal(ctx._written[3], '\r', 'step 1 Enter should be written');
 
     watcher.close();
   } finally {
@@ -1573,7 +1580,7 @@ test('chain instant-reply mid-chain: step 1 never sets busy → proceeds to step
     const result = readResult(path.join(tmp, 'processed'), uuid);
     assert.equal(result.ok, true, 'chain should succeed via instant-reply path');
     assert.equal(result.steps.length, 3, 'all 3 steps must have run');
-    assert.deepEqual(ctx._written, ['/first\r', '/second\r', '/third\r']);
+    assert.deepEqual(ctx._written, ['/first', '\r', '/second', '\r', '/third', '\r']);
     // Step 1's instant-reply path should have spent ~2s (BUSY_RISE_TIMEOUT_MS)
     assert.ok(result.steps[1].waited_ms >= 1900 && result.steps[1].waited_ms <= 2400,
       `step 1 should have waited ~2000ms for the rising edge; got ${result.steps[1].waited_ms}ms`);
