@@ -91,7 +91,7 @@ const MAX_BUFFER_SIZE = 256 * 1024;
 const activeSessions = new Map();
 let mainWindow = null;
 
-// Subagent live-tail watchers (watchId → { filePath, parentSessionId, agentId })
+// Subagent live-tail watchers (watchId → { filePath, parentSessionId, agentId, teardown })
 const subagentWatchers = new Map();
 let subagentWatcherSeq = 0;
 
@@ -221,9 +221,10 @@ function createWindow() {
       }
       activeSessions.delete(id);
     }
-    // Release all subagent file watchers
+    // Release all subagent file watchers (closes fs.watch handles + clears any
+    // debounce timers / polling fallbacks via the stored teardown closure)
     for (const [, entry] of subagentWatchers) {
-      try { fs.unwatchFile(entry.filePath); } catch {}
+      try { entry.teardown(); } catch {}
     }
     subagentWatchers.clear();
     mainWindow = null;
@@ -1298,10 +1299,43 @@ ipcMain.handle('start-subagent-watch', (_event, parentSessionId, agentId) => {
     } catch {}
   }
 
-  // fs.watchFile gives reliable polling on Linux where inotify can be unreliable for JSONL appends
-  fs.watchFile(filePath, { interval: 1000, persistent: false }, readNewEntries);
+  // Coalesce rapid JSONL appends into a single incremental read. Mirrors the
+  // debounce used by the projects watcher (see startProjectsWatcher) instead of
+  // polling stat() once per second per watcher, which pegged the main process at
+  // idle when watchers accumulated.
+  let debounceTimer = null;
+  function scheduleRead() {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null;
+      readNewEntries();
+    }, 300);
+  }
 
-  subagentWatchers.set(watchId, { filePath, parentSessionId, agentId });
+  let watcher = null;
+  let pollInterval = null;
+  try {
+    watcher = fs.watch(filePath, { persistent: false }, (eventType) => {
+      if (eventType === 'rename') return; // file replaced/removed — ignore
+      scheduleRead();
+    });
+    watcher.on('error', (err) => {
+      log.warn(`[subagent-watch] fs.watch error watchId=${watchId}: ${err.message}`);
+    });
+  } catch (err) {
+    // Robustness fallback only when fs.watch can't attach: poll on a long
+    // interval (10s) so a failed inotify registration never busy-stats the file.
+    log.warn(`[subagent-watch] fs.watch failed watchId=${watchId}, polling fallback: ${err.message}`);
+    pollInterval = setInterval(readNewEntries, 10000);
+  }
+
+  function teardown() {
+    if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+    if (watcher) { try { watcher.close(); } catch {} watcher = null; }
+    if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+  }
+
+  subagentWatchers.set(watchId, { filePath, parentSessionId, agentId, teardown });
   log.info(`[subagent-watch] start watchId=${watchId} parent=${parentSessionId} agentId=${agentId}`);
   return { watchId };
 });
@@ -1309,7 +1343,7 @@ ipcMain.handle('start-subagent-watch', (_event, parentSessionId, agentId) => {
 ipcMain.handle('stop-subagent-watch', (_event, watchId) => {
   const entry = subagentWatchers.get(watchId);
   if (!entry) return { ok: false };
-  fs.unwatchFile(entry.filePath);
+  entry.teardown();
   subagentWatchers.delete(watchId);
   log.info(`[subagent-watch] stop watchId=${watchId}`);
   return { ok: true };
