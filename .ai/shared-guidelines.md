@@ -54,8 +54,8 @@ The AppImage uses `~/.switchboard/switchboard.db`. The dev electron uses `~/.swi
 
 **Rules**:
 - **NEVER run `npm run build:linux` (or `task build`) while the user's AppImage is running** without explicit confirmation. Ask first. The user may need to quit before you start the build.
-- The **`cp dist/*.AppImage ~/Applications/Switchboard.AppImage`** step on its own IS safe — the running AppImage is fully extracted to `/tmp/.mount_*` at launch and never pages back from the on-disk file. Verified 2026-05-31 at 17:36 — process kept running through the swap.
-- Investigation candidates if you have to build while running: `--config.npmRebuild=false` on electron-builder, dedicated build worktree with its own `node_modules/`, or `electron-builder --linux AppImage --dir` (skips packaging step).
+- **Building while running IS safe with `--config.npmRebuild=false`** (`npm run bundle:codemirror && electron-builder --linux --config.npmRebuild=false`): electron-builder logs `skipped dependencies rebuild` and never rewrites the `dlopen()`-loaded `.node` files. Field-proven 2026-06-02 (×2) and 2026-06-04 — the live process survived every build.
+- The **`cp dist/*.AppImage ~/Applications/Switchboard.AppImage` step is NOT reliably safe** — **corrected 2026-06-04** (the previous claim "verified safe 2026-05-31" held twice on 2026-06-02 then failed). The mmap/paging concern is indeed moot (`/tmp/.mount_*`), but **`appimagelauncherd` watches `~/Applications/`**: on file replacement it re-runs desktop integration ("Cleaning up old desktop integration files", 17:17:33) and the running instance was **cleanly terminated 15 s later** (systemd scope end 17:17:48, no segfault, no kernel trace — user confirmed they did not quit). Non-deterministic: it survived the same swap twice before. **Treat the `cp` as the disruptive step**: do it only when the user is ready to restart, or have them quit first.
 
 The new code takes effect on **next launch only** (after the user fully quits and relaunches).
 
