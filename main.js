@@ -290,7 +290,7 @@ sessionCache.init({
     setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName,
   },
 });
-const { readSessionFile, readFolderFromFilesystem, refreshFolder, populateCacheFromFilesystem,
+const { readSessionFile, readFolderFromFilesystem, refreshFolder, reconcileCacheFromFilesystem,
         buildProjectsFromCache, notifyRendererProjectsChanged, sendStatus, populateCacheViaWorker } = sessionCache;
 const { resolveJsonlPath, enumerateSessionFiles } = require('./read-session-file');
 
@@ -644,6 +644,11 @@ ipcMain.handle('get-projects', async (_event, showArchived) => {
       // avoid that race, await the scan here so the response carries the
       // freshly-populated cache. Concurrent callers share the same Promise.
       await populateCacheViaWorker();
+    } else {
+      // Cache already populated: pick up folders changed while the app was
+      // closed, or never indexed by an older build, so sessions/worktrees don't
+      // silently go missing. Stat-gated, so it's cheap when nothing has changed.
+      reconcileCacheFromFilesystem();
     }
 
     return buildProjectsFromCache(showArchived);
