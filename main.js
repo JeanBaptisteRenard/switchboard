@@ -648,6 +648,8 @@ ipcMain.handle('get-projects', async (_event, showArchived) => {
       // Cache already populated: pick up folders changed while the app was
       // closed, or never indexed by an older build, so sessions/worktrees don't
       // silently go missing. Stat-gated, so it's cheap when nothing has changed.
+      // Synchronous (readdir/stat sweep) — completes before buildProjectsFromCache
+      // below; no await needed despite the await in the cold-start branch above.
       reconcileCacheFromFilesystem();
     }
 
