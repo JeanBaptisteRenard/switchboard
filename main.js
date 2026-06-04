@@ -1494,7 +1494,13 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         } else if (sessionOptions.permissionMode) {
           claudeCmd += ` --permission-mode "${sessionOptions.permissionMode}"`;
         }
-        if (sessionOptions.worktree) {
+        // --worktree only applies when STARTING a session — it creates a fresh
+        // isolated git worktree. Resuming (isNew === false) must reuse the
+        // session's existing directory, so ignore the worktree option on resume
+        // regardless of which call site supplied it (sidebar click, schedule
+        // creator, fork, …). Otherwise a resume tries to spin up a new worktree
+        // and fails to attach.
+        if (isNew && sessionOptions.worktree) {
           claudeCmd += ' --worktree';
           if (sessionOptions.worktreeName) {
             claudeCmd += ` "${sessionOptions.worktreeName}"`;
