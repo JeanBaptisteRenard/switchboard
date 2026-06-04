@@ -89,6 +89,145 @@ async function submitToPty(ptyProcess, command) {
   ptyProcess.write('\r');
 }
 
+// Window (ms) to wait for the busy rising edge when verifying a submission.
+// Defaults to BUSY_RISE_TIMEOUT_MS; override via SWITCHBOARD_SUBMIT_VERIFY_MS.
+function getSubmitVerifyMs() {
+  const v = Number(process.env.SWITCHBOARD_SUBMIT_VERIFY_MS);
+  return Number.isFinite(v) && v >= 0 ? v : BUSY_RISE_TIMEOUT_MS;
+}
+
+/**
+ * Poll ctx.isSessionBusy(sessionId) for a rising edge (busy=true) up to
+ * `windowMs`, bounded by the absolute `deadlineMs`. Stops early if the PTY
+ * disappears.
+ *
+ * Returns { rose, timedOut, sessionExited, waited_ms }.
+ *   - rose:         busy=true was observed
+ *   - timedOut:     global deadline fired before any rise
+ *   - sessionExited: PTY vanished during the poll
+ */
+function pollForBusyRise(sessionId, ctx, windowMs, deadlineMs) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const windowEnd = start + windowMs;
+
+    function check() {
+      const now = Date.now();
+
+      if (now >= deadlineMs) {
+        return resolve({ rose: false, timedOut: true, sessionExited: false, waited_ms: now - start });
+      }
+      if (!ctx.getPtyForSession(sessionId)) {
+        return resolve({ rose: false, timedOut: false, sessionExited: true, waited_ms: now - start });
+      }
+      if (ctx.isSessionBusy(sessionId)) {
+        return resolve({ rose: true, timedOut: false, sessionExited: false, waited_ms: now - start });
+      }
+      if (now >= windowEnd) {
+        // Verify window elapsed without a rise — caller decides what to do.
+        return resolve({ rose: false, timedOut: false, sessionExited: false, waited_ms: now - start });
+      }
+      setTimeout(check, IDLE_POLL_INTERVAL);
+    }
+
+    check();
+  });
+}
+
+/**
+ * Submit a command and verify it actually started a turn.
+ *
+ * 1. submitToPty(text + discrete Enter)
+ * 2. Poll for busy-rise within SWITCHBOARD_SUBMIT_VERIFY_MS.
+ * 3. Rise observed → done (submit_retries: 0).
+ * 4. No rise → write a SINGLE bare '\r' (a no-op on an empty composer, so it is
+ *    harmless if the first submit actually worked; if the text is still sitting
+ *    in the composer because the first Enter was absorbed, this submits it) and
+ *    poll the same window again (submit_retries: 1).
+ *
+ * The observed rise IS the equivalent of waitForTurnComplete's Phase 1; callers
+ * MUST NOT then wait for the rise again — they proceed straight to busy-fall.
+ *
+ * Returns { submit_retries, rose, sessionExited, timedOut, waited_ms }.
+ *   - waited_ms is the total time spent polling (both windows + retry).
+ *
+ * If sessionExited/timedOut fire, the caller short-circuits with the usual
+ * error result. If neither rise nor retry produces a rise (and no deadline),
+ * the caller keeps the legacy instant-reply semantics — submit_retries traces
+ * that the verification could not confirm a turn started.
+ */
+async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs) {
+  await submitToPty(ptyProcess, command);
+
+  const windowMs = getSubmitVerifyMs();
+  // No explicit (global) deadline → the verify window alone governs; the retry
+  // must fire on window expiry, so the deadline must NOT coincide with it.
+  const effectiveDeadline = (deadlineMs !== undefined) ? deadlineMs : Infinity;
+
+  const first = await pollForBusyRise(sessionId, ctx, windowMs, effectiveDeadline);
+  if (first.rose || first.sessionExited || first.timedOut) {
+    return {
+      submit_retries: 0,
+      rose: first.rose,
+      sessionExited: first.sessionExited,
+      timedOut: first.timedOut,
+      waited_ms: first.waited_ms,
+    };
+  }
+
+  // No rise within the window — retry the Enter ONCE (bare '\r', never the text).
+  try {
+    ptyProcess.write('\r');
+  } catch (err) {
+    // Surface as a sessionExited-like failure; caller maps to an error result.
+    return {
+      submit_retries: 1,
+      rose: false,
+      sessionExited: false,
+      timedOut: false,
+      writeError: err,
+      waited_ms: first.waited_ms,
+    };
+  }
+
+  const second = await pollForBusyRise(sessionId, ctx, windowMs, effectiveDeadline);
+  return {
+    submit_retries: 1,
+    rose: second.rose,
+    sessionExited: second.sessionExited,
+    timedOut: second.timedOut,
+    waited_ms: first.waited_ms + second.waited_ms,
+  };
+}
+
+/**
+ * Wait only for the busy FALLING edge (busy → false), i.e. the turn finishing.
+ * Used after submitWithVerify has already confirmed (or assumed) the rise.
+ *
+ * Returns { timedOut, sessionExited, waited_ms }.
+ */
+function waitForBusyFall(sessionId, ctx, deadlineMs) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+
+    function check() {
+      const now = Date.now();
+      if (now >= deadlineMs) {
+        return resolve({ timedOut: true, sessionExited: false, waited_ms: now - start });
+      }
+      if (!ctx.getPtyForSession(sessionId)) {
+        return resolve({ timedOut: false, sessionExited: true, waited_ms: now - start });
+      }
+      if (!ctx.isSessionBusy(sessionId)) {
+        return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
+      }
+      setTimeout(check, IDLE_POLL_INTERVAL);
+    }
+
+    check();
+  });
+}
+
 function getTriggersDir() {
   return process.env.SWITCHBOARD_TRIGGERS_DIR || DEFAULT_TRIGGERS_DIR;
 }
@@ -138,87 +277,13 @@ function waitForIdle(sessionId, ctx, timeoutMs) {
   });
 }
 
-/**
- * After injecting a command, wait for the session's busy state to go:
- *   true (turn started) → false (turn finished).
- *
- * TOCTOU note: Claude may answer so fast that busy=true is never observed
- * between IDLE_POLL_INTERVAL (100ms) ticks.  We wait up to BUSY_RISE_TIMEOUT_MS
- * (2s) for the rising edge; if it doesn't arrive within that window (but
- * before the global deadline), we assume the turn completed instantly and
- * return immediately.
- *
- * Known risk of the instant-reply heuristic: if the model takes longer than
- * 2 s to start tokenizing (cold start, network stall, paused mid-stream),
- * Phase 1 wrongly returns success and the next chain step's input will be
- * appended to the previous turn rather than starting a new prompt.  This is
- * accepted as the lesser of two evils — the alternative (longer wait) penalises
- * the common fast-reply case.  Callers that need stronger guarantees should
- * set a per-step `timeout_ms` and inspect `waited_ms` to detect the rare
- * "near-2000ms then declared instant" pattern.
- *
- * If the global deadline fires first, we return {timedOut: true}.
- *
- * @param {string} sessionId
- * @param {object} ctx
- * @param {number} deadlineMs  absolute epoch-ms deadline (shared global deadline)
- * Returns { timedOut: boolean, sessionExited: boolean, waited_ms: number }.
- */
-function waitForTurnComplete(sessionId, ctx, deadlineMs) {
-  return new Promise((resolve) => {
-    const start = Date.now();
-    // busyRiseDeadline is the earliest of: 2s from now, or the global deadline.
-    // If the global deadline is sooner, Phase 1 times out → timedOut:true.
-    // If BUSY_RISE_TIMEOUT_MS fires first, we assume instant-reply → timedOut:false.
-    const busyRiseAt = start + BUSY_RISE_TIMEOUT_MS;
-
-    // Phase 1: wait for busy=true (turn started accepting our injected command)
-    function waitForBusy() {
-      const now = Date.now();
-
-      if (now >= deadlineMs) {
-        return resolve({ timedOut: true, sessionExited: false, waited_ms: now - start });
-      }
-
-      if (!ctx.getPtyForSession(sessionId)) {
-        return resolve({ timedOut: false, sessionExited: true, waited_ms: now - start });
-      }
-
-      if (ctx.isSessionBusy(sessionId)) {
-        // Rising edge observed — proceed to Phase 2
-        return waitForIdle2();
-      }
-
-      if (now >= busyRiseAt) {
-        // TOCTOU: BUSY_RISE_TIMEOUT_MS elapsed without busy rising;
-        // assume the turn completed so quickly we missed the rising edge.
-        return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
-      }
-
-      setTimeout(waitForBusy, IDLE_POLL_INTERVAL);
-    }
-
-    // Phase 2: wait for busy=false (turn finished)
-    function waitForIdle2() {
-      const now = Date.now();
-      if (now >= deadlineMs) {
-        return resolve({ timedOut: true, sessionExited: false, waited_ms: now - start });
-      }
-
-      if (!ctx.getPtyForSession(sessionId)) {
-        return resolve({ timedOut: false, sessionExited: true, waited_ms: now - start });
-      }
-
-      if (!ctx.isSessionBusy(sessionId)) {
-        return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
-      }
-
-      setTimeout(waitForIdle2, IDLE_POLL_INTERVAL);
-    }
-
-    waitForBusy();
-  });
-}
+// NOTE: the previous combined-phase waiter (waitForTurnComplete: busy-rise then
+// busy-fall) was split into submitWithVerify (Phase 1, busy-rise + Enter retry)
+// and waitForBusyFall (Phase 2, busy-fall) so the chain path can verify each
+// submission and retry the Enter once if the turn never starts (2026-06-04
+// "text stuck in composer" incident). The instant-reply semantics are preserved:
+// when no rise is confirmed, submitWithVerify still returns and waitForBusyFall
+// returns immediately on an already-idle session.
 
 /**
  * Validate a single timeout_ms value (for top-level or per-step).
@@ -469,23 +534,31 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
       return;
     }
 
-    // Write to PTY: text, then Enter as a discrete keypress (see submitToPty).
+    // Write to PTY: text, then Enter as a discrete keypress (see submitToPty),
+    // then verify the submission actually started a turn — retrying the Enter
+    // once if the busy rising edge never arrives (the 2026-06-04 "text stuck in
+    // composer, Enter absorbed" incident).
+    let submitRetries = 0;
     try {
-      await submitToPty(ptyProcess, command);
+      const v = await submitWithVerify(ptyProcess, sessionId, command, ctx);
+      submitRetries = v.submit_retries;
+      if (v.writeError) throw v.writeError;
     } catch (err) {
       ctx.log.error('[trigger-watcher] PTY write failed:', err.message);
       await writeResult({ ok: false, error: 'pty write failed: ' + err.message, sessionId });
       return;
     }
 
-    ctx.log.info(`[trigger-watcher] Sent command to ${sessionId}: ${command}`);
+    ctx.log.info(`[trigger-watcher] Sent command to ${sessionId}: ${command}` +
+      (submitRetries ? ` (submit retried ${submitRetries}x)` : ''));
 
     await writeResult({
-      ok:        true,
+      ok:             true,
       sessionId,
       command,
-      sent_at:   new Date().toISOString(),
+      sent_at:        new Date().toISOString(),
       waited_ms,
+      submit_retries: submitRetries,
     });
     return;
   }
@@ -551,50 +624,85 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     const stepSentAt = new Date().toISOString();
     if (i === 0) step0SentAt = stepSentAt;
 
+    // Per-step timeout_ms (if set) bounds THIS whole step (verify + retry + the
+    // busy-fall wait for non-final steps), capped by the remaining global
+    // deadline — mirroring the old combined waitForTurnComplete deadline.
+    let stepTimeoutMs;
+    if (step.timeout_ms !== undefined) {
+      stepTimeoutMs = Math.min(step.timeout_ms, globalDeadline - Date.now());
+    } else {
+      stepTimeoutMs = globalDeadline - Date.now();
+    }
+    const stepDeadline = Date.now() + stepTimeoutMs;
+
+    // Submit the step and verify the turn actually started (busy rising edge).
+    // The verify poll IS this step's Phase 1 (busy-rise) — for non-final steps
+    // we proceed straight to the busy-FALL wait, never re-observing the rise.
+    // The verify window is bounded by this step's deadline; if no rise arrives
+    // we retry the bare Enter once (harmless no-op if already submitted).
+    let submitRetries = 0;
+    let stepWaitedMs = 0;
+    let verify;
     try {
-      await submitToPty(entry.ptyProcess, step.command);
+      verify = await submitWithVerify(entry.ptyProcess, sessionId, step.command, ctx, stepDeadline);
     } catch (err) {
       ctx.log.error(`[trigger-watcher] PTY write failed at chain step ${i}:`, err.message);
       await writeResult({ ok: false, error: 'pty write failed: ' + err.message, partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
       return;
     }
+    if (verify.writeError) {
+      ctx.log.error(`[trigger-watcher] PTY write failed at chain step ${i}:`, verify.writeError.message);
+      await writeResult({ ok: false, error: 'pty write failed: ' + verify.writeError.message, partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      return;
+    }
+    submitRetries = verify.submit_retries;
+    stepWaitedMs += verify.waited_ms;
+    totalWaitedMs += verify.waited_ms;
 
-    ctx.log.info(`[trigger-watcher] Chain step ${i} sent to ${sessionId}: ${step.command}`);
+    ctx.log.info(`[trigger-watcher] Chain step ${i} sent to ${sessionId}: ${step.command}` +
+      (submitRetries ? ` (submit retried ${submitRetries}x)` : ''));
 
-    // Wait for the turn to complete (except after the last step — no need to wait)
-    let stepWaitedMs = 0;
+    // Session exited / global timeout observed during verify.
+    if (verify.sessionExited) {
+      ctx.log.warn(`[trigger-watcher] Session exited during chain step ${i} submit verify:`, sessionId);
+      steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
+      await writeResult({ ok: false, error: 'session exited during wait', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      return;
+    }
+    if (verify.timedOut) {
+      ctx.log.warn(`[trigger-watcher] Chain timeout during step ${i} submit verify:`, sessionId);
+      steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
+      await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      return;
+    }
+
+    // For non-final steps, wait for the turn to FINISH (busy falling edge).
+    // submitWithVerify already consumed the rising edge. If the rise was never
+    // observed (instant-reply / unconfirmed submit), busy is already false and
+    // this returns immediately — preserving the legacy instant-reply behaviour
+    // while submit_retries records that verification could not confirm a turn.
     if (i < chain.length - 1) {
-      // Determine timeout for this step's turn completion.
-      // Per-step timeout_ms (if set) is the deadline for THIS step's turn wait only.
-      // It is capped by the remaining global deadline.
-      let stepTimeoutMs;
-      if (step.timeout_ms !== undefined) {
-        stepTimeoutMs = Math.min(step.timeout_ms, globalDeadline - Date.now());
-      } else {
-        stepTimeoutMs = globalDeadline - Date.now();
-      }
-
-      const stepDeadline = Date.now() + stepTimeoutMs;
-      const result = await waitForTurnComplete(sessionId, ctx, stepDeadline);
-      stepWaitedMs = result.waited_ms;
-      totalWaitedMs += stepWaitedMs;
+      // Same per-step deadline as the verify above — bounds the busy-fall wait.
+      const result = await waitForBusyFall(sessionId, ctx, stepDeadline);
+      stepWaitedMs += result.waited_ms;
+      totalWaitedMs += result.waited_ms;
 
       if (result.sessionExited) {
         ctx.log.warn(`[trigger-watcher] Session exited during chain step ${i} turn wait:`, sessionId);
-        steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs });
+        steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
         await writeResult({ ok: false, error: 'session exited during wait', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
         return;
       }
 
       if (result.timedOut) {
         ctx.log.warn(`[trigger-watcher] Chain timeout at step ${i}:`, sessionId);
-        steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs });
+        steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
         await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
         return;
       }
     }
 
-    steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs });
+    steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
   }
 
   await writeResult({

@@ -8,6 +8,12 @@
 // turn-completion timing in makeChainCtx is not perturbed by a 50ms wait.
 process.env.SWITCHBOARD_SUBMIT_ENTER_DELAY_MS = '1';
 
+// Submission-verify window: must exceed makeChainCtx's simulated busy-rise
+// (50ms after the '\r' write) plus one IDLE_POLL_INTERVAL (100ms) so the poll
+// reliably catches the rising edge, yet stay short enough to keep the suite
+// fast and deterministic when no rise ever arrives (retry path).
+process.env.SWITCHBOARD_SUBMIT_VERIFY_MS = '400';
+
 const test   = require('node:test');
 const assert = require('node:assert/strict');
 const fs     = require('fs');
@@ -131,9 +137,11 @@ test('happy path: trigger → pty.write called, result ok:true, trigger deleted'
     assert.equal(result.command, '/compact');
     assert.ok(result.sent_at, 'result.sent_at should be set');
     assert.equal(typeof result.waited_ms, 'number', 'waited_ms should be a number');
+    // busy never rises in this ctx → submit-verify retries the Enter once.
+    assert.equal(result.submit_retries, 1, 'submit_retries should be 1 (no busy-rise observed)');
 
-    // pty.write called with command + \r
-    assert.deepEqual(ctx._written, ['/compact', '\r'], 'pty.write: command text then discrete Enter');
+    // pty.write: command text, discrete Enter, then the verify-retry Enter.
+    assert.deepEqual(ctx._written, ['/compact', '\r', '\r'], 'pty.write: command text, Enter, then retry Enter');
 
     // Trigger file deleted
     assert.equal(fs.existsSync(triggerPath), false, 'trigger file should be deleted');
@@ -276,7 +284,8 @@ test('wait:idle while busy → flips to idle after 150ms → write happens, wait
       result.waited_ms >= 100,
       `waited_ms (${result.waited_ms}) should be >= 100ms`,
     );
-    assert.deepEqual(ctx._written, ['/compact', '\r'], 'PTY write should happen after idle');
+    // busy is false by the time we submit → no rise → verify retries the Enter.
+    assert.deepEqual(ctx._written, ['/compact', '\r', '\r'], 'PTY write should happen after idle (with verify-retry Enter)');
 
     watcher.close();
   } finally {
@@ -525,8 +534,10 @@ test('W4 concurrency cap: 12 simultaneous triggers all get processed', async () 
       assert.equal(result.ok, true, `trigger ${uuid} should be ok:true`);
     }
 
-    // 12 PTY writes should have happened
-    assert.equal(ctx._written.filter((w) => w === '\r').length, COUNT, `expected ${COUNT} submitted commands`);
+    // 12 command texts should have been written. We count by command texts
+    // (w !== '\r') rather than Enters, because submit-verify may add a retry '\r'
+    // per command when no busy-rise is observed.
+    assert.equal(ctx._written.filter((w) => w !== '\r').length, COUNT, `expected ${COUNT} submitted commands`);
 
     watcher.close();
   } finally {
@@ -628,7 +639,8 @@ test('inFlight dedup: same filename event fired twice → processed at most once
     assert.equal(result.ok, true);
     // The trigger file is deleted after first processing, so any second fs.watch
     // event for the same name finds no file and is silently skipped.
-    assert.equal(ctx._written.filter((w) => w === '\r').length, 1, 'command submitted exactly once');
+    // Count command texts (w !== '\r'): submit-verify may add a retry '\r'.
+    assert.equal(ctx._written.filter((w) => w !== '\r').length, 1, 'command submitted exactly once');
 
     watcher.close();
   } finally {
@@ -708,7 +720,8 @@ test('W6 timeout_ms: per-trigger timeout_ms honored, overrides env-var fallback'
     const result = readResult(path.join(tmp, 'processed'), uuid);
     assert.equal(result.ok, true, 'result should be ok when timeout_ms overrides short env var');
     assert.ok(result.waited_ms >= 100, `waited_ms (${result.waited_ms}) should be >= 100ms`);
-    assert.deepEqual(ctx._written, ['/compact', '\r'], 'PTY write should happen');
+    // busy is false at submit time → no rise → verify retries the Enter once.
+    assert.deepEqual(ctx._written, ['/compact', '\r', '\r'], 'PTY write should happen (with verify-retry Enter)');
 
     watcher.close();
   } finally {
@@ -990,7 +1003,8 @@ test('W7 default helper: real-pid mock passes default signal-0 probe → happy p
 
     const result = readResult(path.join(tmp, 'processed'), uuid);
     assert.equal(result.ok, true, 'live pid → default helper returns true → ok');
-    assert.deepEqual(ctx._written, ['/help', '\r']);
+    // busy never rises → verify retries the Enter once.
+    assert.deepEqual(ctx._written, ['/help', '\r', '\r']);
 
     watcher.close();
   } finally {
@@ -1531,8 +1545,9 @@ test('chain validation: invalid per-step timeout_ms → ok:false, no PTY write',
 });
 
 // CHAIN-12: instant-reply path on a mid-chain step (i>0) — busy never rises within
-// BUSY_RISE_TIMEOUT_MS so the watcher must declare the turn complete and proceed.
-test('chain instant-reply mid-chain: step 1 never sets busy → proceeds to step 2 after ~2s', async () => {
+// the verify window, so submit-verify retries the Enter once and then the watcher
+// declares the turn complete and proceeds. Step 2 (final) also goes through verify.
+test('chain instant-reply mid-chain: step 1 never sets busy → verify-retries then proceeds to step 2', async () => {
   const tmp = mkTmp();
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
@@ -1580,13 +1595,203 @@ test('chain instant-reply mid-chain: step 1 never sets busy → proceeds to step
     const result = readResult(path.join(tmp, 'processed'), uuid);
     assert.equal(result.ok, true, 'chain should succeed via instant-reply path');
     assert.equal(result.steps.length, 3, 'all 3 steps must have run');
-    assert.deepEqual(ctx._written, ['/first', '\r', '/second', '\r', '/third', '\r']);
-    // Step 1's instant-reply path should have spent ~2s (BUSY_RISE_TIMEOUT_MS)
-    assert.ok(result.steps[1].waited_ms >= 1900 && result.steps[1].waited_ms <= 2400,
-      `step 1 should have waited ~2000ms for the rising edge; got ${result.steps[1].waited_ms}ms`);
-    // Total elapsed dominated by step 1's instant-reply wait
-    assert.ok(elapsed >= 2000 && elapsed <= 3500,
-      `total elapsed should reflect the ~2s busy-rise wait; got ${elapsed}ms`);
+    // Steps 1 and 2 never observe a busy-rise → each gets a single verify-retry '\r'.
+    assert.deepEqual(ctx._written, ['/first', '\r', '/second', '\r', '\r', '/third', '\r', '\r']);
+    assert.equal(result.steps[0].submit_retries, 0, 'step 0 rose (busy@20ms) → no retry');
+    assert.equal(result.steps[1].submit_retries, 1, 'step 1 never rose → one verify-retry');
+    assert.equal(result.steps[2].submit_retries, 1, 'step 2 (final) never rose → one verify-retry');
+    // Step 1 spent two verify windows (~2 × SWITCHBOARD_SUBMIT_VERIFY_MS=400ms) probing
+    // for the rising edge across the initial submit and the retry.
+    assert.ok(result.steps[1].waited_ms >= 700 && result.steps[1].waited_ms <= 1400,
+      `step 1 should have waited ~2 verify windows for the rising edge; got ${result.steps[1].waited_ms}ms`);
+    // Total elapsed dominated by steps 1 & 2's verify+retry windows.
+    assert.ok(elapsed >= 1500 && elapsed <= 3500,
+      `total elapsed should reflect the verify+retry windows; got ${elapsed}ms`);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// ── submit-verify tests (2026-06-04 "Enter absorbed in composer" incident) ──────
+
+// VERIFY-1: single command, busy NEVER rises → submit-verify retries the Enter
+// once. _written must carry the retry '\r' and result.submit_retries === 1.
+test('submit-verify single: busy never rises → retry Enter, submit_retries:1', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-verify-noRise-' + Date.now();
+    const ctx = makeCtx(SESSION_ID, () => false); // busy never rises
+    const watcher = start(ctx);
+
+    const uuid = 'verify-norise-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: 'resume the task' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true, 'result should still be ok (instant-reply semantics preserved)');
+    assert.equal(result.submit_retries, 1, 'one verify-retry when no busy-rise observed');
+    // command text, discrete Enter, then the single retry Enter.
+    assert.deepEqual(ctx._written, ['resume the task', '\r', '\r'],
+      'should write text, Enter, then exactly one retry Enter');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// VERIFY-2: single command, busy rises promptly after the submit → no retry,
+// result.submit_retries === 0 and only one Enter written.
+test('submit-verify single: busy rises fast → no retry, submit_retries:0', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-verify-rise-' + Date.now();
+    // Busy rises the moment the discrete Enter ('\r') is written — the verify
+    // poll observes the rising edge on its first tick → no retry.
+    let busy = false;
+    const ctx = makeCtx(SESSION_ID, () => busy);
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function(data) {
+      origWrite(data);
+      if (data === '\r') busy = true; // turn starts immediately on submit
+    };
+    const watcher = start(ctx);
+
+    const uuid = 'verify-rise-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: 'do the thing' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submit_retries, 0, 'no retry when busy rises promptly');
+    assert.deepEqual(ctx._written, ['do the thing', '\r'], 'only one Enter, no retry');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// VERIFY-3: chain whose FINAL step never raises busy → the final step still
+// gets a submit-verify + retry (the exact 2026-06-04 incident shape), and the
+// retry is traced on steps[last].submit_retries. Earlier steps that rise
+// normally record submit_retries:0.
+test('submit-verify chain final step silent: retry traced on steps[last].submit_retries', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '10000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-verify-finalsilent-' + Date.now();
+    let busy = false;
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function(data) {
+      origWrite(data);
+      writeCount++;
+      // Step 0 submit ('\r' is the 2nd write): normal turn rises then falls.
+      if (writeCount === 2) {
+        setTimeout(() => { busy = true; }, 20);
+        setTimeout(() => { busy = false; }, 200);
+      }
+      // Final step (step 1) never raises busy → must verify-retry the Enter.
+    };
+    ctx.isSessionBusy = (id) => id === SESSION_ID ? busy : false;
+
+    const watcher = start(ctx);
+
+    const uuid = 'verify-finalsilent-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [
+        { command: '/compact' },
+        { command: 'resume and finish' }, // FINAL step — Enter gets absorbed
+      ],
+      timeout_ms: 8000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true, 'chain should complete');
+    assert.equal(result.steps.length, 2);
+    assert.equal(result.steps[0].submit_retries, 0, 'step 0 rose normally → no retry');
+    assert.equal(result.steps[1].submit_retries, 1, 'final step never rose → one verify-retry');
+    // Final step carries the retry '\r'; step 0 does not.
+    assert.deepEqual(ctx._written,
+      ['/compact', '\r', 'resume and finish', '\r', '\r'],
+      'final step writes text, Enter, then the verify-retry Enter');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// VERIFY-4: chain happy path (makeChainCtx auto-turn raises busy on every '\r')
+// → no step needs a retry, submit_retries is 0 for every step and no extra '\r'
+// appears in _written.
+test('submit-verify chain happy: auto-turn rises every step → submit_retries:0 everywhere', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-verify-happy-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID); // auto-turn: busy@50, idle@200 per '\r'
+    const watcher = start(ctx);
+
+    const uuid = 'verify-happy-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'idle',
+      chain: [
+        { command: '/compact' },
+        { command: 'verify and commit' },
+        { command: 'open the PR' },
+      ],
+      timeout_ms: 8000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 8000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 3);
+    for (const s of result.steps) {
+      assert.equal(s.submit_retries, 0, `step ${s.idx} should not retry on a healthy turn`);
+    }
+    // No retry '\r' anywhere — exactly one Enter per command.
+    assert.deepEqual(ctx._written,
+      ['/compact', '\r', 'verify and commit', '\r', 'open the PR', '\r']);
 
     watcher.close();
   } finally {
