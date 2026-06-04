@@ -1485,6 +1485,27 @@ ipcMain.handle('archive-session', (_event, sessionId, archived) => {
 });
 
 // --- IPC: open-terminal ---
+// Recover a session's ORIGINAL working directory from its transcript. The cached
+// projectPath can be collapsed to the parent repo (worktree sessions are grouped
+// under it in the sidebar), but `claude --resume` is project/cwd-scoped — launched
+// from the parent it reports "No conversation found with session ID". We read the
+// real cwd (e.g. the worktree path) from the .jsonl so resume runs in the right place.
+function resolveSessionRealCwd(sessionId) {
+  try {
+    for (const folder of fs.readdirSync(PROJECTS_DIR)) {
+      const jsonl = path.join(PROJECTS_DIR, folder, sessionId + '.jsonl');
+      if (!fs.existsSync(jsonl)) continue;
+      const head = fs.readFileSync(jsonl, 'utf8').slice(0, 8000);
+      for (const line of head.split('\n')) {
+        if (!line) continue;
+        try { const e = JSON.parse(line); if (e.cwd) return e.cwd; } catch {}
+      }
+      return null;
+    }
+  } catch {}
+  return null;
+}
+
 ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, sessionOptions) => {
   if (!mainWindow) return { ok: false, error: 'no window' };
 
@@ -1511,6 +1532,15 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     }
 
     return { ok: true, reattached: true, mcpActive: !!session.mcpServer };
+  }
+
+  // For a Claude resume, launch in the session's real recorded cwd (e.g. its
+  // worktree) rather than the possibly-collapsed projectPath — otherwise
+  // `claude --resume` can't find the conversation. New sessions and plain
+  // terminals keep the requested projectPath.
+  if (!isNew && sessionOptions?.type !== 'terminal') {
+    const realCwd = resolveSessionRealCwd(sessionId);
+    if (realCwd && fs.existsSync(realCwd)) projectPath = realCwd;
   }
 
   // Spawn new PTY
