@@ -79,4 +79,21 @@ function deriveProjectPath(folderPath) {
   return null;
 }
 
-module.exports = { deriveProjectPath, resolveWorktreePath };
+// Locate a session's transcript under any project folder and return its
+// recorded cwd. Used on resume: a worktree session's cached projectPath is
+// collapsed to the parent repo for sidebar grouping, but `claude --resume` is
+// cwd-scoped — resumed from the parent it reports "No conversation found with
+// session ID". Reads go through the bounded extractCwdFromJsonl scan (see
+// CWD_SCAN_BYTES above) so a giant live-session JSONL can't peg the caller.
+function resolveSessionRealCwd(projectsDir, sessionId) {
+  try {
+    for (const folder of fs.readdirSync(projectsDir)) {
+      const jsonl = path.join(projectsDir, folder, sessionId + '.jsonl');
+      if (!fs.existsSync(jsonl)) continue;
+      return extractCwdFromJsonl(jsonl);
+    }
+  } catch {}
+  return null;
+}
+
+module.exports = { deriveProjectPath, resolveWorktreePath, extractCwdFromJsonl, resolveSessionRealCwd };
