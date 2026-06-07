@@ -1800,3 +1800,353 @@ test('submit-verify chain happy: auto-turn rises every step → submit_retries:0
     cleanup(tmp);
   }
 });
+
+// ── W9 — chain re-queue on global-deadline expiry ─────────────────────────────
+
+// W9-1: chain timeout with remaining unsent steps → result has requeued:true +
+// requeue_trigger filename; a new trigger file exists in the triggers dir with
+// the correct payload shape.
+test('W9 requeue: chain timeout with unsent steps → requeued:true + new trigger file', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-requeue-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    // step 0 completes; step 1 stays busy forever → global timeout fires with step 2 unsent.
+    let busy = false;
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function(data) {
+      origWrite(data);
+      writeCount++;
+      if (writeCount === 1) {
+        setTimeout(() => { busy = true; }, 20);
+        setTimeout(() => { busy = false; }, 150);
+      }
+      if (writeCount === 2) {
+        busy = true; // step 1 never goes idle → global deadline fires
+      }
+    };
+    ctx.isSessionBusy = (id) => id === SESSION_ID ? busy : false;
+
+    const watcher = start(ctx);
+
+    const uuid = 'requeue-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [
+        { command: '/compact' },
+        { command: 'step-two' },   // gets sent but stays busy
+        { command: 'step-three' }, // never sent → re-queued
+      ],
+      timeout_ms: 800,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false, 'result.ok should be false');
+    assert.equal(result.partial, true, 'partial should be true');
+    assert.match(result.error, /chain timeout/i, 'error should mention chain timeout');
+    assert.equal(result.requeued, true, 'requeued should be true');
+    assert.ok(typeof result.requeue_trigger === 'string' && result.requeue_trigger.endsWith('.json'),
+      'requeue_trigger should be a .json filename');
+
+    // The new trigger file should exist in the triggers dir
+    const requeuedPath = path.join(tmp, result.requeue_trigger);
+    assert.ok(fs.existsSync(requeuedPath), 'requeue trigger file should exist on disk');
+
+    const requeuedPayload = JSON.parse(fs.readFileSync(requeuedPath, 'utf8'));
+    assert.equal(requeuedPayload.sessionId, SESSION_ID, 'requeued trigger has correct sessionId');
+    assert.ok(Array.isArray(requeuedPayload.chain), 'requeued trigger has chain array');
+    assert.equal(requeuedPayload.chain.length, 1, 'requeued chain has 1 step (step-three)');
+    assert.equal(requeuedPayload.chain[0].command, 'step-three', 'requeued step is step-three');
+    assert.equal(requeuedPayload.wait, 'idle', 'requeued trigger waits for idle');
+    assert.equal(requeuedPayload.requeue_count, 1, 'requeue_count is 1');
+    assert.equal(requeuedPayload.timeout_ms, 800, 'original timeout_ms preserved');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W9-2: initial idle wait times out with ALL steps unsent → entire chain re-queued.
+test('W9 requeue initial-wait: all steps unsent when idle wait times out → all re-queued', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-requeue-init-' + Date.now();
+    // Always busy → initial idle wait times out
+    const ctx = makeChainCtx(SESSION_ID, { initiallyBusy: true });
+
+    const watcher = start(ctx);
+
+    const uuid = 'requeue-init-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'idle',
+      chain: [
+        { command: '/compact' },
+        { command: 'step-two' },
+      ],
+      timeout_ms: 300,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.equal(result.requeued, true, 'should be re-queued');
+    assert.ok(typeof result.requeue_trigger === 'string');
+
+    const requeuedPayload = JSON.parse(fs.readFileSync(path.join(tmp, result.requeue_trigger), 'utf8'));
+    assert.equal(requeuedPayload.chain.length, 2, 'all 2 steps should be re-queued');
+    assert.equal(requeuedPayload.chain[0].command, '/compact');
+    assert.equal(requeuedPayload.chain[1].command, 'step-two');
+    assert.equal(requeuedPayload.requeue_count, 1);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W9-3: requeue_count at MAX_REQUEUE → no new file, result has requeue_exhausted:true.
+test('W9 requeue cap: requeue_count >= MAX_REQUEUE → requeue_exhausted:true, no new file', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-requeue-cap-' + Date.now();
+    // Always busy → initial idle wait times out
+    const ctx = makeChainCtx(SESSION_ID, { initiallyBusy: true });
+
+    const watcher = start(ctx);
+
+    // Simulate a trigger that has already been re-queued MAX_REQUEUE times (=2).
+    const uuid = 'requeue-cap-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'idle',
+      chain: [
+        { command: '/compact' },
+        { command: 'step-two' },
+      ],
+      timeout_ms: 300,
+      requeue_count: 2, // already at cap
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.equal(result.requeue_exhausted, true, 'requeue_exhausted should be true at cap');
+    assert.equal(result.requeued, undefined, 'requeued should not be set');
+
+    // Count trigger json files in the triggers dir (should only be the processed one, not a new requeue)
+    const files = fs.readdirSync(tmp).filter(f => f.endsWith('.json') && !f.includes(uuid));
+    assert.equal(files.length, 0, 'no new trigger file should be written at cap');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W9-4: validation rejects invalid requeue_count (negative number).
+test('W9 validation: negative requeue_count → ok:false, no PTY write', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-badrequeue-neg-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    const watcher = start(ctx);
+
+    const uuid = 'badrequeue-neg-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      chain: [{ command: '/compact' }],
+      requeue_count: -1,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /requeue_count/i, 'error should mention requeue_count');
+    assert.deepEqual(ctx._written, [], 'no PTY write for invalid requeue_count');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W9-5: validation rejects non-integer float requeue_count.
+test('W9 validation: float requeue_count (1.5) → ok:false', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-badrequeue-float-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    const watcher = start(ctx);
+
+    const uuid = 'badrequeue-float-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      chain: [{ command: '/compact' }],
+      requeue_count: 1.5,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /requeue_count/i);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W9-6: validation rejects string requeue_count.
+test('W9 validation: string requeue_count → ok:false', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-badrequeue-str-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    const watcher = start(ctx);
+
+    const uuid = 'badrequeue-str-' + Date.now();
+    fs.writeFileSync(
+      path.join(tmp, uuid + '.json'),
+      JSON.stringify({ sessionId: SESSION_ID, chain: [{ command: '/compact' }], requeue_count: '1' }),
+      'utf8',
+    );
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /requeue_count/i);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W9-7: absent requeue_count (normal new trigger) → treated as 0, no validation error.
+test('W9 validation: absent requeue_count → treated as 0, no validation error', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-requeue-absent-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    const watcher = start(ctx);
+
+    const uuid = 'requeue-absent-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      chain: [{ command: '/compact' }],
+      // requeue_count absent → should default to 0 and pass validation
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true, 'absent requeue_count should not cause a validation error');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// W9-8: completed chain (all steps sent successfully) → no re-queue file written.
+test('W9 no requeue on success: completed chain → no new trigger file written', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-requeue-success-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID); // auto-turn: completes cleanly
+    const watcher = start(ctx);
+
+    const uuid = 'requeue-success-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'idle',
+      chain: [
+        { command: '/compact' },
+        { command: 'verify result and commit' },
+      ],
+      timeout_ms: 5000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true, 'result should be ok on success');
+    assert.equal(result.requeued, undefined, 'requeued should not be set on success');
+    assert.equal(result.requeue_trigger, undefined, 'requeue_trigger should not be set on success');
+
+    // No extra trigger files should exist
+    const files = fs.readdirSync(tmp).filter(f => f.endsWith('.json') && !f.includes(uuid));
+    assert.equal(files.length, 0, 'no extra trigger files on success');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});

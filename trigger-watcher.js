@@ -17,14 +17,19 @@
 //   - Per-trigger timeout_ms capped at 600 000 ms (W6)
 //   - Child-process liveness check before write (W7)
 //   - Max chain length: 20 steps (W8)
+//   - Chain re-queue on global-deadline expiry (W9): when the global deadline
+//     fires with unsent steps remaining, a new trigger file is written with the
+//     remaining steps so they can be retried once the session is idle again.
+//     Max re-queues: MAX_REQUEUE (2). requeue_count tracks depth.
 //
 // Platform note: fs.watch is Linux-only reliable (I2). On macOS, inotify
 // events may be coalesced or delayed; not blocked but not tested.
 'use strict';
 
-const fs   = require('fs');
-const path = require('path');
-const os   = require('os');
+const fs     = require('fs');
+const path   = require('path');
+const os     = require('os');
+const crypto = require('crypto');
 
 const DEFAULT_TRIGGERS_DIR   = path.join(os.homedir(), '.switchboard', 'triggers');
 // Default idle-wait timeout: 5 minutes.
@@ -42,6 +47,10 @@ const MAX_TRIGGER_SIZE  = 64 * 1024;  // 64 KB  (C1)
 const MAX_COMMAND_LEN   = 4 * 1024;   // 4 KB   (W2)
 const MAX_INFLIGHT      = 8;          // concurrency cap (W4)
 const MAX_CHAIN_LENGTH  = 20;         // max steps per chain (W8)
+// W9: Maximum number of times a timed-out chain run may be automatically
+// re-queued.  Keeps starvation loops bounded — if the session is perpetually
+// busy, the chain eventually gives up rather than re-queuing forever.
+const MAX_REQUEUE       = 2;
 // Max time to wait for busy=true after injecting a command.
 // Claude may answer so fast that we never observe the rising edge;
 // after BUSY_RISE_TIMEOUT_MS we assume the turn completed instantly and move on.
@@ -286,6 +295,44 @@ function waitForIdle(sessionId, ctx, timeoutMs) {
 // returns immediately on an already-idle session.
 
 /**
+ * W9 — Write a new trigger file for the unsent remaining chain steps.
+ *
+ * @param {string}   sessionId
+ * @param {Array}    remainingSteps   The chain steps not yet sent.
+ * @param {number}   newRequeueCount  requeueCount + 1.
+ * @param {number|undefined} originalTimeoutMs  Top-level timeout_ms from the original trigger (if any).
+ * @param {string}   triggersDir
+ * @param {object}   log
+ * @returns {string|null}  The new trigger filename (e.g. "abc123.json") or null on failure.
+ */
+function writeRequeueTrigger(sessionId, remainingSteps, newRequeueCount, originalTimeoutMs, triggersDir, log) {
+  const hex      = crypto.randomBytes(16).toString('hex');
+  const filename = hex + '.json';
+  const filePath = path.join(triggersDir, filename);
+  const tmpPath  = filePath + '.tmp';
+
+  const payload = {
+    sessionId,
+    chain:         remainingSteps,
+    wait:          'idle',
+    requeue_count: newRequeueCount,
+  };
+  if (originalTimeoutMs !== undefined) {
+    payload.timeout_ms = originalTimeoutMs;
+  }
+
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(payload) + '\n', 'utf8');
+    fs.renameSync(tmpPath, filePath);
+    return filename;
+  } catch (err) {
+    log.error('[trigger-watcher] Failed to write re-queue trigger:', err.message);
+    try { fs.unlinkSync(tmpPath); } catch {}
+    return null;
+  }
+}
+
+/**
  * Validate a single timeout_ms value (for top-level or per-step).
  * Returns null if valid, or an error string if invalid.
  */
@@ -390,6 +437,22 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
   if (typeof sessionId !== 'string' || !sessionId) {
     await writeResult({ ok: false, error: 'missing required field: sessionId', sessionId: sessionId || null });
     return;
+  }
+
+  // W9: validate requeue_count — absent → 0; must be a non-negative integer
+  const rawRequeueCount = trigger.requeue_count;
+  let requeueCount;
+  if (rawRequeueCount === undefined || rawRequeueCount === null) {
+    requeueCount = 0;
+  } else if (
+    typeof rawRequeueCount !== 'number' ||
+    !Number.isInteger(rawRequeueCount) ||
+    rawRequeueCount < 0
+  ) {
+    await writeResult({ ok: false, error: 'invalid requeue_count: must be a non-negative integer', sessionId });
+    return;
+  } else {
+    requeueCount = rawRequeueCount;
   }
 
   // Mutual exclusion: command and chain cannot both be present
@@ -572,6 +635,30 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
   let totalWaitedMs = 0;
   let step0SentAt = null;
 
+  // W9 — helper: attempt to re-queue remaining chain steps starting at `firstUnsent`.
+  // Returns the writeResult payload extras: requeued, requeue_trigger (on success)
+  // or requeue_exhausted (at cap).
+  function tryRequeue(firstUnsent) {
+    const remaining = chain.slice(firstUnsent);
+    if (remaining.length === 0) return {}; // nothing left to re-queue
+
+    const newRequeueCount = requeueCount + 1;
+    if (requeueCount >= MAX_REQUEUE) {
+      ctx.log.warn(`[trigger-watcher] Chain requeue limit reached (${MAX_REQUEUE}), giving up:`, sessionId);
+      return { requeue_exhausted: true };
+    }
+
+    const filename = writeRequeueTrigger(
+      sessionId, remaining, newRequeueCount, timeout_ms, triggersDir, ctx.log,
+    );
+    if (!filename) {
+      // writeRequeueTrigger already logged the error
+      return { requeue_exhausted: true };
+    }
+    ctx.log.info(`[trigger-watcher] Chain re-queued (${newRequeueCount}/${MAX_REQUEUE}) → ${filename}:`, sessionId);
+    return { requeued: true, requeue_trigger: filename };
+  }
+
   // Step 0: initial wait (respects `wait` field)
   if (wait === 'idle') {
     const remainingMs = globalDeadline - Date.now();
@@ -586,7 +673,9 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
 
     if (result.timedOut || Date.now() >= globalDeadline) {
       ctx.log.warn('[trigger-watcher] Chain timeout during initial idle wait:', sessionId);
-      await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: 0, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      // All steps are unsent — re-queue from step 0.
+      const requeueExtras = tryRequeue(0);
+      await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: 0, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs, ...requeueExtras });
       return;
     }
   }
@@ -597,7 +686,9 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     // Check deadline before each step
     if (Date.now() >= globalDeadline) {
       ctx.log.warn(`[trigger-watcher] Chain global timeout before step ${i}:`, sessionId);
-      await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      // Steps 0..i-1 already sent; re-queue steps i..end.
+      const requeueExtras = tryRequeue(i);
+      await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs, ...requeueExtras });
       return;
     }
 
@@ -672,7 +763,9 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     if (verify.timedOut) {
       ctx.log.warn(`[trigger-watcher] Chain timeout during step ${i} submit verify:`, sessionId);
       steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
-      await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      // Step i was submitted but verify timed out; step i is "in-flight" — re-queue i+1..end.
+      const requeueExtras = tryRequeue(i + 1);
+      await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs, ...requeueExtras });
       return;
     }
 
@@ -697,7 +790,9 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
       if (result.timedOut) {
         ctx.log.warn(`[trigger-watcher] Chain timeout at step ${i}:`, sessionId);
         steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
-        await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+        // Step i completed (rise observed, send done); re-queue steps i+1..end.
+        const requeueExtras = tryRequeue(i + 1);
+        await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs, ...requeueExtras });
         return;
       }
     }
