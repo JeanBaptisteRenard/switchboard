@@ -92,13 +92,29 @@ const MAX_BUFFER_SIZE = 256 * 1024;
 const activeSessions = new Map();
 let mainWindow = null;
 
-// Wrapper that plumbs the live activeSessions map into isAllowedMemoryPath.
+// Wrapper that plumbs the set of known project roots into isAllowedMemoryPath.
+// The Plans/Memory panel (get-memories) surfaces CLAUDE.md / agents.md and
+// .claude/*.md from EVERY indexed project — not just ones with a live session —
+// so the allowlist must cover every known project root, otherwise reading a
+// memory file for a project without an open session would be rejected.
 function isAllowedMemoryPath(filePath) {
-  const projectPaths = [];
+  const projectPaths = new Set();
   for (const [, s] of activeSessions) {
-    if (s.projectPath) projectPaths.push(s.projectPath);
+    if (s.projectPath) projectPaths.add(s.projectPath);
   }
-  return _isAllowedMemoryPath(filePath, projectPaths);
+  // All indexed projects (same enumeration as the get-memories handler).
+  try {
+    const { deriveProjectPath } = require('./derive-project-path');
+    if (fs.existsSync(PROJECTS_DIR)) {
+      for (const d of fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })) {
+        if (!d.isDirectory() || d.name === '.git') continue;
+        const folderPath = path.join(PROJECTS_DIR, d.name);
+        const p = deriveProjectPath(folderPath, d.name);
+        if (p) projectPaths.add(p);
+      }
+    }
+  } catch {}
+  return _isAllowedMemoryPath(filePath, [...projectPaths]);
 }
 
 // Subagent live-tail watchers (watchId → { filePath, parentSessionId, agentId, teardown })
