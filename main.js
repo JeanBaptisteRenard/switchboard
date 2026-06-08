@@ -1,4 +1,4 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, screen, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, screen, session, shell } = require('electron');
 const { Worker } = require('worker_threads');
 const { execFile } = require('child_process');
 const path = require('path');
@@ -39,6 +39,7 @@ const cleanPtyEnv = Object.fromEntries(
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs } = require('./shell-profiles');
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
+const { isSensitivePath, isAllowedMemoryPath: _isAllowedMemoryPath } = require('./ipc-path-validator');
 
 
 
@@ -90,6 +91,15 @@ const MAX_BUFFER_SIZE = 256 * 1024;
 // Active PTY sessions
 const activeSessions = new Map();
 let mainWindow = null;
+
+// Wrapper that plumbs the live activeSessions map into isAllowedMemoryPath.
+function isAllowedMemoryPath(filePath) {
+  const projectPaths = [];
+  for (const [, s] of activeSessions) {
+    if (s.projectPath) projectPaths.push(s.projectPath);
+  }
+  return _isAllowedMemoryPath(filePath, projectPaths);
+}
 
 // Subagent live-tail watchers (watchId → { filePath, parentSessionId, agentId, teardown })
 const subagentWatchers = new Map();
@@ -565,7 +575,9 @@ ipcMain.on('mcp-diff-response', (_event, sessionId, diffId, action, editedConten
 
 ipcMain.handle('read-file-for-panel', async (_event, filePath) => {
   try {
-    const content = fs.readFileSync(filePath, 'utf8');
+    const resolved = path.resolve(filePath);
+    if (isSensitivePath(resolved)) return { ok: false, error: 'access to sensitive path denied' };
+    const content = fs.readFileSync(resolved, 'utf8');
     return { ok: true, content };
   } catch (err) {
     return { ok: false, error: err.message };
@@ -575,6 +587,7 @@ ipcMain.handle('read-file-for-panel', async (_event, filePath) => {
 ipcMain.handle('save-file-for-panel', async (_event, filePath, content) => {
   try {
     const resolved = path.resolve(filePath);
+    if (isSensitivePath(resolved)) return { ok: false, error: 'access to sensitive path denied' };
     if (!fs.existsSync(resolved)) return { ok: false, error: 'File does not exist' };
     fs.writeFileSync(resolved, content, 'utf8');
     return { ok: true };
@@ -588,6 +601,7 @@ const fileWatchers = new Map(); // filePath → FSWatcher
 
 ipcMain.handle('watch-file', (_event, filePath) => {
   const resolved = path.resolve(filePath);
+  if (isSensitivePath(resolved)) return { ok: false, error: 'access to sensitive path denied' };
   if (fileWatchers.has(resolved)) return { ok: true };
   try {
     let debounce = null;
@@ -947,9 +961,8 @@ ipcMain.handle('get-memories', () => {
 ipcMain.handle('read-memory', (_event, filePath) => {
   try {
     const resolved = path.resolve(filePath);
-    // Allow paths under ~/.claude/ or any .md file that exists
     if (!resolved.endsWith('.md')) return '';
-    if (!resolved.startsWith(CLAUDE_DIR) && !fs.existsSync(resolved)) return '';
+    if (!isAllowedMemoryPath(resolved)) return '';
     return fs.readFileSync(resolved, 'utf8');
   } catch (err) {
     console.error('Error reading memory file:', err);
@@ -962,6 +975,7 @@ ipcMain.handle('save-memory', (_event, filePath, content) => {
   try {
     const resolved = path.resolve(filePath);
     if (!resolved.endsWith('.md')) return { ok: false, error: 'not a .md file' };
+    if (!isAllowedMemoryPath(resolved)) return { ok: false, error: 'path not allowed' };
     if (!fs.existsSync(resolved)) return { ok: false, error: 'file does not exist' };
     fs.writeFileSync(resolved, content, 'utf8');
     return { ok: true };
@@ -1885,6 +1899,20 @@ if (!gotSingleInstanceLock) {
   });
 
   app.whenReady().then(() => {
+    // Content Security Policy — restrict what the renderer can load or execute.
+    // 'unsafe-inline' for style-src is required because the app sets .style.*
+    // properties via JavaScript and style.css uses data: URIs in background-image.
+    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+      callback({
+        responseHeaders: {
+          ...details.responseHeaders,
+          'Content-Security-Policy': [
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; font-src 'self'",
+          ],
+        },
+      });
+    });
+
     buildMenu();
     createWindow();
     startProjectsWatcher();
