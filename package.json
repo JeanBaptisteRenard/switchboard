@@ -73,7 +73,7 @@
     ],
     "publish": {
       "provider": "github",
-      "owner": "doctly",
+      "owner": "JeanBaptisteRenard",
       "repo": "switchboard"
     },
     "mac": {
