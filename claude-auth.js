@@ -2,7 +2,7 @@
 // macOS: Keychain (primary) → ~/.claude/.credentials.json (fallback)
 // Linux/Windows: ~/.claude/.credentials.json only
 
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -26,8 +26,12 @@ function readFromKeychain() {
   try {
     const service = getKeychainServiceName();
     const user = process.env.USER || os.userInfo().username;
-    const json = execSync(
-      `security find-generic-password -a "${user}" -w -s "${service}"`,
+    // execFileSync (no shell) so the username and service name are never
+    // interpolated into a shell string — prevents injection via $USER or
+    // a crafted CLAUDE_CONFIG_DIR that produces a malicious service name.
+    const json = execFileSync(
+      'security',
+      ['find-generic-password', '-a', user, '-w', '-s', service],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
     ).trim();
     return JSON.parse(json);
