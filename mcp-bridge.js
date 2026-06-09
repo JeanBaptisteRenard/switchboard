@@ -333,7 +333,13 @@ async function startMcpServer(sessionId, workspaceFolders, mainWindow, log) {
     runningInWindows: false,
     authToken,
   });
-  fs.writeFileSync(lockFilePath, lockData, 'utf8');
+  // mode: 0o600 — lockfile contains the MCP auth token; must not be world-readable.
+  // If the file already exists with wider permissions (from a previous run before this
+  // fix), chmodSync tightens it before the new content is written.
+  if (fs.existsSync(lockFilePath)) {
+    try { fs.chmodSync(lockFilePath, 0o600); } catch {}
+  }
+  fs.writeFileSync(lockFilePath, lockData, { encoding: 'utf8', mode: 0o600 });
 
   const entry = {
     sessionId,

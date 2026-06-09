@@ -36,7 +36,7 @@ const cleanPtyEnv = Object.fromEntries(
 );
 
 // Shell profiles → shell-profiles.js
-const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs } = require('./shell-profiles');
+const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgvForShell } = require('./shell-profiles');
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 
@@ -1890,13 +1890,16 @@ if (!gotSingleInstanceLock) {
     startProjectsWatcher();
     scheduleIpc.ensureScheduleCreatorCommand();
 
-    // Shared runCommand for both cron scheduler and manual "run now"
+    // Shared runCommand for cron scheduler and "run now" — takes argv, not a shell string
     const { spawn: cpSpawn } = require('child_process');
-    function runScheduleCommand(cmd, cwd, name, onDone) {
+    function runScheduleCommand(claudeArgv, cwd, name, onDone) {
       const globalSettings = getSetting('global') || {};
       const profileId = globalSettings.shellProfile || SETTING_DEFAULTS.shellProfile;
       const profile = resolveShell(profileId);
       const shell = profile.path;
+      // Re-serialise the safe argv into a shell string so the user's login shell
+      // can initialise its profile (PATH, version managers, etc.) before running claude.
+      const cmd = 'claude ' + quoteArgvForShell(shell, claudeArgv);
       const args = shellArgs(shell, cmd, profile.args || []);
 
       log.info(`[schedule] Running: ${shell} ${args.join(' ')}`);
