@@ -98,7 +98,8 @@
       "entitlementsInherit": "build/entitlements.mac.plist",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
-      "notarize": false
+      "notarize": false,
+      "identity": null
     },
     "win": {
       "target": [
