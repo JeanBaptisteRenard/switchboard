@@ -132,6 +132,7 @@ const rendererCrossFileGlobals = {
   // Third-party renderer libs loaded as <script>
   morphdom: 'readonly',
   marked: 'readonly',
+  DOMPurify: 'readonly',
   ViewerPanel: 'readonly',
 
   // Switchboard preload bridge
