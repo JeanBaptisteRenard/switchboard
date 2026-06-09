@@ -291,22 +291,30 @@ window.api.onProcessExited((sessionId, exitCode) => {
   const session = sessionMap.get(sessionId);
   if (entry) {
     entry.closed = true;
+    // Write a visible exit banner so the user can see when the process ended
+    // and read any error output it printed (claude / devbox / shell stderr).
+    // Without this, a fast-failing pre-launch command would tear down the
+    // terminal before the user could read the error.
+    try {
+      const colour = exitCode === 0 ? '\x1b[2m' : '\x1b[33m';
+      entry.terminal.write(
+        `\r\n${colour}── session exited (code ${exitCode}) — re-click this session in the sidebar to relaunch, or click another to dismiss ──\x1b[0m\r\n`
+      );
+    } catch {}
   }
 
-  // Clean up terminal UI on exit (uses destroySession to handle grid cards too)
-  if (entry) {
-    destroySession(sessionId);
-  }
-  if (gridViewActive) {
-    gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
-  } else if (activeSessionId === sessionId) {
-    setActiveSession(null);
-    terminalHeader.style.display = 'none';
-    placeholder.style.display = '';
-  }
-
-  // Plain terminal sessions: remove from sidebar entirely (ephemeral)
+  // Plain terminal sessions are ephemeral — destroy immediately and remove from
+  // the sidebar. Claude sessions stay mounted (see below) so the user can read
+  // the exit reason.
   if (session?.type === 'terminal') {
+    if (entry) destroySession(sessionId);
+    if (gridViewActive) {
+      gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
+    } else if (activeSessionId === sessionId) {
+      setActiveSession(null);
+      terminalHeader.style.display = 'none';
+      placeholder.style.display = '';
+    }
     pendingSessions.delete(sessionId);
     for (const projList of [cachedProjects, cachedAllProjects]) {
       for (const proj of projList) {
@@ -319,17 +327,16 @@ window.api.onProcessExited((sessionId, exitCode) => {
     return;
   }
 
-  // Clean up no-op pending sessions (never created a .jsonl)
-  if (pendingSessions.has(sessionId)) {
-    pendingSessions.delete(sessionId);
-    // Remove from cached project data
-    for (const projList of [cachedProjects, cachedAllProjects]) {
-      for (const proj of projList) {
-        proj.sessions = proj.sessions.filter(s => s.sessionId !== sessionId);
-      }
-    }
-    sessionMap.delete(sessionId);
-    refreshSidebar();
+  // Claude sessions: keep the terminal mounted with the exit banner visible so
+  // the user can read what happened. Cleanup is deferred — openSession destroys
+  // the closed entry when the user re-clicks the session (existing behavior).
+  // If the session was pending (no .jsonl was written), leave the sidebar
+  // entry in place too so the user has somewhere to relaunch from; it'll be
+  // tidied up by the regular pending-reconciliation pass once it's clear no
+  // real session file is coming.
+
+  if (gridViewActive) {
+    gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
   }
 
   pollActiveSessions();
