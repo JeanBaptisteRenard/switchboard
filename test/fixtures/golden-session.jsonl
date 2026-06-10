@@ -1,0 +1,4 @@
+{"type":"user","slug":"golden-slug-abc123","timestamp":"2024-03-15T10:00:00.000Z","message":{"role":"user","content":"What is the capital of France?"}}
+{"type":"assistant","timestamp":"2024-03-15T10:00:01.000Z","message":{"role":"assistant","model":"claude-opus-4-5","content":[{"type":"text","text":"The capital of France is Paris."}],"usage":{"input_tokens":20,"output_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":0}}}
+{"type":"user","timestamp":"2024-03-15T10:01:00.000Z","message":{"role":"user","content":"Tell me more about Paris."}}
+{"type":"assistant","timestamp":"2024-03-15T10:01:01.000Z","message":{"role":"assistant","model":"claude-opus-4-5","content":[{"type":"text","text":"Paris is a major European city and the capital of France."}],"usage":{"input_tokens":30,"output_tokens":15,"cache_read_input_tokens":3,"cache_creation_input_tokens":2}}}
