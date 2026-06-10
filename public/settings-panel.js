@@ -75,6 +75,10 @@
     const mcpEmulationValue = fieldValue('mcpEmulation', true);
     const shellProfileValue = fieldValue('shellProfile', 'auto');
 
+    // Working copy of the (global-only) re-bindable keyboard shortcuts.
+    let scShortcuts = normalizeShortcuts(isProject ? null : current.shortcuts);
+    const scIsMac = typeof isMac !== 'undefined' ? isMac : /Mac|iPhone|iPad/.test(navigator.platform);
+
     // Discover available shell profiles
     let shellProfiles = [];
     try { shellProfiles = await window.api.getShellProfiles(); } catch {};
@@ -237,6 +241,21 @@
       </div>` : ''}
 
       ${!isProject ? `<div class="settings-section">
+        <div class="settings-section-title">Keyboard Shortcuts</div>
+        ${SHORTCUT_DEFS.map(def => `
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">${escapeHtml(def.label)}</span>
+            <div class="settings-description">${escapeHtml(def.description)}</div>
+          </div>
+          <div class="settings-field-control">
+            <button class="settings-shortcut-btn" id="sv-sc-${def.id}" data-sc-id="${def.id}">${escapeHtml(formatBinding(def.id, scIsMac, scShortcuts))}</button>
+          </div>
+        </div>`).join('')}
+        <div class="settings-hint">Click a shortcut, then press the new combination. At least one modifier (${scIsMac ? 'Cmd' : 'Ctrl'}, ${scIsMac ? 'Option' : 'Alt'} or Shift) is required. Press Esc to cancel, or click again to reset to defaults.</div>
+      </div>` : ''}
+
+      ${!isProject ? `<div class="settings-section">
         <div class="settings-section-title">Updates</div>
         <div class="settings-field">
           <div class="settings-field-info">
@@ -274,6 +293,54 @@
       });
     });
 
+    // --- Keyboard shortcut rebinding (global only) ---
+    // Capture listeners live on the button element itself (not on document), so
+    // they can never leak app-wide: losing focus (incl. the settings viewer being
+    // dismissed by ANY path) fires `blur` → stops capture, and re-opening the
+    // viewer replaces settingsViewerBody, discarding the old listeners with it.
+    let capturingBtn = null;
+    function stopShortcutCapture() {
+      if (capturingBtn) {
+        capturingBtn.classList.remove('capturing');
+        capturingBtn.textContent = formatBinding(capturingBtn.dataset.scId, scIsMac, scShortcuts);
+        capturingBtn = null;
+      }
+    }
+    settingsViewerBody.querySelectorAll('.settings-shortcut-btn').forEach(btn => {
+      const id = btn.dataset.scId;
+      const def = SHORTCUT_DEFS.find(d => d.id === id);
+      btn.addEventListener('click', () => {
+        // Clicking the button that is already capturing resets it to default.
+        if (capturingBtn === btn) {
+          scShortcuts = { ...scShortcuts, [id]: normalizeShortcuts(null)[id] };
+          stopShortcutCapture();
+          btn.blur();
+          return;
+        }
+        stopShortcutCapture();
+        capturingBtn = btn;
+        btn.classList.add('capturing');
+        btn.textContent = 'Press keys…';
+        btn.focus();
+      });
+      // keydown only acts while THIS button is the one capturing.
+      btn.addEventListener('keydown', (e) => {
+        if (capturingBtn !== btn) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.key === 'Escape') { stopShortcutCapture(); btn.blur(); return; }
+        const binding = captureBinding(e, def, scIsMac);
+        if (!binding) return; // chord incomplete — keep listening
+        scShortcuts = { ...scShortcuts, [id]: binding };
+        stopShortcutCapture();
+        btn.blur();
+      });
+      // Losing focus (click elsewhere, panel dismissed, tab switch) cancels capture.
+      btn.addEventListener('blur', () => {
+        if (capturingBtn === btn) stopShortcutCapture();
+      });
+    });
+
     // Save button
     settingsViewerBody.querySelector('#sv-save-btn').addEventListener('click', async () => {
       let settings = {};
@@ -306,7 +373,9 @@
         settings.terminalTheme = settingsViewerBody.querySelector('#sv-terminal-theme').value || 'switchboard';
         settings.mcpEmulation = settingsViewerBody.querySelector('#sv-mcp-emulation').checked;
         settings.shellProfile = settingsViewerBody.querySelector('#sv-shell-profile').value || 'auto';
+        settings.shortcuts = scShortcuts;
       }
+      stopShortcutCapture();
 
       // Merge form values into existing settings to preserve keys not managed by the form
       if (!isProject) {
@@ -326,6 +395,9 @@
         }
         if (settings.terminalTheme && typeof window._applyTerminalTheme === 'function') {
           window._applyTerminalTheme(settings.terminalTheme);
+        }
+        if (settings.shortcuts && typeof window._applyShortcuts === 'function') {
+          window._applyShortcuts(settings.shortcuts);
         }
         if (typeof refreshSidebar === 'function') refreshSidebar();
       }
@@ -349,6 +421,7 @@
 
     // Cancel button
     settingsViewerBody.querySelector('#sv-cancel-btn').addEventListener('click', () => {
+      stopShortcutCapture();
       closeSettingsViewer();
     });
 

@@ -22,8 +22,8 @@ function setupTerminalKeyBindings(terminal, container, getSessionId, { onFind } 
       return false;
     }
 
-    // Cmd/Ctrl+Shift+G → toggle grid view
-    if (e.key === 'g' && (isMac ? e.metaKey : e.ctrlKey) && e.shiftKey && !e.altKey) {
+    // Toggle grid view (default Cmd/Ctrl+Shift+G)
+    if (matchShortcut('gridToggle', e, isMac, appShortcuts)) {
       if (e.type === 'keydown') { e._handled = true; toggleGridView(); }
       return false;
     }
