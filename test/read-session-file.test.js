@@ -223,3 +223,65 @@ test('readSessionFile (subagent) falls back to filename when agentId is absent i
     cleanup(tmp);
   }
 });
+
+// BT5 — large folder fixture: 100 session JSONLs + 5 subagent subdirs
+test('enumerateSessionFiles: large folder with 100 sessions and 5 subagent subdirs returns correct total and discovers children', () => {
+  const tmp = mkTmp();
+  try {
+    const PARENT_COUNT = 100;
+    const SUBAGENT_DIRS = 5;
+    const SUBAGENTS_PER_DIR = 3;
+
+    // Create 100 top-level session JSONLs
+    for (let i = 0; i < PARENT_COUNT; i++) {
+      const id = `session-${String(i).padStart(3, '0')}`;
+      fs.writeFileSync(path.join(tmp, `${id}.jsonl`), '', 'utf8');
+    }
+
+    // Create 5 subagent subdirs, each with 3 agents
+    // (these are subagent layouts: <parentId>/subagents/agent-<id>.jsonl)
+    const subagentParents = [];
+    for (let d = 0; d < SUBAGENT_DIRS; d++) {
+      const parentId = `parent-${d}`;
+      subagentParents.push(parentId);
+      const subDir = path.join(tmp, parentId, 'subagents');
+      fs.mkdirSync(subDir, { recursive: true });
+      for (let a = 0; a < SUBAGENTS_PER_DIR; a++) {
+        fs.writeFileSync(path.join(subDir, `agent-child-${d}-${a}.jsonl`), '', 'utf8');
+      }
+    }
+
+    const entries = enumerateSessionFiles(tmp);
+
+    const expectedTotal = PARENT_COUNT + SUBAGENT_DIRS * SUBAGENTS_PER_DIR;
+    assert.equal(
+      entries.length,
+      expectedTotal,
+      `expected ${expectedTotal} entries, got ${entries.length}`
+    );
+
+    // All top-level sessions should have parentSessionId === null
+    const topLevel = entries.filter(e => e.parentSessionId === null);
+    assert.equal(topLevel.length, PARENT_COUNT, `expected ${PARENT_COUNT} top-level entries`);
+
+    // Each subagent parent dir should contribute SUBAGENTS_PER_DIR children
+    for (let d = 0; d < SUBAGENT_DIRS; d++) {
+      const parentId = `parent-${d}`;
+      const children = entries.filter(e => e.parentSessionId === parentId);
+      assert.equal(
+        children.length,
+        SUBAGENTS_PER_DIR,
+        `parent-${d} should have ${SUBAGENTS_PER_DIR} subagent children, got ${children.length}`
+      );
+      // Each child should have a valid filePath pointing into that parent's subagents dir
+      for (const child of children) {
+        assert.ok(
+          child.filePath.includes(path.join(parentId, 'subagents')),
+          `child filePath should be under ${parentId}/subagents/`
+        );
+      }
+    }
+  } finally {
+    cleanup(tmp);
+  }
+});
