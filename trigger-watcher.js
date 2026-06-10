@@ -127,7 +127,10 @@ function pollForBusyRise(sessionId, ctx, windowMs, deadlineMs) {
         // Verify window elapsed without a rise — caller decides what to do.
         return resolve({ rose: false, timedOut: false, sessionExited: false, waited_ms: now - start });
       }
-      setTimeout(check, IDLE_POLL_INTERVAL);
+      // .unref() so an in-flight poll never keeps the process alive on its own.
+      // In the app, other handles keep the loop running; in tests this lets the
+      // runner exit cleanly instead of hanging until DEFAULT_IDLE_TIMEOUT (5 min).
+      setTimeout(check, IDLE_POLL_INTERVAL).unref();
     }
 
     check();
@@ -221,7 +224,10 @@ function waitForBusyFall(sessionId, ctx, deadlineMs) {
       if (!ctx.isSessionBusy(sessionId)) {
         return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
       }
-      setTimeout(check, IDLE_POLL_INTERVAL);
+      // .unref() so an in-flight poll never keeps the process alive on its own.
+      // In the app, other handles keep the loop running; in tests this lets the
+      // runner exit cleanly instead of hanging until DEFAULT_IDLE_TIMEOUT (5 min).
+      setTimeout(check, IDLE_POLL_INTERVAL).unref();
     }
 
     check();
@@ -270,7 +276,10 @@ function waitForIdle(sessionId, ctx, timeoutMs) {
       if (waited_ms >= timeout) {
         return resolve({ timedOut: true, sessionExited: false, waited_ms });
       }
-      setTimeout(check, IDLE_POLL_INTERVAL);
+      // .unref() so an in-flight poll never keeps the process alive on its own.
+      // In the app, other handles keep the loop running; in tests this lets the
+      // runner exit cleanly instead of hanging until DEFAULT_IDLE_TIMEOUT (5 min).
+      setTimeout(check, IDLE_POLL_INTERVAL).unref();
     }
 
     check();
