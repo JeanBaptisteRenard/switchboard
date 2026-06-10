@@ -294,13 +294,17 @@
     });
 
     // --- Keyboard shortcut rebinding (global only) ---
+    // Capture listeners live on the button element itself (not on document), so
+    // they can never leak app-wide: losing focus (incl. the settings viewer being
+    // dismissed by ANY path) fires `blur` → stops capture, and re-opening the
+    // viewer replaces settingsViewerBody, discarding the old listeners with it.
     let capturingBtn = null;
-    let captureKeyHandler = null;
     function stopShortcutCapture() {
-      if (captureKeyHandler) document.removeEventListener('keydown', captureKeyHandler, true);
-      captureKeyHandler = null;
-      if (capturingBtn) capturingBtn.classList.remove('capturing');
-      capturingBtn = null;
+      if (capturingBtn) {
+        capturingBtn.classList.remove('capturing');
+        capturingBtn.textContent = formatBinding(capturingBtn.dataset.scId, scIsMac, scShortcuts);
+        capturingBtn = null;
+      }
     }
     settingsViewerBody.querySelectorAll('.settings-shortcut-btn').forEach(btn => {
       const id = btn.dataset.scId;
@@ -310,28 +314,30 @@
         if (capturingBtn === btn) {
           scShortcuts = { ...scShortcuts, [id]: normalizeShortcuts(null)[id] };
           stopShortcutCapture();
-          btn.textContent = formatBinding(id, scIsMac, scShortcuts);
+          btn.blur();
           return;
         }
         stopShortcutCapture();
         capturingBtn = btn;
         btn.classList.add('capturing');
         btn.textContent = 'Press keys…';
-        captureKeyHandler = (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          if (e.key === 'Escape') {
-            stopShortcutCapture();
-            btn.textContent = formatBinding(id, scIsMac, scShortcuts);
-            return;
-          }
-          const binding = captureBinding(e, def, scIsMac);
-          if (!binding) return; // chord incomplete — keep listening
-          scShortcuts = { ...scShortcuts, [id]: binding };
-          stopShortcutCapture();
-          btn.textContent = formatBinding(id, scIsMac, scShortcuts);
-        };
-        document.addEventListener('keydown', captureKeyHandler, true);
+        btn.focus();
+      });
+      // keydown only acts while THIS button is the one capturing.
+      btn.addEventListener('keydown', (e) => {
+        if (capturingBtn !== btn) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.key === 'Escape') { stopShortcutCapture(); btn.blur(); return; }
+        const binding = captureBinding(e, def, scIsMac);
+        if (!binding) return; // chord incomplete — keep listening
+        scShortcuts = { ...scShortcuts, [id]: binding };
+        stopShortcutCapture();
+        btn.blur();
+      });
+      // Losing focus (click elsewhere, panel dismissed, tab switch) cancels capture.
+      btn.addEventListener('blur', () => {
+        if (capturingBtn === btn) stopShortcutCapture();
       });
     });
 

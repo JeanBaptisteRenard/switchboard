@@ -132,6 +132,11 @@ function formatBinding(id, isMac, shortcuts) {
 // or a 'key'-family action without a literal key yet).
 function captureBinding(e, def, isMac) {
   if (['Control', 'Alt', 'Shift', 'Meta', 'CapsLock'].includes(e.key)) return null;
+  // The cross-modifier (Ctrl on mac / Meta elsewhere) isn't representable in a
+  // binding, and matchShortcut rejects events that hold it — so refuse to capture
+  // a combo that includes it (would otherwise produce an unmatchable binding).
+  const secondary = isMac ? e.ctrlKey : e.metaKey;
+  if (secondary) return null;
   const primary = isMac ? e.metaKey : e.ctrlKey;
   const binding = { primary: !!primary, alt: !!e.altKey, shift: !!e.shiftKey };
   // Require at least one modifier so we never shadow a bare arrow / letter.

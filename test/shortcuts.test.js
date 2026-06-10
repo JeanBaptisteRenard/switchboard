@@ -118,4 +118,8 @@ test('captureBinding: needs a modifier + real key; rejects bare/modifier-only pr
   // key family with a char → captured incl. key
   assert.deepEqual(captureBinding(ev('K', 'ctrl+shift', 'KeyK'), keyDef, false),
     { primary: true, alt: false, shift: true, key: 'k' });
+  // cross-modifier held (Meta on Linux) → rejected: would be an unmatchable binding
+  assert.equal(captureBinding(ev('ArrowRight', 'ctrl+meta+alt'), arrowsDef, false), null);
+  // on macOS the cross-modifier is Ctrl
+  assert.equal(captureBinding(ev('ArrowRight', 'meta+ctrl+shift'), arrowsDef, true), null);
 });
