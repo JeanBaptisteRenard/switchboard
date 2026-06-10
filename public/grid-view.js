@@ -486,29 +486,28 @@ function navigateGrid(direction) {
   }
 }
 
+// Live session-navigation key bindings (re-bindable via global settings).
+// Defaults until the stored `global.shortcuts` setting is applied at startup.
+let appShortcuts = normalizeShortcuts(null);
+function setAppShortcuts(stored) {
+  appShortcuts = normalizeShortcuts(stored);
+}
+
 // Returns true if the key combo is a session nav shortcut (used by xterm to block without acting)
 function isSessionNavKey(e) {
-  const mod = isMac ? e.metaKey : e.ctrlKey;
-  if (!mod || e.altKey) return false;
-  if (e.shiftKey && (e.code === 'BracketLeft' || e.code === 'BracketRight')) return true;
-  if (!e.shiftKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return true;
-  return false;
+  return isSessionNavShortcut(e, isMac, appShortcuts);
 }
 
 function handleSessionNavKey(e) {
-  const mod = isMac ? e.metaKey : e.ctrlKey;
-  if (!mod || e.altKey) return false;
-
-  // Cmd+Shift+[ or Cmd+Shift+] — prev/next session
-  // On macOS, Shift changes e.key to { / }, so check code for reliable matching
-  if (e.shiftKey && (e.code === 'BracketLeft' || e.code === 'BracketRight')) {
+  // Prev/next session (default Cmd/Ctrl+Shift+[ / ])
+  if (matchShortcut('sessionNavBrackets', e, isMac, appShortcuts)) {
     e.preventDefault();
     if (e.type === 'keydown') navigateSession(e.code === 'BracketLeft' ? -1 : 1);
     return true;
   }
 
-  // Cmd+Arrow — in grid view: 2D grid navigation; in single view: left/right cycle sessions
-  if (!e.shiftKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+  // Arrow nav (default Cmd/Ctrl+Shift+Arrow) — grid view: 2D navigation; single view: cycle sessions
+  if (matchShortcut('sessionNavArrows', e, isMac, appShortcuts)) {
     e.preventDefault();
     if (e.type === 'keydown') {
       if (gridViewActive) {

@@ -201,6 +201,18 @@ const rendererCrossFileGlobals = {
   SYNC_BUFFER_TIMEOUT: 'readonly',
   updatePtyTitle: 'readonly',
   _shellProfiles: 'writable',
+
+  // Configurable keyboard shortcuts (public/shortcuts.js + grid-view.js)
+  DEFAULT_SHORTCUTS: 'readonly',
+  SHORTCUT_DEFS: 'readonly',
+  normalizeShortcuts: 'readonly',
+  keyFamily: 'readonly',
+  matchShortcut: 'readonly',
+  isSessionNavShortcut: 'readonly',
+  formatBinding: 'readonly',
+  captureBinding: 'readonly',
+  appShortcuts: 'writable',
+  setAppShortcuts: 'readonly',
 };
 
 module.exports = [
@@ -233,6 +245,26 @@ module.exports = [
       'no-implicit-globals': 'off', // renderer relies on script-scope globals by design
       'no-empty': ['warn', { allowEmptyCatch: true }],
       'no-unreachable': 'warn',
+      'no-redeclare': 'warn',
+    },
+  },
+
+  // Dual-mode helper: classic <script> in the renderer AND require()-d in tests.
+  // Same browser globals as the rest of public/, plus `module` for the CJS footer.
+  {
+    files: ['public/shortcuts.js'],
+    languageOptions: {
+      ecmaVersion: 2024,
+      sourceType: 'script',
+      globals: {
+        ...globals.browser,
+        ...rendererCrossFileGlobals,
+        module: 'writable',
+      },
+    },
+    rules: {
+      'no-undef': 'error',
+      'no-unused-vars': ['warn', { args: 'none', varsIgnorePattern: '^_' }],
       'no-redeclare': 'warn',
     },
   },
