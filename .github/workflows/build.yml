@@ -17,7 +17,11 @@ jobs:
         include:
           - os: macos-14
             platform: mac
-          - os: windows-latest
+          # Pinned to windows-2022: `windows-latest` migrated to the windows-2025
+          # image, where node-gyp fails to detect the VS toolchain when rebuilding
+          # native modules (node-pty / better-sqlite3) → "Could not find any Visual
+          # Studio installation to use". 2022 ships a node-gyp-discoverable VS2022.
+          - os: windows-2022
             platform: win
           # Linux is split per-arch to avoid electron-builder bundling native
           # modules from the wrong architecture. When multiple targets (AppImage
