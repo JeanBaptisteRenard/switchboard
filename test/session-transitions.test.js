@@ -190,32 +190,111 @@ test('post-bootstrap with no new agents emits no additional events (IPC-flood re
   }
 });
 
-test('completion: agent alive on call N, stable mtime for >30s on call N+1, emits subagent-completed', () => {
+test('completion: agent with stable mtime for >30s emits subagent-completed (driven via fake Date clock)', (t) => {
   const events = setupModule();
   const tmp = mkTmp();
   try {
     const sessionId = 'parent';
-    const subDir = seedAgents(tmp, sessionId, [{ id: 'slow' }]);
+    // Create the agent file aged >60s so bootstrap records it as not-yet-completed
+    // (i.e. looksAlive=false path is too old — we want an agent that is first spotted
+    // post-bootstrap so its full lifecycle plays out).
+    // Seed with ageMs=0 so looksAlive=true; bootstrap will emit synthetic spawn.
+    const subDir = seedAgents(tmp, sessionId, [{ id: 'slow', ageMs: 0 }]);
     const filePath = path.join(subDir, 'agent-slow.jsonl');
-    const mtimeMs = fs.statSync(filePath).mtimeMs;
 
-    // Pre-seed knownSubagents as if a prior call already saw this agent alive
-    // and started the stability timer 31 seconds ago. This skips bootstrap mode
-    // since knownSubagents is already defined.
-    const session = { knownSubagents: new Map() };
-    session.knownSubagents.set('slow', {
-      mtimeMs, // same as file's actual mtime → "mtime stable"
-      completed: false,
-      _stableStart: Date.now() - 31_000, // stability started >30s ago
-    });
+    // Call 1: bootstrap — knownSubagents is created, synthetic spawn emitted,
+    //         agent entry stored with completed:false and no _stableStart yet.
+    const session = {};
+    // Enable fake Date with now=realNow so _stableStart gets a non-zero truthy value
+    // (the stability timer check uses !known._stableStart which would be truthy for 0/epoch).
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
 
     detectSubagentTransitions(sessionId, session, tmp);
+    // Bootstrap emits one synthetic spawn for this fresh agent
+    assert.equal(events.filter(e => e.channel === 'subagent-spawned').length, 1);
+    assert.equal(session.knownSubagents.get('slow').completed, false);
 
-    assert.equal(events.length, 1, `expected 1 completion event, got ${events.length}: ${JSON.stringify(events)}`);
-    assert.equal(events[0].channel, 'subagent-completed');
-    assert.equal(events[0].payload.parentSessionId, sessionId);
-    assert.equal(events[0].payload.agentId, 'slow');
+    // Call 2: mtime unchanged from call 1 → _stableStart is set to "now"
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(session.knownSubagents.get('slow').completed, false);
+
+    // Advance the fake clock 31 seconds — well past the 30s STABLE_MS threshold
+    t.mock.timers.tick(31_000);
+
+    // Call 3: mtime still unchanged, _stableStart was set 31s ago → completion fires
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    const completions = events.filter(e => e.channel === 'subagent-completed');
+    assert.equal(completions.length, 1, `expected 1 completion event, got ${events.length}: ${JSON.stringify(events)}`);
+    assert.equal(completions[0].channel, 'subagent-completed');
+    assert.equal(completions[0].payload.parentSessionId, sessionId);
+    assert.equal(completions[0].payload.agentId, 'slow');
     assert.equal(session.knownSubagents.get('slow').completed, true);
+  } finally {
+    t.mock.timers.reset();
+    cleanup(tmp);
+  }
+});
+
+// BT6 — concurrent session monitoring: 2 sessions no cross-contamination
+test('concurrent monitoring: detectSubagentTransitions for 2 distinct sessions emits independent events with no cross-contamination', () => {
+  const events = setupModule();
+  const tmp = mkTmp();
+  try {
+    const sessionA = 'session-alpha';
+    const sessionB = 'session-beta';
+
+    // Seed session A with 2 agents, session B with 1 agent (different ids)
+    seedAgents(tmp, sessionA, [{ id: 'a-worker-1' }, { id: 'a-worker-2' }]);
+    seedAgents(tmp, sessionB, [{ id: 'b-worker-1' }]);
+
+    const sessA = {};
+    const sessB = {};
+
+    // Bootstrap both sessions
+    detectSubagentTransitions(sessionA, sessA, tmp);
+    detectSubagentTransitions(sessionB, sessB, tmp);
+
+    // Both sessions should have their own independent knownSubagents maps
+    assert.ok(sessA.knownSubagents instanceof Map, 'sessA must have knownSubagents');
+    assert.ok(sessB.knownSubagents instanceof Map, 'sessB must have knownSubagents');
+
+    assert.equal(sessA.knownSubagents.size, 2, 'sessA should know 2 agents');
+    assert.equal(sessB.knownSubagents.size, 1, 'sessB should know 1 agent');
+
+    // No cross-contamination: sessA has no knowledge of B's agent, and vice-versa
+    assert.ok(!sessA.knownSubagents.has('b-worker-1'), 'sessA must not know about b-worker-1');
+    assert.ok(!sessB.knownSubagents.has('a-worker-1'), 'sessB must not know about a-worker-1');
+    assert.ok(!sessB.knownSubagents.has('a-worker-2'), 'sessB must not know about a-worker-2');
+
+    // Add a new agent to session A only — should NOT appear in session B.
+    // Busy-wait a few ms to ensure the filesystem mtime of the subagents dir
+    // advances past the value cached during bootstrap, so dirChanged=true.
+    const waitUntil = Date.now() + 5;
+    while (Date.now() < waitUntil) { /* spin */ }
+    seedAgents(tmp, sessionA, [{ id: 'a-worker-new' }]);
+    detectSubagentTransitions(sessionA, sessA, tmp);
+    detectSubagentTransitions(sessionB, sessB, tmp);
+
+    const spawnedForA = events.filter(
+      e => e.channel === 'subagent-spawned' && e.payload.parentSessionId === sessionA
+    );
+    const spawnedForB = events.filter(
+      e => e.channel === 'subagent-spawned' && e.payload.parentSessionId === sessionB
+    );
+
+    // The new a-worker-new event must carry sessionA's parentSessionId
+    const newWorkerEvent = spawnedForA.find(e => e.payload.agentId === 'a-worker-new');
+    assert.ok(newWorkerEvent, 'expected subagent-spawned for a-worker-new under sessionA');
+    assert.equal(newWorkerEvent.payload.parentSessionId, sessionA);
+
+    // Session B should not have been notified about a-worker-new
+    const bHasNewWorker = spawnedForB.some(e => e.payload.agentId === 'a-worker-new');
+    assert.ok(!bHasNewWorker, 'sessB must not receive spawn events for sessA agents');
+
+    // Fresh workers from bootstrap emit with _bootstrap:true; the new post-bootstrap
+    // agent for sessA must NOT carry _bootstrap:true
+    assert.ok(!newWorkerEvent.payload._bootstrap, 'post-bootstrap spawn must not carry _bootstrap flag');
   } finally {
     cleanup(tmp);
   }

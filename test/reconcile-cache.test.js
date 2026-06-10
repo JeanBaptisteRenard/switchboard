@@ -15,24 +15,29 @@ function writeSession(folderPath, cwd) {
   fs.writeFileSync(path.join(folderPath, 'session.jsonl'), line + '\n', 'utf8');
 }
 
-// In-memory fake of the db layer init() expects; records which folders actually
-// got (re)indexed (i.e. had refreshFolder do work and upsert sessions).
+// In-memory fake of the db layer init() expects.
+// folderMetaCalls records every setFolderMeta(folder, projectPath, indexMtimeMs)
+// invocation so tests can assert at the observable seam (which folders were
+// stamped with a non-zero indexMtimeMs) rather than inspecting internal bookkeeping.
 function makeFakeDb(metaMap) {
-  const indexed = new Set();
+  const folderMetaCalls = [];
   const noop = () => {};
   return {
-    indexed,
+    folderMetaCalls,
     db: {
       deleteCachedFolder: noop,
       getCachedByFolder: () => [],
-      upsertCachedSessions: (sessions) => { for (const s of sessions) indexed.add(s.folder); },
+      upsertCachedSessions: noop,
       touchCachedModified: noop,
       deleteCachedSession: noop,
       replaceSessionMetrics: noop,
       deleteSearchFolder: noop,
       deleteSearchSession: noop,
       upsertSearchEntries: noop,
-      setFolderMeta: (folder, projectPath, indexMtimeMs) => metaMap.set(folder, { folder, projectPath, indexMtimeMs }),
+      setFolderMeta: (folder, projectPath, indexMtimeMs) => {
+        metaMap.set(folder, { folder, projectPath, indexMtimeMs });
+        folderMetaCalls.push({ folder, projectPath, indexMtimeMs });
+      },
       getAllFolderMeta: () => metaMap,
       getAllMeta: () => new Map(),
       getAllCached: () => [],
@@ -68,9 +73,17 @@ test('reconcileCacheFromFilesystem indexes new and stale folders but skips up-to
 
     sessionCache.reconcileCacheFromFilesystem();
 
-    assert.ok(fake.indexed.has('proj-new'), 'new folder should be indexed');
-    assert.ok(fake.indexed.has('proj-stale'), 'stale folder (older indexMtimeMs) should be re-indexed');
-    assert.ok(!fake.indexed.has('proj-current'), 'up-to-date folder should be skipped');
+    // Assert at the observable seam: setFolderMeta was called with a non-zero
+    // indexMtimeMs for folders that were (re)indexed, and was NOT called for
+    // the up-to-date folder. This survives refactors that restructure internal
+    // bookkeeping (e.g. bulk upserts) as long as the folder-meta contract holds.
+    const indexedFolders = fake.folderMetaCalls
+      .filter(c => c.indexMtimeMs > 0)
+      .map(c => c.folder);
+
+    assert.ok(indexedFolders.includes('proj-new'), 'new folder should be stamped with non-zero indexMtimeMs');
+    assert.ok(indexedFolders.includes('proj-stale'), 'stale folder should be re-stamped with non-zero indexMtimeMs');
+    assert.ok(!indexedFolders.includes('proj-current'), 'up-to-date folder must not be re-indexed');
   } finally {
     fs.rmSync(projectsDir, { recursive: true, force: true });
   }
