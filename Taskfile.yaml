@@ -48,6 +48,11 @@ tasks:
     cmds:
       - npm test
 
+  coverage:
+    desc: Run the test suite under c8 (text + lcov in ./coverage)
+    cmds:
+      - npm run coverage
+
   lint:
     desc: Run ESLint across the codebase
     cmds:

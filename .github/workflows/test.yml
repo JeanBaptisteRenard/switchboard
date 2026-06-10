@@ -16,6 +16,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # diff-cover needs history to compare against the base branch
 
       - uses: actions/setup-node@v4
         with:
@@ -25,5 +27,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
-        run: npm test
+      - name: Run tests with coverage
+        run: npm run coverage
+
+      # Gate only NEW/changed lines (patch coverage), not the whole codebase:
+      # main.js (Electron IPC/native) and the DOM glue cannot be unit-tested, so
+      # a global threshold is meaningless. Runs once (Node 22) on PRs only.
+      - name: Patch coverage gate (changed lines >= 80%)
+        if: matrix.node-version == 22 && github.event_name == 'pull_request'
+        run: |
+          python -m pip install --quiet diff_cover
+          git fetch origin "${{ github.base_ref }}" --quiet
+          diff-cover coverage/lcov.info \
+            --compare-branch "origin/${{ github.base_ref }}" \
+            --fail-under 80 \
+            --exclude 'main.js' 'preload.js' 'mcp-bridge.js' 'claude-auth.js' \
+                      'public/codemirror-bundle.js' 'public/codemirror-setup.js' \
+                      'public/terminal-manager.js' 'public/app.js' \
+                      'workers/**' 'scripts/**' 'test/**'
