@@ -386,6 +386,13 @@ function initGridObservers() {
 function hideGridView() {
   gridViewActive = false;
   localStorage.setItem('gridViewActive', '0');
+  // Restore the full scrollback budget for every session, not just the one
+  // about to be focused — background sessions keep producing output after the
+  // grid closes and would otherwise stay silently capped at the thumbnail
+  // budget until individually shown.
+  for (const entry of openSessions.values()) {
+    if (!entry.closed) entry.terminal.options.scrollback = SCROLLBACK_SINGLE;
+  }
   unwrapGridCards();
   terminalsEl.classList.remove('grid-layout');
   terminalsEl.style.gridTemplateColumns = '';
