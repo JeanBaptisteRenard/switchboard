@@ -139,6 +139,9 @@ function flushTerminalBuffer(sessionId) {
   cancelAnimationFrame(buf.rafId);
   terminalWriteBuffers.delete(sessionId);
 
+  // Intentional guard: destroySession may have removed the entry between the
+  // rAF schedule and this flush — bail out instead of writing to a disposed
+  // terminal.
   const entry = openSessions.get(sessionId);
   if (!entry) return;
 
@@ -307,6 +310,20 @@ function destroySession(sessionId) {
   const entry = openSessions.get(sessionId);
   if (!entry) return;
   window.api.closeTerminal(sessionId);
+  // Drop any pending write buffer before disposing — a scheduled rAF/timeout
+  // flush would otherwise call terminal.write() on a disposed instance if
+  // terminal-data IPC raced with the teardown.
+  const buf = terminalWriteBuffers.get(sessionId);
+  if (buf) {
+    cancelAnimationFrame(buf.rafId);
+    clearTimeout(buf.timerId);
+    terminalWriteBuffers.delete(sessionId);
+  }
+  // terminal.dispose() also disposes the parser and its registered OSC
+  // handlers (the OSC-52 clipboard hook) and all onX emitters — no manual
+  // cleanup needed for those. The DnD/search-bar listeners live on
+  // entry.element, which is removed below and garbage-collected once the
+  // entry leaves openSessions/gridCards.
   entry.terminal.dispose();
   entry.element.remove();
   openSessions.delete(sessionId);
