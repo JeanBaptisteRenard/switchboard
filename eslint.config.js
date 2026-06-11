@@ -100,6 +100,7 @@ const rendererCrossFileGlobals = {
   SCROLLBACK_GRID: 'readonly',
   lruTouch: 'readonly',
   suspendTerminalWebgl: 'readonly',
+  destroyGridCard: 'readonly',
   restoreTerminalWebgl: 'readonly',
   cleanDisplayName: 'readonly',
   formatDate: 'readonly',

@@ -313,7 +313,7 @@ function createTerminalEntry(session, opts = {}) {
   searchBar.querySelector('.terminal-search-prev').addEventListener('click', () => searchAddon.findPrevious(searchInput.value, searchOpts));
   searchBar.querySelector('.terminal-search-close').addEventListener('click', closeSearchBar);
 
-  const entry = { terminal, element: container, fitAddon, searchAddon, openSearchBar, closeSearchBar, session, closed: false };
+  const entry = { terminal, element: container, fitAddon, searchAddon, openSearchBar, closeSearchBar, session, closed: false, webglAddon: null };
   openSessions.set(sessionId, entry);
   lruTouch(sessionId);
   loadTerminalWebgl(entry);
@@ -398,15 +398,10 @@ function destroySession(sessionId) {
   openSessions.delete(sessionId);
   const li = lruOrder.indexOf(sessionId);
   if (li !== -1) lruOrder.splice(li, 1);
-  const card = gridCards.get(sessionId);
-  if (card) {
-    card.remove();
-    gridCards.delete(sessionId);
+  if (destroyGridCard(sessionId) && gridViewActive) {
     // Keep the grid header count honest when a card disappears outside the
     // showGridView/showSession flows (e.g. LRU eviction of a closed session).
-    if (gridViewActive) {
-      gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
-    }
+    gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
   }
 }
 

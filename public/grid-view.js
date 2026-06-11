@@ -387,11 +387,27 @@ function updateGridColumns() {
 // large grids.
 let gridCardObserver = null;
 
+// Remove a session's grid card and release its observer registration. Called
+// from destroySession (terminal-manager.js) — without the unobserve, the
+// IntersectionObserver keeps a strong ref to the detached card node, leaking
+// one element per LRU eviction while the grid stays open.
+function destroyGridCard(sessionId) {
+  const card = gridCards.get(sessionId);
+  if (!card) return false;
+  if (gridCardObserver) gridCardObserver.unobserve(card);
+  card.remove();
+  gridCards.delete(sessionId);
+  return true;
+}
+
 // initGridObservers is called from app.js after DOM refs are ready
 function initGridObservers() {
   new ResizeObserver(updateGridColumns).observe(terminalsEl);
   new MutationObserver(updateGridColumns).observe(terminalsEl, { childList: true });
   if (typeof IntersectionObserver !== 'undefined') {
+    // TODO: threshold 0 suspends/restores on every boundary crossing; if fast
+    // grid scrolling ever shows GL-context churn, add a small debounce or
+    // rootMargin here.
     gridCardObserver = new IntersectionObserver((entries) => {
       for (const e of entries) {
         const sid = e.target.dataset.sessionId;
