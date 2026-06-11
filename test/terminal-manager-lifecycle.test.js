@@ -162,3 +162,36 @@ test('destroySession on unknown sessionId is a no-op', () => {
     destroy();
   }
 });
+
+test('scrollback defaults: full budget in single view, thumbnail budget in grid view', () => {
+  const { window, destroy } = setupTerminalDom();
+  try {
+    const single = window.createTerminalEntry({ sessionId: 's-single' });
+    assert.strictEqual(single.terminal.options.scrollback, 10000);
+
+    window.gridViewActive = true;
+    const grid = window.createTerminalEntry({ sessionId: 's-grid' });
+    assert.strictEqual(grid.terminal.options.scrollback, 1000);
+
+    // Explicit option wins over the view-mode default.
+    const explicit = window.createTerminalEntry({ sessionId: 's-explicit', }, { scrollback: 500 });
+    assert.strictEqual(explicit.terminal.options.scrollback, 500);
+  } finally {
+    destroy();
+  }
+});
+
+test('showSession restores the full scrollback budget on a grid-trimmed terminal', () => {
+  const { window, destroy } = setupTerminalDom();
+  try {
+    window.gridViewActive = true;
+    const entry = window.createTerminalEntry({ sessionId: 's1' });
+    assert.strictEqual(entry.terminal.options.scrollback, 1000);
+
+    window.gridViewActive = false;
+    window.showSession('s1');
+    assert.strictEqual(entry.terminal.options.scrollback, 10000);
+  } finally {
+    destroy();
+  }
+});
