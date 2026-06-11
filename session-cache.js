@@ -13,7 +13,7 @@ const { encodeProjectPath } = require('./encode-project-path');
 let PROJECTS_DIR, activeSessions, getMainWindow, log;
 let deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession, touchCachedModified, replaceSessionMetrics;
 let deleteSearchFolder, deleteSearchSession, upsertSearchEntries;
-let setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName;
+let setFolderMeta, getFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName;
 
 function init(ctx) {
   PROJECTS_DIR = ctx.PROJECTS_DIR;
@@ -31,6 +31,7 @@ function init(ctx) {
   deleteSearchSession = ctx.db.deleteSearchSession;
   upsertSearchEntries = ctx.db.upsertSearchEntries;
   setFolderMeta = ctx.db.setFolderMeta;
+  getFolderMeta = ctx.db.getFolderMeta;
   getAllFolderMeta = ctx.db.getAllFolderMeta;
   getAllMeta = ctx.db.getAllMeta;
   getAllCached = ctx.db.getAllCached;
@@ -73,7 +74,16 @@ function refreshFolder(folder, opts = {}) {
     return;
   }
 
-  const projectPath = deriveProjectPath(folderPath, folder);
+  // Reuse the previously-derived projectPath when its directory still exists.
+  // deriveProjectPath reads session JSONL heads, and refreshFolder runs on
+  // every watcher flush — deriving each time is wasted I/O on hot folders.
+  // A vanished directory falls through to a fresh derive so the missing-
+  // project remap detection keeps working.
+  const knownMeta = getFolderMeta ? getFolderMeta(folder) : null;
+  let projectPath = knownMeta && knownMeta.projectPath && fs.existsSync(knownMeta.projectPath)
+    ? knownMeta.projectPath
+    : null;
+  if (!projectPath) projectPath = deriveProjectPath(folderPath, folder);
   if (!projectPath) {
     setFolderMeta(folder, null, getFolderIndexMtimeMs(folderPath));
     return;

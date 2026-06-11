@@ -1,9 +1,24 @@
 const fs = require('fs');
 const path = require('path');
 
+// Only the head of the file is scanned: every session/subagent transcript
+// carries `cwd` on its first JSONL line. Reading the whole file here froze
+// the main process — refreshFolder() derives the project path on every
+// watcher flush, so a 338 MB host-session JSONL meant a multi-second
+// readFileSync per flush, back to back (witnessed 2026-06-11: main thread
+// pegged ~65% CPU re-reading the same file in a loop, UI freezes).
+const CWD_SCAN_BYTES = 256 * 1024;
+
 function extractCwdFromJsonl(filePath) {
+  let fd;
   try {
-    const lines = fs.readFileSync(filePath, 'utf8').split('\n');
+    fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(CWD_SCAN_BYTES);
+    const bytesRead = fs.readSync(fd, buf, 0, CWD_SCAN_BYTES, 0);
+    const lines = buf.toString('utf8', 0, bytesRead).split('\n');
+    // The last line is truncated mid-entry when the file is bigger than the
+    // scan window — drop it instead of feeding garbage to JSON.parse.
+    if (bytesRead === CWD_SCAN_BYTES) lines.pop();
     for (const line of lines) {
       if (!line) continue;
       try {
@@ -11,7 +26,9 @@ function extractCwdFromJsonl(filePath) {
         if (parsed.cwd) return parsed.cwd;
       } catch {}
     }
-  } catch {}
+  } catch {} finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+  }
   return null;
 }
 
