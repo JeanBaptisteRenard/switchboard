@@ -346,10 +346,18 @@ function showGridView() {
   const btn = document.getElementById('grid-toggle-btn');
   if (btn) btn.classList.add('active');
 
-  // Fit all terminals after layout resolves
+  // Fit all terminals after layout resolves. Grid cards also drop to the
+  // thumbnail scrollback budget: xterm trims the buffer immediately when the
+  // new limit is below the current row count, so content scrolled past
+  // SCROLLBACK_GRID rows is lost on entering the grid — accepted trade-off,
+  // the full budget is restored (for future output) when a session returns
+  // to single view (see showSession).
   for (const sid of sessionIds) {
     const entry = openSessions.get(sid);
-    if (entry) fitAndScroll(entry);
+    if (entry) {
+      entry.terminal.options.scrollback = SCROLLBACK_GRID;
+      fitAndScroll(entry);
+    }
   }
   // Focus active or first (deferred so fitAndScroll's rAF runs first)
   requestAnimationFrame(() => {

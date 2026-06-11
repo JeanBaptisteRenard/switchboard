@@ -96,6 +96,8 @@ const rendererCrossFileGlobals = {
 
   // Functions from app.js / dialogs.js / utils.js / icons.js / terminal-manager.js / etc.
   ICONS: 'readonly',
+  SCROLLBACK_SINGLE: 'readonly',
+  SCROLLBACK_GRID: 'readonly',
   cleanDisplayName: 'readonly',
   formatDate: 'readonly',
   escapeHtml: 'readonly',

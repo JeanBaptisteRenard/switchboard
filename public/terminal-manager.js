@@ -166,9 +166,15 @@ function scheduleFlush(sessionId, buf) {
 
 // --- Terminal lifecycle helpers ---
 
+// Scrollback budget per view mode. A 10k-row buffer costs ~3 MB per terminal;
+// grid cards are thumbnails and only need enough rows for context. showSession
+// and showGridView switch the live value when the view mode changes.
+const SCROLLBACK_SINGLE = 10000; // focused single-view terminal
+const SCROLLBACK_GRID = 1000;    // grid card (thumbnail)
+
 // Create an xterm instance, wire up IPC, and register in openSessions.
 // Returns the entry. Does NOT make it visible or fit it — call showSession() for that.
-function createTerminalEntry(session) {
+function createTerminalEntry(session, opts = {}) {
   const { sessionId } = session;
   const container = document.createElement('div');
   container.className = 'terminal-container';
@@ -179,7 +185,7 @@ function createTerminalEntry(session) {
     fontFamily: "'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace",
     theme: TERMINAL_THEME,
     cursorBlink: false,
-    scrollback: 10000,
+    scrollback: opts.scrollback ?? (gridViewActive ? SCROLLBACK_GRID : SCROLLBACK_SINGLE),
     convertEol: true,
     allowProposedApi: true,
     linkHandler: {
@@ -366,6 +372,9 @@ function showSession(sessionId) {
     hidePlanViewer();
     if (session) showTerminalHeader(session);
     if (entry) {
+      // Restore the full scrollback budget for the focused terminal (the grid
+      // may have trimmed it — see showGridView). Growing the limit is lossless.
+      entry.terminal.options.scrollback = SCROLLBACK_SINGLE;
       entry.element.classList.add('visible');
       entry.terminal.focus();
       fitAndScroll(entry);
