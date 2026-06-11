@@ -97,14 +97,18 @@ function setupTerminalDom() {
     showTerminalHeader: () => {},
     placeholder: window.document.createElement('div'),
     terminalHeader: window.document.createElement('div'),
+    gridViewer: window.document.createElement('div'),
     gridViewerCount: window.document.createElement('span'),
   };
   for (const [k, v] of Object.entries(stubGlobals)) {
     Object.defineProperty(window, k, { value: v, writable: true, configurable: true });
   }
 
+  // grid-view.js declares `let gridCards` (and other grid state) in the shared
+  // lexical scope — it shadows the window stub, exactly as in production where
+  // grid-view.js owns that global. Tests must read grid state via inCtx().
   const ctx = dom.getInternalVMContext();
-  for (const file of ['utils.js', 'terminal-manager.js']) {
+  for (const file of ['utils.js', 'shortcuts.js', 'terminal-manager.js', 'grid-view.js']) {
     const src = fs.readFileSync(path.join(PUBLIC_DIR, file), 'utf8');
     vm.runInContext(src, ctx, { filename: file });
   }
@@ -122,14 +126,13 @@ test('destroySession clears maps, pending write buffer, DOM, and disposes the te
 
     // Seed a pending write buffer + a grid card, as app.js / grid-view.js would.
     inCtx(`terminalWriteBuffers.set('s1', { chunks: ['data'], syncDepth: 0, rafId: 1, timerId: 2 })`);
-    const card = window.document.createElement('div');
-    window.gridCards.set('s1', card);
+    inCtx(`gridCards.set('s1', document.createElement('div'))`);
 
     window.destroySession('s1');
 
     assert.strictEqual(window.openSessions.size, 0, 'openSessions entry removed');
     assert.strictEqual(inCtx('terminalWriteBuffers.size'), 0, 'pending write buffer removed');
-    assert.strictEqual(window.gridCards.size, 0, 'grid card removed');
+    assert.strictEqual(inCtx('gridCards.size'), 0, 'grid card removed');
     assert.strictEqual(spies.dispose, 1, 'terminal.dispose called exactly once');
     assert.strictEqual(spies.closeTerminal, 1, 'closeTerminal IPC sent');
     assert.strictEqual(window.terminalsEl.querySelectorAll('.terminal-container').length, 0, 'container removed from DOM');
@@ -158,6 +161,60 @@ test('destroySession on unknown sessionId is a no-op', () => {
   try {
     assert.doesNotThrow(() => window.destroySession('nope'));
     assert.strictEqual(spies.closeTerminal, 0);
+  } finally {
+    destroy();
+  }
+});
+
+test('scrollback defaults: full budget in single view, thumbnail budget in grid view', () => {
+  const { window, destroy } = setupTerminalDom();
+  try {
+    const single = window.createTerminalEntry({ sessionId: 's-single' });
+    assert.strictEqual(single.terminal.options.scrollback, 10000);
+
+    window.gridViewActive = true;
+    const grid = window.createTerminalEntry({ sessionId: 's-grid' });
+    assert.strictEqual(grid.terminal.options.scrollback, 1000);
+
+    // Explicit option wins over the view-mode default.
+    const explicit = window.createTerminalEntry({ sessionId: 's-explicit' }, { scrollback: 500 });
+    assert.strictEqual(explicit.terminal.options.scrollback, 500);
+  } finally {
+    destroy();
+  }
+});
+
+test('showSession restores the full scrollback budget on a grid-trimmed terminal', () => {
+  const { window, destroy } = setupTerminalDom();
+  try {
+    window.gridViewActive = true;
+    const entry = window.createTerminalEntry({ sessionId: 's1' });
+    assert.strictEqual(entry.terminal.options.scrollback, 1000);
+
+    window.gridViewActive = false;
+    window.showSession('s1');
+    assert.strictEqual(entry.terminal.options.scrollback, 10000);
+  } finally {
+    destroy();
+  }
+});
+
+test('hideGridView restores the full scrollback budget on ALL open sessions, not just the focused one', () => {
+  const { window, destroy } = setupTerminalDom();
+  try {
+    window.gridViewActive = true;
+    const a = window.createTerminalEntry({ sessionId: 'sa' });
+    const b = window.createTerminalEntry({ sessionId: 'sb' });
+    const c = window.createTerminalEntry({ sessionId: 'sc' });
+    c.closed = true;
+    assert.strictEqual(b.terminal.options.scrollback, 1000);
+
+    window.hideGridView();
+
+    assert.strictEqual(a.terminal.options.scrollback, 10000, 'background session restored');
+    assert.strictEqual(b.terminal.options.scrollback, 10000, 'background session restored');
+    assert.strictEqual(c.terminal.options.scrollback, 1000, 'closed session untouched');
+    assert.strictEqual(window.gridViewActive, false);
   } finally {
     destroy();
   }
