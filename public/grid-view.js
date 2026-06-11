@@ -262,6 +262,7 @@ function focusGridCard(sessionId) {
   gridFocusedSessionId = sessionId;
   setActiveSession(sessionId);
   clearNotifications(sessionId);
+  lruTouch(sessionId);
   // Update sidebar active highlight
   document.querySelectorAll('.session-item.active').forEach(el => el.classList.remove('active'));
   const sidebarItem = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
