@@ -271,17 +271,6 @@ function createTerminalEntry(session, opts = {}) {
   terminal.open(container);
   container.style.backgroundColor = TERMINAL_THEME.background;
 
-  // GPU-accelerated rendering via WebGL — drops renderer+compositor CPU ~50-70%.
-  // Must be loaded after terminal.open() (needs attached DOM). Fails silently on
-  // machines without WebGL support; xterm falls back to the default DOM renderer.
-  try {
-    const webglAddon = new WebglAddon.WebglAddon();
-    webglAddon.onContextLoss(() => webglAddon.dispose());
-    terminal.loadAddon(webglAddon);
-  } catch (e) {
-    console.warn('[terminal] WebGL addon failed, falling back to DOM renderer', e);
-  }
-
   // --- Terminal search bar (Cmd/Ctrl+F) ---
   const searchBar = document.createElement('div');
   searchBar.className = 'terminal-search-bar';
@@ -327,6 +316,7 @@ function createTerminalEntry(session, opts = {}) {
   const entry = { terminal, element: container, fitAddon, searchAddon, openSearchBar, closeSearchBar, session, closed: false };
   openSessions.set(sessionId, entry);
   lruTouch(sessionId);
+  loadTerminalWebgl(entry);
 
   // Wire up IPC (use entry.session.sessionId so fork re-keying works)
   terminal.onData(data => {
@@ -347,6 +337,41 @@ function createTerminalEntry(session, opts = {}) {
   });
 
   return entry;
+}
+
+// --- WebGL renderer lifecycle ---
+// GPU-accelerated rendering via WebGL drops renderer+compositor CPU ~50-70%,
+// but each addon holds a GL context and Chromium caps ~16 of them per
+// process — past the cap, contexts are lost and terminals silently degrade.
+// The grid view suspends the addon on off-screen cards (IntersectionObserver
+// in grid-view.js) and restores it when they scroll back in; showSession
+// restores it for single view. Loading must happen after terminal.open()
+// (needs attached DOM); failure falls back to xterm's DOM renderer.
+function loadTerminalWebgl(entry) {
+  if (entry.webglAddon || !entry.terminal) return;
+  try {
+    const webglAddon = new WebglAddon.WebglAddon();
+    webglAddon.onContextLoss(() => {
+      webglAddon.dispose();
+      if (entry.webglAddon === webglAddon) entry.webglAddon = null;
+    });
+    entry.terminal.loadAddon(webglAddon);
+    entry.webglAddon = webglAddon;
+  } catch (e) {
+    console.warn('[terminal] WebGL addon failed, falling back to DOM renderer', e);
+  }
+}
+
+function suspendTerminalWebgl(sessionId) {
+  const entry = openSessions.get(sessionId);
+  if (!entry || !entry.webglAddon) return;
+  try { entry.webglAddon.dispose(); } catch {}
+  entry.webglAddon = null; // xterm falls back to its DOM renderer
+}
+
+function restoreTerminalWebgl(sessionId) {
+  const entry = openSessions.get(sessionId);
+  if (entry) loadTerminalWebgl(entry);
 }
 
 // Clean up a closed session entry (dispose terminal, remove DOM, remove from maps).
@@ -424,6 +449,7 @@ function showSession(sessionId) {
       // Restore the full scrollback budget for the focused terminal (the grid
       // may have trimmed it — see showGridView). Growing the limit is lossless.
       entry.terminal.options.scrollback = SCROLLBACK_SINGLE;
+      restoreTerminalWebgl(sessionId); // grid may have suspended the GL context
       entry.element.classList.add('visible');
       entry.terminal.focus();
       fitAndScroll(entry);

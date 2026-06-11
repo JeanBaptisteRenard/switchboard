@@ -61,6 +61,7 @@ function setupTerminalDom() {
     },
   });
 
+  spies.webglDispose = 0;
   const noopClass = class { dispose() {} onContextLoss() {} };
   const stubGlobals = {
     Terminal: makeTerminalStub(spies),
@@ -68,7 +69,7 @@ function setupTerminalDom() {
     WebLinksAddon: { WebLinksAddon: noopClass },
     SearchAddon: { SearchAddon: class { clearDecorations() {} findNext() {} findPrevious() {} } },
     UnicodeGraphemesAddon: { UnicodeGraphemesAddon: noopClass },
-    WebglAddon: { WebglAddon: noopClass },
+    WebglAddon: { WebglAddon: class { dispose() { spies.webglDispose++; } onContextLoss() {} } },
 
     TERMINAL_THEME: { background: '#000000' },
     terminalsEl: window.document.getElementById('terminals'),
@@ -283,6 +284,35 @@ test('hideGridView restores the full scrollback budget on ALL open sessions, not
     assert.strictEqual(b.terminal.options.scrollback, 10000, 'background session restored');
     assert.strictEqual(c.terminal.options.scrollback, 1000, 'closed session untouched');
     assert.strictEqual(window.gridViewActive, false);
+  } finally {
+    destroy();
+  }
+});
+
+test('WebGL lifecycle: loaded on create, suspend disposes, restore reloads, showSession restores', () => {
+  const { window, spies, destroy } = setupTerminalDom();
+  try {
+    const entry = window.createTerminalEntry({ sessionId: 's1' });
+    assert.ok(entry.webglAddon, 'WebGL addon loaded at creation');
+
+    window.suspendTerminalWebgl('s1');
+    assert.strictEqual(entry.webglAddon, null, 'addon reference cleared');
+    assert.strictEqual(spies.webglDispose, 1, 'GL context disposed');
+
+    window.suspendTerminalWebgl('s1');
+    assert.strictEqual(spies.webglDispose, 1, 'second suspend is a no-op');
+
+    window.restoreTerminalWebgl('s1');
+    assert.ok(entry.webglAddon, 'addon reloaded on restore');
+
+    window.restoreTerminalWebgl('s1');
+    assert.strictEqual(spies.webglDispose, 1, 'restore on live addon is a no-op');
+
+    window.suspendTerminalWebgl('s1');
+    window.showSession('s1');
+    assert.ok(entry.webglAddon, 'showSession restores a suspended GL context');
+
+    assert.doesNotThrow(() => window.suspendTerminalWebgl('unknown'));
   } finally {
     destroy();
   }
