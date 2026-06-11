@@ -15,6 +15,11 @@ function extractCwdFromJsonl(filePath) {
   return null;
 }
 
+// Maps a worktree cwd to its parent repo path. Exported for callers that need
+// the parent ↔ worktree relationship. Deliberately NOT applied in
+// deriveProjectPath: the sidebar nests worktree projects under their parent by
+// matching the full worktree projectPath, so collapsing at index time would
+// erase the worktree grouping (and break worktree-scoped actions like delete).
 function resolveWorktreePath(cwd) {
   if (!cwd) return cwd;
   // Detect worktree paths: <project>/.claude-worktrees/<name>, <project>/.worktrees/<name>, or <project>/.claude/worktrees/<name>
@@ -33,7 +38,7 @@ function deriveProjectPath(folderPath) {
     for (const e of entries) {
       if (e.isFile() && e.name.endsWith('.jsonl')) {
         const cwd = extractCwdFromJsonl(path.join(folderPath, e.name));
-        if (cwd) return resolveWorktreePath(cwd);
+        if (cwd) return cwd;
       }
     }
     // Check session subdirectories (UUID folders with subagent .jsonl files)
@@ -52,7 +57,7 @@ function deriveProjectPath(folderPath) {
           }
           if (jsonlPath) {
             const cwd = extractCwdFromJsonl(jsonlPath);
-            if (cwd) return resolveWorktreePath(cwd);
+            if (cwd) return cwd;
           }
         }
       } catch {}
