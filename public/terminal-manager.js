@@ -374,7 +374,15 @@ function destroySession(sessionId) {
   const li = lruOrder.indexOf(sessionId);
   if (li !== -1) lruOrder.splice(li, 1);
   const card = gridCards.get(sessionId);
-  if (card) { card.remove(); gridCards.delete(sessionId); }
+  if (card) {
+    card.remove();
+    gridCards.delete(sessionId);
+    // Keep the grid header count honest when a card disappears outside the
+    // showGridView/showSession flows (e.g. LRU eviction of a closed session).
+    if (gridViewActive) {
+      gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
+    }
+  }
 }
 
 // Make a session visible in the current view mode (grid or single).

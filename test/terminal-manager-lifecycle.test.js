@@ -208,12 +208,33 @@ test('LRU cap is soft: running and still-open sessions are never evicted', () =>
   try {
     for (let i = 1; i <= 14; i++) {
       window.createTerminalEntry({ sessionId: `s${i}` });
-      // closed but with a live PTY → protected; s14 closed without pty BUT active.
+      // Every session is closed but still has a live PTY → all protected.
       window.openSessions.get(`s${i}`).closed = true;
       window.activePtyIds.add(`s${i}`);
     }
     assert.strictEqual(window.openSessions.size, 14, 'no eviction when everything is protected');
     assert.strictEqual(spies.dispose, 0);
+  } finally {
+    destroy();
+  }
+});
+
+test('LRU never evicts the active session, even when closed and LRU-most', () => {
+  const { window, spies, destroy } = setupTerminalDom();
+  try {
+    for (let i = 1; i <= 12; i++) {
+      window.createTerminalEntry({ sessionId: `s${i}` });
+      window.openSessions.get(`s${i}`).closed = true;
+    }
+    // s1 is both LRU-most AND the active session — must be skipped in favor
+    // of the next evictable entry (s2).
+    window.activeSessionId = 's1';
+
+    window.createTerminalEntry({ sessionId: 's13' });
+
+    assert.strictEqual(window.openSessions.has('s1'), true, 'active session survives');
+    assert.strictEqual(window.openSessions.has('s2'), false, 'next LRU candidate evicted instead');
+    assert.strictEqual(spies.dispose, 1);
   } finally {
     destroy();
   }
