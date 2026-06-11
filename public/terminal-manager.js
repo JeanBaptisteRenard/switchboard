@@ -164,6 +164,43 @@ function scheduleFlush(sessionId, buf) {
   buf.rafId = requestAnimationFrame(() => flushTerminalBuffer(sessionId));
 }
 
+// --- LRU cap on live terminals ---
+// Every open session keeps a live xterm (+ WebGL context) until destroyed,
+// so renderer memory scales with the number of sessions ever opened in this
+// window (measured: 462 MB renderer RSS). The LRU destroys the
+// least-recently-shown *closed* session beyond the cap. Sessions with a live
+// PTY — and the active session — are never evicted, so the cap is soft when
+// more than TERMINAL_LRU_CAP sessions are actually running. An evicted
+// closed session behaves exactly like the existing re-click flow
+// (openSession finds no entry and relaunches); it just loses its exit
+// banner earlier.
+const TERMINAL_LRU_CAP = 12;
+const lruOrder = []; // sessionIds, most-recently-shown first
+
+function lruTouch(sessionId) {
+  if (!openSessions.has(sessionId)) return;
+  const i = lruOrder.indexOf(sessionId);
+  if (i !== -1) lruOrder.splice(i, 1);
+  lruOrder.unshift(sessionId);
+  while (lruOrder.length > TERMINAL_LRU_CAP) {
+    if (!lruEvictOne()) break; // nothing evictable right now — soft cap
+  }
+}
+
+// Destroy the least-recently-shown evictable session. Returns false when no
+// entry can be evicted (all running, active, or still open).
+function lruEvictOne() {
+  for (let i = lruOrder.length - 1; i >= 0; i--) {
+    const sid = lruOrder[i];
+    const entry = openSessions.get(sid);
+    if (!entry) { lruOrder.splice(i, 1); return true; } // stale id — drop it
+    if (sid === activeSessionId || activePtyIds.has(sid) || !entry.closed) continue;
+    destroySession(sid); // also removes sid from lruOrder
+    return true;
+  }
+  return false;
+}
+
 // --- Terminal lifecycle helpers ---
 
 // Scrollback budget per view mode. A 10k-row buffer costs ~3 MB per terminal;
@@ -289,6 +326,7 @@ function createTerminalEntry(session, opts = {}) {
 
   const entry = { terminal, element: container, fitAddon, searchAddon, openSearchBar, closeSearchBar, session, closed: false };
   openSessions.set(sessionId, entry);
+  lruTouch(sessionId);
 
   // Wire up IPC (use entry.session.sessionId so fork re-keying works)
   terminal.onData(data => {
@@ -333,6 +371,8 @@ function destroySession(sessionId) {
   entry.terminal.dispose();
   entry.element.remove();
   openSessions.delete(sessionId);
+  const li = lruOrder.indexOf(sessionId);
+  if (li !== -1) lruOrder.splice(li, 1);
   const card = gridCards.get(sessionId);
   if (card) { card.remove(); gridCards.delete(sessionId); }
 }
@@ -349,6 +389,7 @@ function showSession(sessionId) {
   if (item) item.classList.add('active');
   setActiveSession(sessionId);
   clearNotifications(sessionId);
+  lruTouch(sessionId);
 
   if (gridViewActive) {
     // Ensure grid layout is set up (e.g. on first session after startup restore)

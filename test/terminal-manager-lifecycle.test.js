@@ -184,6 +184,53 @@ test('scrollback defaults: full budget in single view, thumbnail budget in grid 
   }
 });
 
+test('LRU cap: opening a 13th session evicts the least-recently-shown closed one', () => {
+  const { window, spies, inCtx, destroy } = setupTerminalDom();
+  try {
+    for (let i = 1; i <= 12; i++) window.createTerminalEntry({ sessionId: `s${i}` });
+    // The three oldest sessions have exited (banner shown, pty gone).
+    for (const sid of ['s1', 's2', 's3']) window.openSessions.get(sid).closed = true;
+
+    window.createTerminalEntry({ sessionId: 's13' });
+
+    assert.strictEqual(window.openSessions.has('s1'), false, 'LRU-most closed session evicted');
+    assert.strictEqual(window.openSessions.has('s2'), true, 'only one eviction needed');
+    assert.strictEqual(window.openSessions.size, 12);
+    assert.strictEqual(inCtx('lruOrder.length'), 12);
+    assert.strictEqual(spies.dispose, 1);
+  } finally {
+    destroy();
+  }
+});
+
+test('LRU cap is soft: running and still-open sessions are never evicted', () => {
+  const { window, spies, destroy } = setupTerminalDom();
+  try {
+    for (let i = 1; i <= 14; i++) {
+      window.createTerminalEntry({ sessionId: `s${i}` });
+      // closed but with a live PTY → protected; s14 closed without pty BUT active.
+      window.openSessions.get(`s${i}`).closed = true;
+      window.activePtyIds.add(`s${i}`);
+    }
+    assert.strictEqual(window.openSessions.size, 14, 'no eviction when everything is protected');
+    assert.strictEqual(spies.dispose, 0);
+  } finally {
+    destroy();
+  }
+});
+
+test('destroySession removes the session from the LRU order', () => {
+  const { window, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.createTerminalEntry({ sessionId: 's1' });
+    assert.strictEqual(inCtx('lruOrder.length'), 1);
+    window.destroySession('s1');
+    assert.strictEqual(inCtx('lruOrder.length'), 0);
+  } finally {
+    destroy();
+  }
+});
+
 test('showSession restores the full scrollback budget on a grid-trimmed terminal', () => {
   const { window, destroy } = setupTerminalDom();
   try {
