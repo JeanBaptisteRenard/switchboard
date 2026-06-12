@@ -433,24 +433,8 @@ function renderDiffContent(sessionId, tab) {
   if (titleEl) titleEl.textContent = tab.label;
   if (pathEl) pathEl.textContent = tab.filePath || '';
 
-  if (!tab.editorView) {
-    if (diffMode === 'inline') {
-      tab.editorView = window.createUnifiedMergeViewer(
-        diffBodyEl, tab.oldContent, tab.newContent, tab.filePath,
-      );
-      tab._diffMode = 'inline';
-    } else {
-      tab.editorView = window.createMergeViewer(
-        diffBodyEl, tab.oldContent, tab.newContent, tab.filePath,
-      );
-      tab._diffMode = 'side-by-side';
-    }
-    tab.editorView.dom.addEventListener('click', () => tab.editorView.dom.focus());
-  } else {
-    diffBodyEl.appendChild(tab.editorView.dom);
-  }
-
-  // Accept/reject buttons
+  // Accept/reject buttons are rendered synchronously so the UI appears
+  // immediately; the diff viewer itself is deferred until the bundle loads.
   if (!tab.resolved) {
     diffActionsEl.style.display = 'flex';
     diffActionsEl.innerHTML = '';
@@ -470,6 +454,26 @@ function renderDiffContent(sessionId, tab) {
   } else {
     diffActionsEl.style.display = 'none';
   }
+
+  // Defer merge-viewer creation until codemirror-bundle.js is available.
+  window.loadCodeMirrorBundle().then(() => {
+    if (!tab.editorView) {
+      if (diffMode === 'inline') {
+        tab.editorView = window.createUnifiedMergeViewer(
+          diffBodyEl, tab.oldContent, tab.newContent, tab.filePath,
+        );
+        tab._diffMode = 'inline';
+      } else {
+        tab.editorView = window.createMergeViewer(
+          diffBodyEl, tab.oldContent, tab.newContent, tab.filePath,
+        );
+        tab._diffMode = 'side-by-side';
+      }
+      tab.editorView.dom.addEventListener('click', () => tab.editorView.dom.focus());
+    } else {
+      diffBodyEl.appendChild(tab.editorView.dom);
+    }
+  });
 }
 
 // ── Diff Actions ────────────────────────────────────────────────────
