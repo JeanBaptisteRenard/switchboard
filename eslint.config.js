@@ -200,6 +200,7 @@ const rendererCrossFileGlobals = {
   safeFit: 'readonly',
   flushTerminalBuffer: 'readonly',
   scheduleFlush: 'readonly',
+  handleTerminalData: 'readonly',
   createTerminalEntry: 'readonly',
   terminalWriteBuffers: 'readonly',
   ESC_SYNC_START: 'readonly',
