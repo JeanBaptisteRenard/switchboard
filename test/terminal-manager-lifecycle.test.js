@@ -408,6 +408,52 @@ test('30fps cap: destroySession clears lastFlushAt and cancels a pending throttl
   }
 });
 
+// Regression: v0.0.35 frozen-terminal bug. The sync branch cancelled a pending
+// rAF without zeroing buf.rafId; scheduleFlush's early-return guard (added by
+// the 30 fps cap) then treated the stale id as "flush already pending" forever
+// — no output ever painted again for that session.
+test('sync block arriving while a rAF is pending does not permanently block future flushes', () => {
+  const { window, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.createTerminalEntry({ sessionId: 's1' });
+
+    // 1. Plain chunk on an idle session → rAF armed.
+    window.handleTerminalData('s1', 'plain');
+    assert.ok(inCtx(`terminalWriteBuffers.get('s1').rafId`) !== 0, 'rAF pending after plain chunk');
+
+    // 2. Sync-start chunk lands before the rAF fires → it cancels the rAF.
+    //    rafId MUST be zeroed, otherwise scheduleFlush is blocked forever.
+    window.handleTerminalData('s1', '\x1b[?2026hredraw');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('s1').rafId`), 0,
+      'rafId zeroed when the sync branch cancels the pending rAF');
+    assert.ok(inCtx(`terminalWriteBuffers.get('s1').timerId`) !== 0, 'sync safety timer armed');
+
+    // 3. Sync-end chunk closes the block → a flush must be schedulable again.
+    window.handleTerminalData('s1', 'rest\x1b[?2026l');
+    const buf = inCtx(`terminalWriteBuffers.get('s1')`);
+    assert.ok(buf.rafId !== 0 || buf.timerId !== 0,
+      'a flush is scheduled once the sync block closes (terminal not frozen)');
+  } finally {
+    destroy();
+  }
+});
+
+test('handleTerminalData on an idle session schedules a flush (keystroke echo paints)', () => {
+  const { window, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.createTerminalEntry({ sessionId: 's1' });
+
+    // A fully-wrapped sync redraw in one chunk (as ink emits) on an idle
+    // session — syncDepth nets to 0, must end with a flush scheduled.
+    window.handleTerminalData('s1', '\x1b[?2026hredraw\x1b[?2026l');
+    const buf = inCtx(`terminalWriteBuffers.get('s1')`);
+    assert.strictEqual(buf.syncDepth, 0, 'sync nesting unwound within the chunk');
+    assert.ok(buf.rafId !== 0 || buf.timerId !== 0, 'flush scheduled for the wrapped chunk');
+  } finally {
+    destroy();
+  }
+});
+
 test('30fps cap: scheduleFlush does not double-schedule if timerId or rafId already pending', () => {
   const { window, inCtx, destroy } = setupTerminalDom();
   try {

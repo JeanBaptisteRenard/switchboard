@@ -186,6 +186,46 @@ function scheduleFlush(sessionId, buf) {
   }
 }
 
+// Entry point for PTY data (wired to window.api.onTerminalData in app.js).
+// Lives here rather than app.js so the sync-block/flush interplay runs under
+// the jsdom test harness — the v0.0.35 frozen-terminal bug shipped because
+// this logic sat in untestable app.js.
+function handleTerminalData(sessionId, data) {
+  const entry = openSessions.get(sessionId);
+  if (entry) {
+    let buf = terminalWriteBuffers.get(sessionId);
+    if (!buf) {
+      buf = { chunks: [], syncDepth: 0, rafId: 0, timerId: 0 };
+      terminalWriteBuffers.set(sessionId, buf);
+    }
+    buf.chunks.push(data);
+
+    // Track sync start/end nesting
+    if (data.includes(ESC_SYNC_START)) buf.syncDepth++;
+    if (data.includes(ESC_SYNC_END)) buf.syncDepth = Math.max(0, buf.syncDepth - 1);
+
+    if (buf.syncDepth > 0) {
+      // Inside a synchronized update — keep buffering.
+      // Set a safety timeout so we never hold data forever.
+      cancelAnimationFrame(buf.rafId);
+      // Must zero rafId: scheduleFlush early-returns on a truthy rafId, so a
+      // stale id here would permanently block every future flush (frozen
+      // terminal) once the sync block closes.
+      buf.rafId = 0;
+      if (!buf.timerId) {
+        buf.timerId = setTimeout(() => flushTerminalBuffer(sessionId), SYNC_BUFFER_TIMEOUT);
+      }
+    } else {
+      // Not in a sync block (or sync just ended) — flush on next frame.
+      clearTimeout(buf.timerId);
+      buf.timerId = 0;
+      scheduleFlush(sessionId, buf);
+    }
+  }
+  // Update last activity time (noise-filtered)
+  trackActivity(sessionId, data);
+}
+
 // --- LRU cap on live terminals ---
 // Every open session keeps a live xterm (+ WebGL context) until destroyed,
 // so renderer memory scales with the number of sessions ever opened in this

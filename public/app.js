@@ -192,37 +192,10 @@ function clearNotifications(sessionId) {
 
 // --- IPC listeners from main process ---
 
-window.api.onTerminalData((sessionId, data) => {
-  const entry = openSessions.get(sessionId);
-  if (entry) {
-    let buf = terminalWriteBuffers.get(sessionId);
-    if (!buf) {
-      buf = { chunks: [], syncDepth: 0, rafId: 0, timerId: 0 };
-      terminalWriteBuffers.set(sessionId, buf);
-    }
-    buf.chunks.push(data);
-
-    // Track sync start/end nesting
-    if (data.includes(ESC_SYNC_START)) buf.syncDepth++;
-    if (data.includes(ESC_SYNC_END)) buf.syncDepth = Math.max(0, buf.syncDepth - 1);
-
-    if (buf.syncDepth > 0) {
-      // Inside a synchronized update — keep buffering.
-      // Set a safety timeout so we never hold data forever.
-      cancelAnimationFrame(buf.rafId);
-      if (!buf.timerId) {
-        buf.timerId = setTimeout(() => flushTerminalBuffer(sessionId), SYNC_BUFFER_TIMEOUT);
-      }
-    } else {
-      // Not in a sync block (or sync just ended) — flush on next frame.
-      clearTimeout(buf.timerId);
-      buf.timerId = 0;
-      scheduleFlush(sessionId, buf);
-    }
-  }
-  // Update last activity time (noise-filtered)
-  trackActivity(sessionId, data);
-});
+// Buffering + sync-block handling + activity tracking live in
+// terminal-manager.js (handleTerminalData) so the flush interplay is
+// covered by jsdom tests — app.js itself cannot be loaded in jsdom.
+window.api.onTerminalData((sessionId, data) => handleTerminalData(sessionId, data));
 
 window.api.onSessionDetected((tempId, realId) => {
   const entry = openSessions.get(tempId);
