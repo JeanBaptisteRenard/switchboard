@@ -317,3 +317,117 @@ test('WebGL lifecycle: loaded on create, suspend disposes, restore reloads, show
     destroy();
   }
 });
+
+// --- 30 fps flush-cap tests ---
+
+// scheduleFlush routing: the throttle decision is based on `performance.now() - lastFlushAt`.
+// jsdom's rAF does not fire reliably in headless test runs, so these tests verify the
+// *scheduling decision* (which branch of scheduleFlush is taken) rather than waiting for
+// the rAF callback to execute.
+
+test('30fps cap: flushTerminalBuffer records lastFlushAt timestamp when it writes', () => {
+  const { window, spies, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.createTerminalEntry({ sessionId: 's1' });
+
+    assert.strictEqual(inCtx('lastFlushAt.has("s1")'), false, 'no entry before first flush');
+
+    // Seed a buffer and call flushTerminalBuffer directly (bypasses rAF).
+    inCtx(`terminalWriteBuffers.set('s1', { chunks: ['data'], syncDepth: 0, rafId: 0, timerId: 0 })`);
+    window.flushTerminalBuffer('s1');
+
+    assert.strictEqual(spies.write, 1, 'terminal.write called');
+    assert.strictEqual(inCtx('lastFlushAt.has("s1")'), true, 'lastFlushAt populated after flush');
+    const ts = inCtx('lastFlushAt.get("s1")');
+    assert.ok(typeof ts === 'number' && ts > 0, 'timestamp is a positive number');
+  } finally {
+    destroy();
+  }
+});
+
+test('30fps cap: scheduleFlush takes rAF path when interval has elapsed, timerId path when too soon', () => {
+  const { window, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.createTerminalEntry({ sessionId: 's1' });
+
+    // Case 1: no prior flush (lastFlushAt has no entry) → elapsed is infinite → rAF path.
+    inCtx(`terminalWriteBuffers.set('s1', { chunks: ['a'], syncDepth: 0, rafId: 0, timerId: 0 })`);
+    inCtx(`scheduleFlush('s1', terminalWriteBuffers.get('s1'))`);
+    assert.ok(inCtx(`terminalWriteBuffers.get('s1').rafId`) !== 0, 'rAF scheduled when no prior flush');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('s1').timerId`), 0, 'no timerId on first call');
+
+    // Cancel the pending rAF so we can re-use the entry.
+    inCtx(`cancelAnimationFrame(terminalWriteBuffers.get('s1').rafId); terminalWriteBuffers.get('s1').rafId = 0`);
+
+    // Case 2: stamp lastFlushAt as just-now → elapsed < MIN_FLUSH_INTERVAL_MS → timer path.
+    inCtx(`lastFlushAt.set('s1', performance.now())`);
+    inCtx(`terminalWriteBuffers.set('s1', { chunks: ['b'], syncDepth: 0, rafId: 0, timerId: 0 })`);
+    inCtx(`scheduleFlush('s1', terminalWriteBuffers.get('s1'))`);
+    assert.ok(inCtx(`terminalWriteBuffers.get('s1').timerId`) !== 0, 'timer scheduled when within throttle window');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('s1').rafId`), 0, 'no rAF stacked on timerId path');
+
+    // Case 3: stamp lastFlushAt as 100 ms ago → elapsed > MIN_FLUSH_INTERVAL_MS → rAF path.
+    inCtx(`lastFlushAt.set('s1', performance.now() - 100)`);
+    inCtx(`terminalWriteBuffers.set('s1', { chunks: ['c'], syncDepth: 0, rafId: 0, timerId: 0 })`);
+    inCtx(`scheduleFlush('s1', terminalWriteBuffers.get('s1'))`);
+    assert.ok(inCtx(`terminalWriteBuffers.get('s1').rafId`) !== 0, 'rAF scheduled when interval has elapsed');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('s1').timerId`), 0, 'no timerId when rAF path taken');
+  } finally {
+    destroy();
+  }
+});
+
+test('30fps cap: destroySession clears lastFlushAt and cancels a pending throttle timer without a late write', async () => {
+  const { window, spies, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.createTerminalEntry({ sessionId: 's1' });
+
+    // Populate lastFlushAt by direct flush.
+    inCtx(`terminalWriteBuffers.set('s1', { chunks: ['a'], syncDepth: 0, rafId: 0, timerId: 0 })`);
+    window.flushTerminalBuffer('s1');
+    assert.strictEqual(spies.write, 1, 'first flush via direct call');
+    assert.strictEqual(inCtx('lastFlushAt.has("s1")'), true, 'lastFlushAt populated');
+
+    // Seed a second buffer — stamp lastFlushAt as just-now so scheduleFlush takes timer path.
+    inCtx(`lastFlushAt.set('s1', performance.now())`);
+    inCtx(`terminalWriteBuffers.set('s1', { chunks: ['b'], syncDepth: 0, rafId: 0, timerId: 0 })`);
+    inCtx(`scheduleFlush('s1', terminalWriteBuffers.get('s1'))`);
+
+    // Confirm a timer was set (throttle path).
+    assert.ok(inCtx(`terminalWriteBuffers.get('s1').timerId`) !== 0, 'timer pending before destroy');
+
+    // destroySession must cancel the timer and clear lastFlushAt.
+    window.destroySession('s1');
+    assert.strictEqual(inCtx('lastFlushAt.size'), 0, 'lastFlushAt cleared on destroySession');
+
+    // Wait well past the throttle window — the cancelled timer must not fire.
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.strictEqual(spies.write, 1, 'no late write after destroySession');
+  } finally {
+    destroy();
+  }
+});
+
+test('30fps cap: scheduleFlush does not double-schedule if timerId or rafId already pending', () => {
+  const { window, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.createTerminalEntry({ sessionId: 's1' });
+
+    // Simulate a pending rafId already set (e.g. first call within cap window already scheduled).
+    inCtx(`terminalWriteBuffers.set('s1', { chunks: ['x'], syncDepth: 0, rafId: 99, timerId: 0 })`);
+    inCtx(`scheduleFlush('s1', terminalWriteBuffers.get('s1'))`);
+
+    // rafId must remain unchanged (guard returned early).
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('s1').rafId`), 99, 'rafId not overwritten when already set');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('s1').timerId`), 0, 'no timerId stacked on top');
+
+    // Simulate a pending timerId (throttle path already armed).
+    inCtx(`terminalWriteBuffers.set('s1', { chunks: ['y'], syncDepth: 0, rafId: 0, timerId: 42 })`);
+    inCtx(`scheduleFlush('s1', terminalWriteBuffers.get('s1'))`);
+
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('s1').timerId`), 42, 'timerId not overwritten when already set');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('s1').rafId`), 0, 'no rafId stacked on top');
+  } finally {
+    destroy();
+  }
+});
