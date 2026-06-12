@@ -1,0 +1,215 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
+
+// ---------------------------------------------------------------------------
+// Static-analysis tests (native-module-free) — verify db.js source text for
+// the contentless FTS5 schema, body truncation, and migration wiring.
+// better-sqlite3 is compiled against Electron's Node ABI and cannot be
+// required from plain node:test (same constraint as db-daily-activity.test.js).
+// ---------------------------------------------------------------------------
+
+const root = path.join(__dirname, '..');
+
+function readSrc(file) {
+  return fs.readFileSync(path.join(root, file), 'utf8');
+}
+
+const dbSrc = readSrc('db.js');
+
+// ---------------------------------------------------------------------------
+// 1. Schema: external-content FTS5 table
+// ---------------------------------------------------------------------------
+
+test('search_fts uses content= pointing to search_content table', () => {
+  // Must contain content='search_content' (or content="search_content")
+  assert.match(
+    dbSrc,
+    /content\s*=\s*['"]search_content['"]/,
+    'search_fts DDL must reference search_content as its external content table'
+  );
+});
+
+test('search_content table is created with title and body columns', () => {
+  assert.match(
+    dbSrc,
+    /CREATE TABLE IF NOT EXISTS search_content/,
+    'search_content table must be defined in db.js'
+  );
+  // Must have a body column
+  const contentTableMatch = dbSrc.match(
+    /CREATE TABLE IF NOT EXISTS search_content[\s\S]*?\)/
+  );
+  assert.ok(contentTableMatch, 'search_content CREATE TABLE not found');
+  assert.match(contentTableMatch[0], /body/, 'search_content must have a body column');
+  assert.match(contentTableMatch[0], /title/, 'search_content must have a title column');
+});
+
+test('search_fts DDL no longer stores its own content (no bare fts5 without content=)', () => {
+  // Find the search_fts USING fts5( ... ) block
+  const ftsMatch = dbSrc.match(/USING fts5\s*\([\s\S]*?\)/);
+  assert.ok(ftsMatch, 'search_fts USING fts5(...) block not found');
+  // Must contain content= — proves it is NOT a plain content-storing table
+  assert.match(
+    ftsMatch[0],
+    /content\s*=/,
+    'fts5 options must include content= (external or contentless)'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 2. Body truncation constant
+// ---------------------------------------------------------------------------
+
+test('db.js defines a body truncation cap (FTS_BODY_MAX_CHARS or similar)', () => {
+  // We expect a constant like: const FTS_BODY_MAX_CHARS = N
+  // Accept any reasonable name as long as a truncation cap is applied on body
+  assert.match(
+    dbSrc,
+    /FTS_BODY_MAX/,
+    'db.js must define an FTS body truncation cap constant'
+  );
+});
+
+test('body is truncated before insertion into search_content', () => {
+  // The insert into search_content (or insert into search_fts) must use
+  // a slice/substr call or the truncation constant on the body argument.
+  // We look for .slice(0, applied near the searchInsertContent or searchInsertFts stmt.
+  assert.match(
+    dbSrc,
+    /\.slice\s*\(\s*0\s*,\s*FTS_BODY_MAX/,
+    'body must be sliced to FTS_BODY_MAX_CHARS before insertion'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 3. Migration: v6 drops old search_fts + search_content, recreates both,
+//    sets searchFtsRecreated = true
+// ---------------------------------------------------------------------------
+
+test('migrations array contains a v6 entry that drops and recreates search_fts', () => {
+  // v6 migration must drop the old table and set searchFtsRecreated
+  assert.match(
+    dbSrc,
+    /DROP TABLE IF EXISTS search_fts/,
+    'db.js must DROP search_fts in a migration'
+  );
+  assert.match(
+    dbSrc,
+    /DROP TABLE IF EXISTS search_content/,
+    'db.js must DROP search_content in a migration (clean slate for existing installs)'
+  );
+});
+
+test('searchFtsRecreated is set to true in the v6 migration', () => {
+  // The migration that drops search_fts must also set the flag so
+  // main.js triggers a full repopulate.
+  // Count occurrences: one in v2 (existing), one in v6 (new).
+  const matches = dbSrc.match(/searchFtsRecreated\s*=\s*true/g);
+  assert.ok(matches && matches.length >= 2, 'searchFtsRecreated = true should appear at least twice (v2 + v6 migrations)');
+});
+
+// ---------------------------------------------------------------------------
+// 4. Delete statements keep search_content in sync
+// ---------------------------------------------------------------------------
+
+test('searchDeleteBySession also cleans search_content rows', () => {
+  // Expect a prepared statement or inline DELETE targeting search_content
+  // keyed by session rowid
+  assert.match(
+    dbSrc,
+    /DELETE FROM search_content WHERE rowid IN[\s\S]*?search_map[\s\S]*?session/,
+    'delete-by-session must purge search_content rows'
+  );
+});
+
+test('searchDeleteByFolder also cleans search_content rows', () => {
+  assert.match(
+    dbSrc,
+    /DELETE FROM search_content WHERE rowid IN[\s\S]*?search_map[\s\S]*?folder/,
+    'delete-by-folder must purge search_content rows'
+  );
+});
+
+test('searchDeleteByType also cleans search_content rows', () => {
+  assert.match(
+    dbSrc,
+    /DELETE FROM search_content WHERE rowid IN[\s\S]*?search_map[\s\S]*?type/,
+    'delete-by-type must purge search_content rows'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 5. searchUpdateTitle updates search_content, not search_fts directly
+//    (external-content tables are read-only via the FTS shadow tables;
+//     the content table is the authoritative store for the columns)
+// ---------------------------------------------------------------------------
+
+test('searchUpdateTitle targets search_content (not search_fts) for title update', () => {
+  // The UPDATE stmt for title should touch search_content, not search_fts
+  // (updating search_fts directly on an external-content table is not how it works)
+  assert.match(
+    dbSrc,
+    /UPDATE search_content SET title/,
+    'searchUpdateTitle must UPDATE search_content.title (not search_fts)'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 6. searchQuery snippet() call still works (column index 1 = body column)
+// ---------------------------------------------------------------------------
+
+test('searchQuery uses snippet(search_fts, 1, ...) to extract body preview', () => {
+  assert.match(
+    dbSrc,
+    /snippet\s*\(\s*search_fts\s*,\s*1\s*,/,
+    'searchQuery must call snippet(search_fts, 1, ...) for the body column'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 7. Insertion writes to search_content THEN search_fts (external-content
+//    protocol: content row must exist before the FTS shadow-row insert)
+// ---------------------------------------------------------------------------
+
+test('upsertSearchEntriesBatch inserts into search_content before search_fts', () => {
+  // Find the upsertSearchEntriesBatch transaction body.
+  // Use 2000 chars to cover the full body including the truncation comment.
+  const txStart = dbSrc.indexOf('upsertSearchEntriesBatch');
+  assert.ok(txStart !== -1, 'upsertSearchEntriesBatch not found');
+  const txSlice = dbSrc.slice(txStart, txStart + 2000);
+  const contentPos = txSlice.indexOf('searchInsertContent');
+  const ftsPos = txSlice.indexOf('searchInsertFts');
+  assert.ok(contentPos !== -1, 'searchInsertContent call not found in upsertSearchEntriesBatch');
+  assert.ok(ftsPos !== -1, 'searchInsertFts call not found in upsertSearchEntriesBatch');
+  assert.ok(
+    contentPos < ftsPos,
+    'search_content row must be inserted before search_fts row (external-content protocol)'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 8. main-ctx-db-wiring compatibility: db.js still exports the same set of
+//    public FTS functions (no renames that would break main.js callers)
+// ---------------------------------------------------------------------------
+
+test('db.js module.exports still includes all required FTS function names', () => {
+  const exportsSrc = dbSrc.split('module.exports')[1] || '';
+  for (const name of [
+    'upsertSearchEntries',
+    'updateSearchTitle',
+    'deleteSearchSession',
+    'deleteSearchFolder',
+    'deleteSearchType',
+    'searchByType',
+    'isSearchIndexPopulated',
+    'searchFtsRecreated',
+  ]) {
+    assert.match(
+      exportsSrc,
+      new RegExp(`\\b${name}\\b`),
+      `db.js module.exports must include ${name}`
+    );
+  }
+});
