@@ -32,7 +32,7 @@ function loadCodeMirrorBundle() {
     const script = document.createElement('script');
     script.src = 'codemirror-bundle.js';
     script.onload = () => resolve();
-    script.onerror = (err) => reject(err);
+    script.onerror = (err) => { _cmBundlePromise = null; reject(err); };
     document.head.appendChild(script);
   });
 
@@ -283,6 +283,8 @@ class ViewerPanel {
       if (wantPreview) {
         this._setPreview(true);
       }
+    }).catch((err) => {
+      console.error('[viewer-panel] Failed to load codemirror-bundle:', err);
     });
   }
 
@@ -347,6 +349,7 @@ class ViewerPanel {
   }
 
   destroy() {
+    this._openGen = (this._openGen || 0) + 1;  // invalidate in-flight open() closure
     this._unwatchFile();
     if (this.editorView) {
       this.editorView.destroy();

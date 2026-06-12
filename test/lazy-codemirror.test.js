@@ -184,3 +184,154 @@ test('lazy-codemirror: window.loadCodeMirrorBundle is exported', () => {
     ctx.destroy();
   }
 });
+
+/**
+ * Set up a jsdom window where the bundle load is HELD until the caller manually
+ * fires the resolve or reject callback.  Returns { ...ctx, resolveBundle, rejectBundle }.
+ */
+function setupViewerPanelDomHeld() {
+  const dom = new JSDOM(INDEX_HTML, {
+    url: 'http://localhost/',
+    runScripts: 'outside-only',
+    pretendToBeVisual: true,
+  });
+  const { window } = dom;
+
+  window.api = {
+    onFileChanged: () => {},
+    watchFile: () => {},
+    unwatchFile: () => {},
+  };
+
+  window.localStorage = {
+    getItem: () => null,
+    setItem: () => {},
+  };
+
+  let capturedScript = null;
+
+  const realCreateElement = window.document.createElement.bind(window.document);
+  window.document.createElement = function (tag, ...args) {
+    const el = realCreateElement(tag, ...args);
+    if (tag.toLowerCase() === 'script') {
+      // Capture the script element so the test can fire onload/onerror manually.
+      // Do NOT auto-fire — the caller controls resolution timing.
+      const origHeadAppend = window.document.head.appendChild.bind(window.document.head);
+      window.document.head.appendChild = function (child) {
+        const result = origHeadAppend(child);
+        if (child === el) capturedScript = el;
+        return result;
+      };
+    }
+    return el;
+  };
+
+  evalInWindow(dom, path.join(PUBLIC_DIR, 'viewer-toolbar.js'));
+  evalInWindow(dom, path.join(PUBLIC_DIR, 'viewer-panel.js'));
+
+  const container = window.document.getElementById('panel-container');
+
+  function resolveBundle() {
+    if (capturedScript && typeof capturedScript.onload === 'function') {
+      capturedScript.onload();
+    }
+  }
+
+  function rejectBundle() {
+    if (capturedScript && typeof capturedScript.onerror === 'function') {
+      capturedScript.onerror(new Error('load failed'));
+    }
+  }
+
+  return {
+    window, document: window.document, container,
+    resolveBundle, rejectBundle,
+    destroy: () => window.close(),
+  };
+}
+
+// ── Regression: destroy() before bundle resolves must NOT create an editor ──
+
+test('lazy-codemirror: destroy() before bundle resolves does not create a zombie editor', async () => {
+  const ctx = setupViewerPanelDomHeld();
+  try {
+    // Stub CM globals (should never be reached in this test)
+    let createEditorCalled = false;
+    ctx.window.createEditableViewer = () => {
+      createEditorCalled = true;
+      return {
+        dispatch: () => {},
+        state: { doc: { toString: () => '', length: 0 } },
+        destroy: () => {},
+        _wrapCompartment: null,
+      };
+    };
+    ctx.window.createPlanEditor = ctx.window.createEditableViewer;
+    ctx.window.CMEditorView = { lineWrapping: [] };
+
+    const panel = new ctx.window.ViewerPanel(ctx.container, { language: 'auto' });
+
+    // open() queues the .then() callback — bundle is NOT yet resolved
+    panel.open('Test', '/tmp/test.js', 'const x = 1;');
+
+    // destroy() must increment _openGen so the queued .then() becomes stale
+    panel.destroy();
+
+    // Now resolve the bundle — the stale .then() should bail early
+    ctx.resolveBundle();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    assert.equal(createEditorCalled, false, 'destroy() before bundle load must prevent editor creation');
+    assert.equal(panel.editorView, null, 'editorView must remain null after destroy+late-resolve');
+  } finally {
+    ctx.destroy();
+  }
+});
+
+// ── Regression: rejected bundle load must reset the cached promise for retry ──
+
+test('lazy-codemirror: rejected bundle load resets cached promise so next open() retries', async () => {
+  const ctx = setupViewerPanelDomHeld();
+  try {
+    ctx.window.createEditableViewer = () => ({
+      dispatch: () => {},
+      state: { doc: { toString: () => '', length: 0 } },
+      destroy: () => {},
+      _wrapCompartment: null,
+    });
+    ctx.window.createPlanEditor = ctx.window.createEditableViewer;
+    ctx.window.CMEditorView = { lineWrapping: [] };
+
+    const panel = new ctx.window.ViewerPanel(ctx.container, { language: 'auto' });
+
+    // First open — triggers bundle load
+    panel.open('Test', '/tmp/test.js', 'const x = 1;');
+
+    // Simulate a load failure (404 / CSP)
+    ctx.rejectBundle();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    // After rejection the module-level _cmBundlePromise must be reset to null.
+    // We verify this indirectly: a second open() must inject a new <script> tag
+    // (meaning loadCodeMirrorBundle() created a fresh Promise rather than
+    // returning the old rejected one).
+    const scriptsBefore = [...ctx.document.head.querySelectorAll('script')]
+      .filter(s => s.src && s.src.includes('codemirror-bundle')).length;
+
+    // The onerror handler resets _cmBundlePromise = null.  A new open() call
+    // will then call loadCodeMirrorBundle() which creates a fresh Promise and
+    // injects a second <script> element.
+    panel.open('Retry', '/tmp/test2.js', 'const y = 2;');
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const scriptsAfter = [...ctx.document.head.querySelectorAll('script')]
+      .filter(s => s.src && s.src.includes('codemirror-bundle')).length;
+
+    assert.ok(
+      scriptsAfter > scriptsBefore,
+      `A new <script> must be injected after a failed load so the panel can retry (before=${scriptsBefore}, after=${scriptsAfter})`,
+    );
+  } finally {
+    ctx.destroy();
+  }
+});

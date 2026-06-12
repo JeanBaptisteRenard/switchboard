@@ -457,6 +457,7 @@ function renderDiffContent(sessionId, tab) {
 
   // Defer merge-viewer creation until codemirror-bundle.js is available.
   window.loadCodeMirrorBundle().then(() => {
+    if (tab.resolved) return;  // tab was accepted/rejected before bundle loaded
     if (!tab.editorView) {
       if (diffMode === 'inline') {
         tab.editorView = window.createUnifiedMergeViewer(
@@ -473,6 +474,8 @@ function renderDiffContent(sessionId, tab) {
     } else {
       diffBodyEl.appendChild(tab.editorView.dom);
     }
+  }).catch((err) => {
+    console.error('[file-panel] Failed to load codemirror-bundle:', err);
   });
 }
 
