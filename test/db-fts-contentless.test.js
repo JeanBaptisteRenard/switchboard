@@ -190,7 +190,77 @@ test('upsertSearchEntriesBatch inserts into search_content before search_fts', (
 });
 
 // ---------------------------------------------------------------------------
-// 8. main-ctx-db-wiring compatibility: db.js still exports the same set of
+// 8. Delete functions issue the FTS5 delete BEFORE the search_content delete
+//    (external-content protocol: SQLite reads content rows to remove trigram
+//     entries from the shadow tables; if content is deleted first, ghost
+//     trigrams accumulate and the DB silently re-inflates on every delete).
+//    Static assertion: verify statement call order in each function body.
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the source text of a top-level named function from src.
+ * Scans from the `function <name>` declaration to the matching closing brace.
+ */
+function extractFunctionSrc(src, name) {
+  const start = src.indexOf(`function ${name}(`);
+  if (start === -1) return null;
+  let depth = 0;
+  let i = start;
+  while (i < src.length) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') {
+      depth--;
+      if (depth === 0) return src.slice(start, i + 1);
+    }
+    i++;
+  }
+  return null;
+}
+
+test('deleteSearchSession: FTS delete issued before search_content delete', () => {
+  const fnSrc = extractFunctionSrc(dbSrc, 'deleteSearchSession');
+  assert.ok(fnSrc, 'deleteSearchSession not found in db.js');
+  const ftsDel = fnSrc.indexOf('searchDeleteBySession');
+  const contentDel = fnSrc.indexOf('searchDeleteContentBySession');
+  assert.ok(ftsDel !== -1, 'searchDeleteBySession call not found');
+  assert.ok(contentDel !== -1, 'searchDeleteContentBySession call not found');
+  assert.ok(
+    ftsDel < contentDel,
+    'deleteSearchSession must delete from search_fts (searchDeleteBySession) BEFORE search_content ' +
+    '(external-content FTS5 protocol — ghost trigrams accumulate if order is reversed)'
+  );
+});
+
+test('deleteSearchFolder: FTS delete issued before search_content delete', () => {
+  const fnSrc = extractFunctionSrc(dbSrc, 'deleteSearchFolder');
+  assert.ok(fnSrc, 'deleteSearchFolder not found in db.js');
+  const ftsDel = fnSrc.indexOf('searchDeleteByFolder');
+  const contentDel = fnSrc.indexOf('searchDeleteContentByFolder');
+  assert.ok(ftsDel !== -1, 'searchDeleteByFolder call not found');
+  assert.ok(contentDel !== -1, 'searchDeleteContentByFolder call not found');
+  assert.ok(
+    ftsDel < contentDel,
+    'deleteSearchFolder must delete from search_fts (searchDeleteByFolder) BEFORE search_content ' +
+    '(external-content FTS5 protocol — ghost trigrams accumulate if order is reversed)'
+  );
+});
+
+test('deleteSearchType: FTS delete issued before search_content delete', () => {
+  const fnSrc = extractFunctionSrc(dbSrc, 'deleteSearchType');
+  assert.ok(fnSrc, 'deleteSearchType not found in db.js');
+  const ftsDel = fnSrc.indexOf('searchDeleteByType');
+  const contentDel = fnSrc.indexOf('searchDeleteContentByType');
+  assert.ok(ftsDel !== -1, 'searchDeleteByType call not found');
+  assert.ok(contentDel !== -1, 'searchDeleteContentByType call not found');
+  assert.ok(
+    ftsDel < contentDel,
+    'deleteSearchType must delete from search_fts (searchDeleteByType) BEFORE search_content ' +
+    '(external-content FTS5 protocol — ghost trigrams accumulate if order is reversed)'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 9. main-ctx-db-wiring compatibility: db.js still exports the same set of
 //    public FTS functions (no renames that would break main.js callers)
 // ---------------------------------------------------------------------------
 

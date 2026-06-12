@@ -191,7 +191,7 @@ if (migrations.length > currentDbVersion) {
 // Body is capped at FTS_BODY_MAX_CHARS before being stored. This bounds the
 // content table size independently of raw transcript length, while keeping
 // enough text for useful snippet() previews.
-const FTS_BODY_MAX_CHARS = 32768; // 32 KB of UTF-16 code units
+const FTS_BODY_MAX_CHARS = 32768; // 32 768 JS characters (UTF-16 code units); surrogate-pair split at the boundary is negligible for ASCII transcripts
 
 // search_content holds the plaintext the fts5 index reads columns from.
 // It is the single authoritative copy: title is full-length; body is
@@ -302,10 +302,10 @@ const stmts = {
   searchInsertFts: db.prepare('INSERT OR REPLACE INTO search_fts(rowid, title, body) VALUES (?, ?, ?)'),
   searchInsertMap: db.prepare('INSERT OR REPLACE INTO search_map(id, type, folder) VALUES (?, ?, ?)'),
   searchMapLookup: db.prepare('SELECT rowid FROM search_map WHERE id = ? AND type = ?'),
-  // Title update: only search_content needs updating; the fts5 index is
-  // rebuilt lazily the next time the row is touched, or via an explicit
-  // fts5 rebuild (not needed here — trigram queries tolerate stale index
-  // for a title-only rename until the next full insert replaces the row).
+  // Title update: patches search_content (the authoritative column store) and
+  // immediately removes the old fts5 shadow row via the 'delete' command then
+  // reinserts it with the new title. See updateSearchTitle() for the full
+  // two-step delete + reinsert protocol — the index is NOT lazily rebuilt.
   searchUpdateTitle: db.prepare('UPDATE search_content SET title = ? WHERE rowid = (SELECT rowid FROM search_map WHERE id = ? AND type = ?)'),
   searchDeleteContentByRowid: db.prepare('DELETE FROM search_content WHERE rowid = ?'),
   searchDeleteByRowid: db.prepare('DELETE FROM search_fts WHERE rowid = ?'),
@@ -477,22 +477,28 @@ const upsertSearchEntriesBatch = db.transaction((entries) => {
 });
 
 function deleteSearchSession(sessionId) {
-  // Delete from search_content and search_fts before removing the search_map
-  // rows so the rowid sub-select still resolves.
-  stmts.searchDeleteContentBySession.run(sessionId);
+  // External-content FTS5 protocol: delete from search_fts FIRST while
+  // search_content rows still exist. SQLite reads search_content to locate the
+  // trigram entries to remove from the shadow tables; if content is gone first,
+  // those entries are never cleaned up and accumulate as ghost trigrams.
+  // search_map is deleted last because the rowid sub-select in the two DELETE
+  // stmts above still needs to resolve.
   stmts.searchDeleteBySession.run(sessionId);
+  stmts.searchDeleteContentBySession.run(sessionId);
   stmts.searchMapDeleteBySession.run(sessionId);
 }
 
 function deleteSearchFolder(folder) {
-  stmts.searchDeleteContentByFolder.run(folder);
+  // Same external-content FTS5 ordering: FTS delete before content delete.
   stmts.searchDeleteByFolder.run(folder);
+  stmts.searchDeleteContentByFolder.run(folder);
   stmts.searchMapDeleteByFolder.run(folder);
 }
 
 function deleteSearchType(type) {
-  stmts.searchDeleteContentByType.run(type);
+  // Same external-content FTS5 ordering: FTS delete before content delete.
   stmts.searchDeleteByType.run(type);
+  stmts.searchDeleteContentByType.run(type);
   stmts.searchMapDeleteByType.run(type);
 }
 
