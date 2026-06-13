@@ -422,6 +422,10 @@ addProjectBtn.addEventListener('click', () => {
 const MIN_SEARCH_CHARS = 3;
 
 let searchDebounceTimer = null;
+// Pending rAF handle for clearSearch / resetSearchFilter.
+// Cancelled before scheduling a new frame so rapid boundary-crossings
+// (e.g. typing 3→2→1 chars) queue only one full-tree rebuild.
+let clearRenderRaf = null;
 const searchClear = document.getElementById('search-clear');
 const searchTitlesToggle = document.getElementById('search-titles-toggle');
 let searchTitlesOnly = false;
@@ -458,7 +462,9 @@ function clearSearch() {
     // input-cleared state paints first, eliminating the input-to-feedback stall
     // the user perceives as lag. The resort:true is required because sortedOrder
     // was overwritten during the search render to contain only matched projects.
-    requestAnimationFrame(() => refreshSidebar({ resort: true }));
+    // Cancel any pending clear-render frame so rapid clears only trigger one rebuild.
+    if (clearRenderRaf) cancelAnimationFrame(clearRenderRaf);
+    clearRenderRaf = requestAnimationFrame(() => { clearRenderRaf = null; refreshSidebar({ resort: true }); });
   } else if (activeTab === 'plans') {
     renderPlans(cachedPlans);
   } else if (activeTab === 'memory') {
@@ -479,7 +485,10 @@ function resetSearchFilter() {
     // Defer the heavy full-tree rebuild to the next animation frame so the
     // partially-typed input keeps its current visual state while the sidebar
     // resets. resort:true is required — same reason as clearSearch.
-    requestAnimationFrame(() => refreshSidebar({ resort: true }));
+    // Cancel any pending clear-render frame to avoid stacked rebuilds on rapid
+    // boundary crossings (e.g. typing 3→2→1 chars before a frame fires).
+    if (clearRenderRaf) cancelAnimationFrame(clearRenderRaf);
+    clearRenderRaf = requestAnimationFrame(() => { clearRenderRaf = null; refreshSidebar({ resort: true }); });
   } else if (activeTab === 'plans') {
     renderPlans(cachedPlans);
   } else if (activeTab === 'memory') {

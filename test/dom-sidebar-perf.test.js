@@ -60,7 +60,7 @@ test('Fix1: buildSubagentItem emits js-stateful on .sidebar-subagent', () => {
   }
 });
 
-test('Fix1: renderProjects — project-header, slug-group, sessions-more-toggle, sessions-older carry js-stateful', () => {
+test('Fix1: renderProjects — project-header carries js-stateful', () => {
   const ctx = setupSidebarDom();
   try {
     ctx.sidebar.renderProjects([makeSampleProject()], true);
@@ -69,12 +69,120 @@ test('Fix1: renderProjects — project-header, slug-group, sessions-more-toggle,
     const header = sc.querySelector('.project-header');
     assert.ok(header, 'project-header must be present');
     assert.ok(header.classList.contains('js-stateful'), 'project-header must carry js-stateful');
+  } finally {
+    ctx.destroy();
+  }
+});
 
-    // sessions-more-toggle and sessions-older require older sessions (visible > visibleSessionCount)
-    // Our fixture has only 2 top-level sessions so no pagination; that's fine — we test slug-group instead.
-    // slug-group is built by buildSlugGroup which is exercised when sessions share a slug prefix.
-    // For this fixture, slug-groups are not triggered (each session has a distinct id).
-    // Test that worktree-header carries js-stateful when a worktree project is rendered.
+test('Fix1: renderProjects — sessions-more-toggle and sessions-older carry js-stateful (pagination fixture)', () => {
+  // Trigger pagination: need more non-archived top-level sessions than visibleSessionCount (10).
+  // We inject 12 sessions so 2 end up in the "older" bucket.
+  const ctx = setupSidebarDom();
+  try {
+    const baseTime = Date.parse('2026-05-22T10:00:00Z');
+    const t = (offset) => new Date(baseTime + offset).toISOString();
+    const sessions = [];
+    for (let i = 0; i < 12; i++) {
+      sessions.push({
+        sessionId: 'pag-' + i,
+        name: 'session ' + i,
+        modified: t(-i * 60000),
+        archived: 0,
+      });
+    }
+    ctx.sidebar.renderProjects([{ projectPath: '/home/dev/pagtest', sessions }], true);
+    const sc = ctx.document.getElementById('sidebar-content');
+
+    const moreToggle = sc.querySelector('.sessions-more-toggle');
+    assert.ok(moreToggle, 'sessions-more-toggle must be present with >10 sessions');
+    assert.ok(moreToggle.classList.contains('js-stateful'),
+      'sessions-more-toggle must carry js-stateful');
+
+    const older = sc.querySelector('.sessions-older');
+    assert.ok(older, 'sessions-older must be present with >10 sessions');
+    assert.ok(older.classList.contains('js-stateful'),
+      'sessions-older must carry js-stateful');
+  } finally {
+    ctx.destroy();
+  }
+});
+
+test('Fix1: renderProjects — slug-group carries js-stateful (slug fixture)', () => {
+  // Trigger slug-group: two sessions sharing the same slug value.
+  const ctx = setupSidebarDom();
+  try {
+    const baseTime = Date.parse('2026-05-22T10:00:00Z');
+    const t = (offset) => new Date(baseTime + offset).toISOString();
+    const sessions = [
+      { sessionId: 'slug-a', name: 'alpha v1', slug: 'alpha', modified: t(0), archived: 0 },
+      { sessionId: 'slug-b', name: 'alpha v2', slug: 'alpha', modified: t(-1000), archived: 0 },
+    ];
+    ctx.sidebar.renderProjects([{ projectPath: '/home/dev/slugtest', sessions }], true);
+    const sc = ctx.document.getElementById('sidebar-content');
+
+    const group = sc.querySelector('.slug-group');
+    assert.ok(group, 'slug-group must be present when sessions share a slug');
+    assert.ok(group.classList.contains('js-stateful'), 'slug-group must carry js-stateful');
+  } finally {
+    ctx.destroy();
+  }
+});
+
+test('Fix1: renderProjects — slug-group-more and slug-group-older carry js-stateful (promoted + rest)', () => {
+  // Trigger slug-group-more / slug-group-older: need a promoted session (running)
+  // and at least one rest session within the same slug group.
+  const ctx = setupSidebarDom();
+  try {
+    // Mark slug-run-1 as running so it gets promoted
+    ctx.window.activePtyIds.add('slug-run-1');
+    const baseTime = Date.parse('2026-05-22T10:00:00Z');
+    const t = (offset) => new Date(baseTime + offset).toISOString();
+    const sessions = [
+      { sessionId: 'slug-run-1', name: 'running', slug: 'beta', modified: t(0), archived: 0 },
+      { sessionId: 'slug-rest-1', name: 'rest 1', slug: 'beta', modified: t(-1000), archived: 0 },
+      { sessionId: 'slug-rest-2', name: 'rest 2', slug: 'beta', modified: t(-2000), archived: 0 },
+    ];
+    ctx.sidebar.renderProjects([{ projectPath: '/home/dev/slugmore', sessions }], true);
+    const sc = ctx.document.getElementById('sidebar-content');
+
+    const moreBtn = sc.querySelector('.slug-group-more');
+    assert.ok(moreBtn, 'slug-group-more must be present when slug has promoted + rest sessions');
+    assert.ok(moreBtn.classList.contains('js-stateful'), 'slug-group-more must carry js-stateful');
+
+    const olderDiv = sc.querySelector('.slug-group-older');
+    assert.ok(olderDiv, 'slug-group-older must be present when slug has promoted + rest sessions');
+    assert.ok(olderDiv.classList.contains('js-stateful'), 'slug-group-older must carry js-stateful');
+  } finally {
+    ctx.destroy();
+  }
+});
+
+test('Fix1: renderProjects — worktree-header carries js-stateful (worktree fixture)', () => {
+  // Trigger worktree-header: a project whose path matches /.claude/worktrees/<name>
+  // must be rendered nested under its parent, emitting a worktree-header element.
+  const ctx = setupSidebarDom();
+  try {
+    const baseTime = Date.parse('2026-05-22T10:00:00Z');
+    const t = (offset) => new Date(baseTime + offset).toISOString();
+    const parentProject = {
+      projectPath: '/home/dev/myrepo',
+      sessions: [
+        { sessionId: 'wt-parent-1', name: 'main', modified: t(0), archived: 0 },
+      ],
+    };
+    const worktreeProject = {
+      projectPath: '/home/dev/myrepo/.claude/worktrees/agent-abc123',
+      sessions: [
+        { sessionId: 'wt-child-1', name: 'wt session', modified: t(-500), archived: 0 },
+      ],
+    };
+    ctx.sidebar.renderProjects([parentProject, worktreeProject], true);
+    const sc = ctx.document.getElementById('sidebar-content');
+
+    const wtHeader = sc.querySelector('.worktree-header');
+    assert.ok(wtHeader, 'worktree-header must be present for a .claude/worktrees/* project');
+    assert.ok(wtHeader.classList.contains('js-stateful'),
+      'worktree-header must carry js-stateful');
   } finally {
     ctx.destroy();
   }
@@ -209,6 +317,102 @@ test('Fix1: non-stateful child nodes do NOT carry js-stateful (fast-path eligibi
     const statefulDescendants = allDescendants.filter(el => el.classList.contains('js-stateful'));
     assert.equal(statefulDescendants.length, 0,
       'no descendant of session-item should carry js-stateful — inner nodes take the fast-path');
+  } finally {
+    ctx.destroy();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// MINOR 2 — clearRenderRaf cancel guard: two rapid clear calls → one render
+// ---------------------------------------------------------------------------
+//
+// app.js cannot be eval-ed in jsdom (registers IPC listeners before stubs
+// exist). We follow the search-perf.test.js inline-replica pattern: replicate
+// the clearSearch / resetSearchFilter rAF guard in-process and test it with
+// jsdom's requestAnimationFrame / cancelAnimationFrame (available because
+// dom-setup.js uses pretendToBeVisual:true).
+
+test('MINOR2: two rapid clearSearch calls result in exactly one refreshSidebar via cancel guard', async () => {
+  const ctx = setupSidebarDom();
+  try {
+    const { window } = ctx;
+    let refreshCount = 0;
+    function refreshSidebar() { refreshCount++; }
+
+    // Inline replica of the clearRenderRaf guard (mirrors the patched app.js).
+    let clearRenderRaf = null;
+    function clearSearch() {
+      if (clearRenderRaf) window.cancelAnimationFrame(clearRenderRaf);
+      clearRenderRaf = window.requestAnimationFrame(() => {
+        clearRenderRaf = null;
+        refreshSidebar({ resort: true });
+      });
+    }
+
+    // Two rapid calls — only the second frame should fire.
+    clearSearch();
+    clearSearch();
+
+    // Wait for the jsdom rAF timer to flush (jsdom schedules rAF via setTimeout).
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    assert.equal(refreshCount, 1,
+      'exactly one refreshSidebar call expected — first rAF must be cancelled by second clearSearch');
+  } finally {
+    ctx.destroy();
+  }
+});
+
+test('MINOR2: resetSearchFilter cancel guard — three rapid calls yield one refreshSidebar', async () => {
+  const ctx = setupSidebarDom();
+  try {
+    const { window } = ctx;
+    let refreshCount = 0;
+    function refreshSidebar() { refreshCount++; }
+
+    let clearRenderRaf = null;
+    function resetSearchFilter() {
+      if (clearRenderRaf) window.cancelAnimationFrame(clearRenderRaf);
+      clearRenderRaf = window.requestAnimationFrame(() => {
+        clearRenderRaf = null;
+        refreshSidebar({ resort: true });
+      });
+    }
+
+    resetSearchFilter();
+    resetSearchFilter();
+    resetSearchFilter();
+
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    assert.equal(refreshCount, 1,
+      'exactly one refreshSidebar call expected across three rapid resetSearchFilter calls');
+  } finally {
+    ctx.destroy();
+  }
+});
+
+test('MINOR2: clearRenderRaf handle is null after the frame fires (no double-cancel)', async () => {
+  const ctx = setupSidebarDom();
+  try {
+    const { window } = ctx;
+    let clearRenderRaf = null;
+    let handleAfterFire = 'unset';
+
+    function clearSearch() {
+      if (clearRenderRaf) window.cancelAnimationFrame(clearRenderRaf);
+      clearRenderRaf = window.requestAnimationFrame(() => {
+        clearRenderRaf = null;
+        // Capture state inside the callback — after fire the handle must be null.
+        handleAfterFire = clearRenderRaf;
+      });
+    }
+
+    clearSearch();
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    assert.equal(handleAfterFire, null,
+      'clearRenderRaf handle must be reset to null inside the rAF callback after it fires');
   } finally {
     ctx.destroy();
   }
