@@ -606,6 +606,12 @@ ipcMain.handle('save-file-for-panel', async (_event, filePath, content) => {
     if (isSensitivePath(resolved)) return { ok: false, error: 'access to sensitive path denied' };
     if (!fs.existsSync(resolved)) return { ok: false, error: 'File does not exist' };
     fs.writeFileSync(resolved, content, 'utf8');
+    // Close the sub-second window between save and search: if the saved file
+    // belongs to a type that the FTS index tracks, invalidate its signature so
+    // the next get-work-files / get-memories call triggers a full reindex
+    // (matching the explicit invalidation in save-memory / delete-work-file).
+    if (resolved.includes('/.work-files/')) invalidateFtsSignature('work-file');
+    if (resolved.endsWith('.md')) invalidateFtsSignature('memory');
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err.message };
@@ -833,6 +839,58 @@ ipcMain.handle('get-usage', async () => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// FTS dirty-flag: skip full reindex when file set hasn't changed.
+// Each tab handler (get-memories, get-work-files) computes a cheap signature
+// from the collected file list (sorted filePath + mtimeMs + size) and compares
+// it to the last-indexed signature stored here. If equal, the expensive
+// deleteSearchType + upsertSearchEntries block is skipped entirely — including
+// the full-file readFileSync calls on every file.
+//
+// Invariant: the result payload (file tree returned to the UI) is built and
+// returned unconditionally; only the FTS side-effect is gated.
+//
+// Invalidation: save-memory and delete-work-file mutations clear the stored
+// signature for their respective type, forcing a fresh reindex on the next
+// tab open (even if mtime precision rounds to the same second on some FSes).
+// ---------------------------------------------------------------------------
+
+/** @type {Map<string, string>} type → last-indexed signature */
+const _ftsIndexSignature = new Map();
+
+/**
+ * Compute a cheap stable signature for an array of indexed file descriptors.
+ * @param {Array<{filePath: string, mtimeMs: number, size: number}>} files
+ * @returns {string}
+ */
+function computeIndexSignature(files) {
+  // Sort by filePath for determinism regardless of scan order.
+  const sorted = [...files].sort((a, b) => a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0);
+  return sorted.map(f => `${f.filePath}\x00${f.mtimeMs}\x00${f.size}`).join('\n');
+}
+
+/**
+ * Returns true when the file set for the given FTS type has changed since
+ * the last reindex (or was never indexed), and updates the stored signature.
+ * @param {string} type - FTS type key ('memory' | 'work-file' | 'plan')
+ * @param {string} sig  - result of computeIndexSignature()
+ * @returns {boolean}
+ */
+function shouldReindex(type, sig) {
+  if (_ftsIndexSignature.get(type) === sig) return false;
+  _ftsIndexSignature.set(type, sig);
+  return true;
+}
+
+/**
+ * Invalidate the stored signature for a given FTS type, forcing a full
+ * reindex on the next get-memories / get-work-files call.
+ * @param {string} type
+ */
+function invalidateFtsSignature(type) {
+  _ftsIndexSignature.delete(type);
+}
+
 // --- IPC: get-memories ---
 function folderToShortPath(folder) {
   // Convert "-Users-home-dev-MyClaude" → "dev/MyClaude"
@@ -956,18 +1014,25 @@ ipcMain.handle('get-memories', () => {
 
   const result = { global: { files: globalFiles }, projects };
 
-  // Index all files for FTS
+  // Index all files for FTS — skipped when the file set is unchanged (dirty-flag).
   try {
-    deleteSearchType('memory');
     const allFiles = [
       ...globalFiles.map(f => ({ ...f, label: 'Global' })),
       ...projects.flatMap(p => p.files.map(f => ({ ...f, label: p.shortName }))),
     ];
-    upsertSearchEntries(allFiles.map(f => ({
-      id: f.filePath, type: 'memory', folder: null,
-      title: f.label + ' ' + f.filename,
-      body: fs.readFileSync(f.filePath, 'utf8'),
+    const sig = computeIndexSignature(allFiles.map(f => ({
+      filePath: f.filePath,
+      mtimeMs: new Date(f.modified).getTime(),
+      size: 0, // .md files don't carry size in scanMdFiles; mtime + path is sufficient
     })));
+    if (shouldReindex('memory', sig)) {
+      deleteSearchType('memory');
+      upsertSearchEntries(allFiles.map(f => ({
+        id: f.filePath, type: 'memory', folder: null,
+        title: f.label + ' ' + f.filename,
+        body: fs.readFileSync(f.filePath, 'utf8'),
+      })));
+    }
   } catch {}
 
   return result;
@@ -994,6 +1059,10 @@ ipcMain.handle('save-memory', (_event, filePath, content) => {
     if (!isAllowedMemoryPath(resolved)) return { ok: false, error: 'path not allowed' };
     if (!fs.existsSync(resolved)) return { ok: false, error: 'file does not exist' };
     fs.writeFileSync(resolved, content, 'utf8');
+    // Invalidate the FTS signature so the next get-memories call reindexes
+    // (mtime change is caught by the signature, but an explicit invalidation
+    // guards against sub-second writes where the mtime might not advance).
+    invalidateFtsSignature('memory');
     return { ok: true };
   } catch (err) {
     console.error('Error saving memory file:', err);
@@ -1089,24 +1158,30 @@ ipcMain.handle('get-work-files', () => {
     return bMax - aMax;
   });
 
-  // Index for FTS — text files ≤ 64KB, skip .jsonl
+  // Index for FTS — text files ≤ 64KB, skip .jsonl — skipped when file set is unchanged.
   try {
-    deleteSearchType('work-file');
-    const TEXT_MAX = 64 * 1024;
-    const entries = projects.flatMap(proj =>
-      proj.files.map(f => {
+    const allFiles = projects.flatMap(proj => proj.files.map(f => ({ ...f, proj })));
+    const sig = computeIndexSignature(allFiles.map(f => ({
+      filePath: f.filePath,
+      mtimeMs: new Date(f.modified).getTime(),
+      size: f.size,
+    })));
+    if (shouldReindex('work-file', sig)) {
+      deleteSearchType('work-file');
+      const TEXT_MAX = 64 * 1024;
+      const entries = allFiles.map(f => {
         let body = '';
         if (!f.relativePath.endsWith('.jsonl') && f.size <= TEXT_MAX) {
           try { body = fs.readFileSync(f.filePath, 'utf8'); } catch {}
         }
         return {
           id: f.filePath, type: 'work-file', folder: null,
-          title: proj.shortName + ' ' + f.relativePath,
+          title: f.proj.shortName + ' ' + f.relativePath,
           body,
         };
-      })
-    );
-    upsertSearchEntries(entries);
+      });
+      upsertSearchEntries(entries);
+    }
   } catch {}
 
   return { projects };
@@ -1142,7 +1217,10 @@ ipcMain.handle('delete-work-file', (_event, filePath) => {
     }
     if (!fs.existsSync(resolved)) return { ok: false, error: 'not found' };
     fs.unlinkSync(resolved);
-    // FTS entry is cleaned up on the next get-work-files call (full type rebuild)
+    // Invalidate the FTS signature so the next get-work-files call reindexes.
+    // Deletion changes the path set, which the signature would catch; the explicit
+    // invalidation is a belt-and-braces guard for path-set mutations.
+    invalidateFtsSignature('work-file');
     return { ok: true };
   } catch (err) {
     console.error('Error deleting work file:', err);
