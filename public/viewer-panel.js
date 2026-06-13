@@ -12,8 +12,34 @@
  *   - Close: shown if onClose is provided
  *   - Copy path/content: shown if opted in
  *
- * Depends on: viewer-toolbar.js, codemirror-bundle.js
+ * Depends on: viewer-toolbar.js
+ * codemirror-bundle.js is loaded on demand (lazy) via loadCodeMirrorBundle().
  */
+
+// ── Lazy CodeMirror loader ───────────────────────────────────────────────────
+//
+// Returns a Promise that resolves once codemirror-bundle.js has been injected
+// and its globals (CMEditorView, createPlanEditor, …) are available on window.
+// The Promise is cached after the first call — the <script> is injected exactly
+// once regardless of how many callers race to open a panel.
+
+let _cmBundlePromise = null;
+
+function loadCodeMirrorBundle() {
+  if (_cmBundlePromise) return _cmBundlePromise;
+
+  _cmBundlePromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'codemirror-bundle.js';
+    script.onload = () => resolve();
+    script.onerror = (err) => { _cmBundlePromise = null; reject(err); };
+    document.head.appendChild(script);
+  });
+
+  return _cmBundlePromise;
+}
+
+window.loadCodeMirrorBundle = loadCodeMirrorBundle;
 
 class ViewerPanel {
   /**
@@ -179,6 +205,11 @@ class ViewerPanel {
 
   /**
    * Open a file in the viewer.
+   *
+   * The toolbar and file-watch are configured synchronously so the panel
+   * header appears immediately. CodeMirror editor creation is deferred until
+   * codemirror-bundle.js has been loaded (first call triggers the load; all
+   * subsequent calls share the same cached Promise and resolve near-instantly).
    */
   open(title, filePath, content) {
     this._unwatchFile();
@@ -199,9 +230,6 @@ class ViewerPanel {
       this.toolbar.formatBtn.style.display = isJsonish ? '' : 'none';
     }
 
-    // Save preview preference before resetting
-    const wantPreview = isMd && this.opts.storageKey && localStorage.getItem(this.opts.storageKey) === 'true';
-
     // Reset to edit mode before updating content (without touching localStorage)
     if (this.previewMode) {
       this.previewEl.style.display = 'none';
@@ -210,33 +238,54 @@ class ViewerPanel {
       this.previewMode = false;
     }
 
-    // Create or update editor
-    if (!this.editorView) {
-      this._createEditor(content, filePath);
-    } else {
-      this.editorView.dispatch({
-        changes: { from: 0, to: this.editorView.state.doc.length, insert: content },
-      });
-    }
-
-    // Set wrap default based on file type
-    this.wrapMode = isMd;
-    this.toolbar.setWrapMode(this.wrapMode);
-    if (this.editorView && this.editorView._wrapCompartment) {
-      this.editorView.dispatch({
-        effects: this.editorView._wrapCompartment.reconfigure(
-          this.wrapMode ? window.CMEditorView.lineWrapping : []
-        ),
-      });
-    }
-
-    // Re-apply preview preference
-    if (wantPreview) {
-      this._setPreview(true);
-    }
-
-    // Watch for external changes
+    // Watch for external changes (sync — does not need CodeMirror)
     this._watchFile(filePath);
+
+    // Snapshot the caller's intent so that if open() is called again before
+    // the bundle resolves, the latest content/filePath wins.
+    // A monotonically-incrementing generation token lets each .then() callback
+    // identify whether it is the most-recent open() call or a stale one.
+    this._openGen = (this._openGen || 0) + 1;
+    const myGen = this._openGen;
+    const pending = { content, filePath, isMd };
+
+    // Defer all CodeMirror work until the bundle is available.
+    loadCodeMirrorBundle().then(() => {
+      // Guard: if open() was called again after this closure was queued,
+      // a newer call has incremented _openGen — skip this stale one.
+      if (this._openGen !== myGen) return;
+      const { content: c, filePath: fp, isMd: md } = pending;
+
+      // Save preview preference before creating/updating editor
+      const wantPreview = md && this.opts.storageKey && localStorage.getItem(this.opts.storageKey) === 'true';
+
+      // Create or update editor
+      if (!this.editorView) {
+        this._createEditor(c, fp);
+      } else {
+        this.editorView.dispatch({
+          changes: { from: 0, to: this.editorView.state.doc.length, insert: c },
+        });
+      }
+
+      // Set wrap default based on file type
+      this.wrapMode = md;
+      this.toolbar.setWrapMode(this.wrapMode);
+      if (this.editorView && this.editorView._wrapCompartment) {
+        this.editorView.dispatch({
+          effects: this.editorView._wrapCompartment.reconfigure(
+            this.wrapMode ? window.CMEditorView.lineWrapping : []
+          ),
+        });
+      }
+
+      // Re-apply preview preference
+      if (wantPreview) {
+        this._setPreview(true);
+      }
+    }).catch((err) => {
+      console.error('[viewer-panel] Failed to load codemirror-bundle:', err);
+    });
   }
 
   _createEditor(content, filePath) {
@@ -300,6 +349,7 @@ class ViewerPanel {
   }
 
   destroy() {
+    this._openGen = (this._openGen || 0) + 1;  // invalidate in-flight open() closure
     this._unwatchFile();
     if (this.editorView) {
       this.editorView.destroy();
