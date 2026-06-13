@@ -453,10 +453,10 @@ function clearSearch() {
   if (activeTab === 'sessions') {
     searchMatchIds = null;
     searchMatchProjectPaths = null;
-    // resort: false — the sort order is unchanged while the filter was active;
-    // skipping the full re-sort cuts the lag when going from a small filtered
-    // set back to the full unfiltered list.
-    refreshSidebar({ resort: false });
+    // resort: true — sortedOrder was overwritten during the search render to
+    // contain only matched projects; resorting from data is required to restore
+    // the correct full-list order.
+    refreshSidebar({ resort: true });
   } else if (activeTab === 'plans') {
     renderPlans(cachedPlans);
   } else if (activeTab === 'memory') {
@@ -474,7 +474,9 @@ function resetSearchFilter() {
   if (activeTab === 'sessions') {
     searchMatchIds = null;
     searchMatchProjectPaths = null;
-    refreshSidebar({ resort: false });
+    // resort: true — same reason as clearSearch: sortedOrder may be stale if a
+    // prior 3+ char search ran (and overwrote it with the filtered subset).
+    refreshSidebar({ resort: true });
   } else if (activeTab === 'plans') {
     renderPlans(cachedPlans);
   } else if (activeTab === 'memory') {

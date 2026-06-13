@@ -4,9 +4,11 @@
 //     NOT call window.api.search, must NOT clear the input value, but MUST
 //     reset the filter state (searchMatchIds = null) and refresh.
 //
-//   Fix 2 — clear-search lag: the X-button path calls clearSearch(), which
-//     now passes resort:false to refreshSidebar so no full re-sort is done
-//     when clearing a filter.
+//   Fix 2 (order correctness) — clearSearch() and resetSearchFilter() must pass
+//     resort:true to refreshSidebar. Using resort:false is unsound: renderProjects
+//     overwrites sortedOrder with only the matched-project subset during a search,
+//     so clearing with resort:false would sort the full list against a stale index
+//     and produce a scrambled sidebar order.
 //
 // app.js cannot be eval-ed in jsdom (it registers IPC listeners at module
 // scope before stubs are ready). We follow the running-indicators.test.js
@@ -65,7 +67,7 @@ function makeSearchState() {
     if (state.activeTab === 'sessions') {
       state.searchMatchIds = null;
       state.searchMatchProjectPaths = null;
-      refreshSidebar({ resort: false }); // Fix 2: was resort:true
+      refreshSidebar({ resort: true }); // resort:true required — sortedOrder is stale after search
     } else if (state.activeTab === 'plans') {
       renderPlans(state.cachedPlans);
     } else if (state.activeTab === 'memory') {
@@ -80,7 +82,7 @@ function makeSearchState() {
     if (state.activeTab === 'sessions') {
       state.searchMatchIds = null;
       state.searchMatchProjectPaths = null;
-      refreshSidebar({ resort: false });
+      refreshSidebar({ resort: true }); // resort:true required — same stale-sortedOrder reason
     } else if (state.activeTab === 'plans') {
       renderPlans(state.cachedPlans);
     } else if (state.activeTab === 'memory') {
@@ -196,17 +198,20 @@ test('search: empty query calls clearSearch (wipes input value)', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Fix 2: clear-search path calls refreshSidebar with resort:false
+// Fix 2: clear-search path calls refreshSidebar with resort:true
+// (resort:false was unsound — sortedOrder is overwritten with only the
+//  matched subset during a search, so clearing with resort:false scrambles
+//  the full project list order)
 // ---------------------------------------------------------------------------
 
-test('clearSearch: calls refreshSidebar with resort:false (not resort:true)', () => {
+test('clearSearch: calls refreshSidebar with resort:true (not resort:false)', () => {
   const { state, clearSearch } = makeSearchState();
   state.searchMatchIds = new Set(['s1', 's2']);
   clearSearch();
 
   assert.equal(state.refreshSidebarCalls.length, 1, 'refreshSidebar called exactly once on clear');
-  assert.equal(state.refreshSidebarCalls[0].resort, false,
-    'clearSearch must pass resort:false — sort order unchanged while filtered');
+  assert.equal(state.refreshSidebarCalls[0].resort, true,
+    'clearSearch must pass resort:true — sortedOrder is stale after a search');
 });
 
 test('clearSearch: resets searchMatchIds and searchMatchProjectPaths', () => {
@@ -224,6 +229,51 @@ test('clearSearch: does NOT call refreshSidebar more than once (no double-render
   clearSearch();
   assert.equal(state.refreshSidebarCalls.length, 1,
     'clearSearch must trigger exactly one refreshSidebar call');
+});
+
+test('resetSearchFilter: calls refreshSidebar with resort:true (not resort:false)', async () => {
+  // Sequence: user types 3+ chars (search runs, searchMatchIds populated),
+  // then deletes back to 2 chars — resetSearchFilter must re-sort from data
+  // because sortedOrder was overwritten to contain only the matched subset.
+  const { state, resetSearchFilter } = makeSearchState();
+  // Simulate a prior active search having populated searchMatchIds
+  state.searchMatchIds = new Set(['session-x']);
+  resetSearchFilter();
+
+  assert.equal(state.refreshSidebarCalls.length, 1, 'refreshSidebar called once');
+  assert.equal(state.refreshSidebarCalls[0].resort, true,
+    'resetSearchFilter must pass resort:true — sortedOrder is stale after prior search');
+});
+
+test('search: delete from 3+ chars to 2 chars resets filter (sequence scenario)', async () => {
+  // Simulates the sequence: type "abc" → results → delete to "ab" → unfiltered.
+  const { state, inputEl, runSearchQuery } = makeSearchState();
+  // Step 1: 3-char search runs
+  inputEl.value = 'abc';
+  await runSearchQuery(() => Promise.resolve([]));
+  assert.notEqual(state.searchMatchIds, null, 'search must have set searchMatchIds');
+
+  // Step 2: user deletes to 2 chars — triggers resetSearchFilter path
+  inputEl.value = 'ab';
+  await runSearchQuery(() => {});
+
+  assert.equal(state.searchMatchIds, null, 'searchMatchIds must be cleared after drop to 2 chars');
+  assert.equal(state.searchMatchProjectPaths, null, 'searchMatchProjectPaths must be cleared');
+  // refreshSidebar must have been called for both the search and the reset
+  assert.ok(state.refreshSidebarCalls.length >= 2, 'refreshSidebar called for search and for reset');
+  // The reset call must use resort:true
+  const resetCall = state.refreshSidebarCalls[state.refreshSidebarCalls.length - 1];
+  assert.equal(resetCall.resort, true, 'reset call must use resort:true');
+});
+
+test('search: "  a  " (1 trimmed char) does NOT call api.search and preserves input', async () => {
+  const { inputEl, runSearchQuery } = makeSearchState();
+  inputEl.value = '  a  ';
+  let apiCalled = false;
+  await runSearchQuery(() => { apiCalled = true; });
+
+  assert.equal(apiCalled, false, 'trim semantics: 1 trimmed char must not trigger search');
+  assert.equal(inputEl.value, '  a  ', 'input value must be preserved (not cleared)');
 });
 
 // ---------------------------------------------------------------------------
