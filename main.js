@@ -16,6 +16,7 @@ if (!app.isPackaged && !process.env.SWITCHBOARD_DATA_DIR) {
 }
 
 // getFolderIndexMtimeMs moved to session-cache.js
+const { appendToOutputBuffer } = require('./output-buffer');
 const { startMcpServer, shutdownMcpServer, shutdownAll: shutdownAllMcp, resolvePendingDiff, rekeyMcpServer, cleanStaleLockFiles } = require('./mcp-bridge');
 const { fetchAndTransformUsage } = require('./claude-auth');
 log.transports.file.level = app.isPackaged ? 'info' : 'debug';
@@ -1689,11 +1690,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
 
     // Buffer output (skip resize-triggered redraws for plain terminals)
     if (!session._suppressBuffer) {
-      session.outputBuffer.push(data);
-      session.outputBufferSize += data.length;
-      while (session.outputBufferSize > MAX_BUFFER_SIZE && session.outputBuffer.length > 1) {
-        session.outputBufferSize -= session.outputBuffer.shift().length;
-      }
+      appendToOutputBuffer(session, data, MAX_BUFFER_SIZE);
     }
 
     if (mainWindow && !mainWindow.isDestroyed()) {
