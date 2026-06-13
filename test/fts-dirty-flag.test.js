@@ -56,13 +56,13 @@ test('computeIndexSignature: empty array returns empty string', () => {
   assert.strictEqual(sig, '');
 });
 
-test('computeIndexSignature: single file encodes filePath:mtimeMs:size', () => {
+test('computeIndexSignature: single file encodes filePath NUL mtimeMs NUL size', () => {
   const ctx = makeCtx();
   const sig = vm.runInContext(
     'computeIndexSignature([{filePath: "/a/b.md", mtimeMs: 1000, size: 42}])',
     ctx
   );
-  assert.strictEqual(sig, '/a/b.md:1000:42');
+  assert.strictEqual(sig, '/a/b.md\x001000\x0042');
 });
 
 test('computeIndexSignature: output is sorted by filePath (order-independent)', () => {
@@ -76,7 +76,7 @@ test('computeIndexSignature: output is sorted by filePath (order-independent)', 
     ctx
   );
   assert.strictEqual(sigA, sigB, 'signature must be order-independent');
-  assert.ok(sigA.startsWith('/a.md:'), 'sorted output must start with /a.md');
+  assert.ok(sigA.startsWith('/a.md\x00'), 'sorted output must start with /a.md NUL-delimited');
 });
 
 test('computeIndexSignature: different mtime produces different signature', () => {
@@ -275,5 +275,52 @@ test('main.js get-work-files result is returned AFTER the shouldReindex guard', 
   assert.ok(
     reindexPos < returnPos,
     'shouldReindex guard must come BEFORE the final return { projects } (always-return invariant)'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 5. NUL-delimiter: paths with colon-digit-digit characters cannot collide
+// ---------------------------------------------------------------------------
+
+test('computeIndexSignature: NUL delimiter prevents collision from paths containing colon-digit sequences', () => {
+  const ctx = makeCtx();
+  // Under the old ':' + '|' scheme these two sets produced identical strings:
+  //   setA: [{filePath: '/a.md:100:0|/b.md', mtimeMs: 200, size: 3}]
+  //   setB: [{filePath: '/a.md', mtimeMs: 100, size: 0}, {filePath: '/b.md', mtimeMs: 200, size: 3}]
+  // Both yielded "/a.md:100:0|/b.md:200:3".
+  // With NUL/newline separators the two sets must produce distinct strings.
+  const setA = [{filePath: '/a.md:100:0|/b.md', mtimeMs: 200, size: 3}];
+  const setB = [{filePath: '/a.md', mtimeMs: 100, size: 0}, {filePath: '/b.md', mtimeMs: 200, size: 3}];
+  const sigA = vm.runInContext(`computeIndexSignature(${JSON.stringify(setA)})`, ctx);
+  const sigB = vm.runInContext(`computeIndexSignature(${JSON.stringify(setB)})`, ctx);
+  assert.notStrictEqual(sigA, sigB, 'paths with colon-digit literals must not collide with separate-file entries');
+});
+
+// ---------------------------------------------------------------------------
+// 6. Static-analysis: save-file-for-panel calls invalidateFtsSignature for
+//    both tracked types (MAJOR-1 fix)
+// ---------------------------------------------------------------------------
+
+test('main.js save-file-for-panel calls invalidateFtsSignature("work-file") for .work-files/ paths', () => {
+  const sfpStart = mainSrc.indexOf("ipcMain.handle('save-file-for-panel'");
+  assert.ok(sfpStart !== -1, "save-file-for-panel handler not found in main.js");
+  const nextHandler = mainSrc.indexOf('ipcMain.handle(', sfpStart + 1);
+  const handlerBody = mainSrc.slice(sfpStart, nextHandler !== -1 ? nextHandler : sfpStart + 2000);
+  assert.match(
+    handlerBody,
+    /invalidateFtsSignature\s*\(\s*['"]work-file['"]/,
+    "save-file-for-panel must call invalidateFtsSignature('work-file') for .work-files/ paths"
+  );
+});
+
+test('main.js save-file-for-panel calls invalidateFtsSignature("memory") for .md paths', () => {
+  const sfpStart = mainSrc.indexOf("ipcMain.handle('save-file-for-panel'");
+  assert.ok(sfpStart !== -1, "save-file-for-panel handler not found in main.js");
+  const nextHandler = mainSrc.indexOf('ipcMain.handle(', sfpStart + 1);
+  const handlerBody = mainSrc.slice(sfpStart, nextHandler !== -1 ? nextHandler : sfpStart + 2000);
+  assert.match(
+    handlerBody,
+    /invalidateFtsSignature\s*\(\s*['"]memory['"]/,
+    "save-file-for-panel must call invalidateFtsSignature('memory') for .md paths"
   );
 });

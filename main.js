@@ -606,6 +606,12 @@ ipcMain.handle('save-file-for-panel', async (_event, filePath, content) => {
     if (isSensitivePath(resolved)) return { ok: false, error: 'access to sensitive path denied' };
     if (!fs.existsSync(resolved)) return { ok: false, error: 'File does not exist' };
     fs.writeFileSync(resolved, content, 'utf8');
+    // Close the sub-second window between save and search: if the saved file
+    // belongs to a type that the FTS index tracks, invalidate its signature so
+    // the next get-work-files / get-memories call triggers a full reindex
+    // (matching the explicit invalidation in save-memory / delete-work-file).
+    if (resolved.includes('/.work-files/')) invalidateFtsSignature('work-file');
+    if (resolved.endsWith('.md')) invalidateFtsSignature('memory');
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err.message };
@@ -860,7 +866,7 @@ const _ftsIndexSignature = new Map();
 function computeIndexSignature(files) {
   // Sort by filePath for determinism regardless of scan order.
   const sorted = [...files].sort((a, b) => a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0);
-  return sorted.map(f => `${f.filePath}:${f.mtimeMs}:${f.size}`).join('|');
+  return sorted.map(f => `${f.filePath}\x00${f.mtimeMs}\x00${f.size}`).join('\n');
 }
 
 /**
