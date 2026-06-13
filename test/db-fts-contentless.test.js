@@ -111,7 +111,67 @@ test('searchFtsRecreated is set to true in the v6 migration', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. Delete statements keep search_content in sync
+// 4. v6 migration includes a VACUUM step to reclaim freed freelist pages
+// ---------------------------------------------------------------------------
+
+test('v6 migration includes a VACUUM call to reclaim freed pages', () => {
+  // The DROP TABLE calls in v6 free ~152 MB of pages into the freelist.
+  // Without VACUUM SQLite keeps the file at its old size ("stopped growing"
+  // not "shrank"). Empirically: 225 MB → 37.9 MB in ~0.5 s on a real DB.
+  // VACUUM cannot run inside a SQLite transaction; the migrations loop is
+  // not wrapped in a transaction, so placing it inside the v6 function body
+  // (after the DROPs) is legal.
+
+  // Locate the v6 migration function body: the block that contains both
+  // DROP TABLE IF EXISTS search_fts AND searchFtsRecreated = true (distinguishes
+  // v6 from v2, which only drops search_fts but not search_content).
+  const v6Start = dbSrc.indexOf("DROP TABLE IF EXISTS search_content");
+  assert.ok(v6Start !== -1, 'v6 migration DROP TABLE IF EXISTS search_content not found');
+
+  // Extract from the DROP TABLE search_content up to the next migrations-array
+  // closing paren, approximately 600 chars — enough to cover the v6 function body.
+  const v6Slice = dbSrc.slice(v6Start, v6Start + 600);
+
+  assert.match(
+    v6Slice,
+    /VACUUM/,
+    'v6 migration must call VACUUM after the DROP TABLEs to reclaim freed freelist pages'
+  );
+});
+
+test('v6 VACUUM is placed inside the migration function body (not outside migrations[])', () => {
+  // We verify that the actual db.exec('VACUUM') call appears AFTER the
+  // DROP TABLE search_content call (which uniquely identifies v6) and BEFORE
+  // the migrations loop runner. This ensures VACUUM is inside the per-migration
+  // function, not added as a post-loop global (which would run on every startup).
+  // We look for the exec call specifically to skip any VACUUM mentions in comments.
+  const v6Drop = dbSrc.indexOf("DROP TABLE IF EXISTS search_content");
+  assert.ok(v6Drop !== -1, 'DROP TABLE IF EXISTS search_content not found (v6 marker)');
+
+  // Find the actual try { db.exec('VACUUM') } call in code (not comments).
+  // We use the try-wrapped form which only appears in code, not in inline comments.
+  const vacuumCall = dbSrc.indexOf("try { db.exec('VACUUM')");
+  assert.ok(vacuumCall !== -1, "try { db.exec('VACUUM') } call not found in db.js");
+
+  // The exec call must come after the v6 DROP TABLE
+  assert.ok(
+    vacuumCall > v6Drop,
+    "try { db.exec('VACUUM') } must appear after the v6 DROP TABLE IF EXISTS search_content"
+  );
+
+  // The exec call must appear before the migrations loop runner (the for loop
+  // that executes migrations) — i.e., inside the migrations array literal
+  const migrationsLoopMarker = 'for (let i = currentDbVersion';
+  const loopPos = dbSrc.indexOf(migrationsLoopMarker);
+  assert.ok(loopPos !== -1, 'migrations loop not found');
+  assert.ok(
+    vacuumCall < loopPos,
+    "try { db.exec('VACUUM') } must be inside the migrations[] array (before the loop that runs them), not after"
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 5. Delete statements keep search_content in sync
 // ---------------------------------------------------------------------------
 
 test('searchDeleteBySession also cleans search_content rows', () => {
