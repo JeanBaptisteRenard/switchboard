@@ -133,7 +133,7 @@ function safeFit(entry) {
   if (dims && dims.rows > 1) {
     const el = entry.element; // .terminal-container
     const cs = getComputedStyle(el);
-    const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+    const padV = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
     // Prefer the private xterm render-service path (same source FitAddon uses).
     // Fall back to measuring the first row element if the internal path is gone.
     const cellH =
