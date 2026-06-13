@@ -600,27 +600,48 @@ async function pollActiveSessions() {
   scheduleActiveSessionsPoll();
 }
 
+// Signature of the pty-id set from the last updateRunningIndicators() call.
+// Used to skip the two full querySelectorAll sidebar scans when nothing changed.
+// A sorted join is a cheap O(n log n) signature — no hashing needed for the
+// small counts expected (<20 active sessions). The gridCards loop runs every
+// call regardless because sessionBusyState can change between polls without
+// the pty-set changing (e.g. CLI-busy IPC updates).
+let _lastPtySignature = '';
+
 function updateRunningIndicators() {
-  document.querySelectorAll('.session-item').forEach(item => {
-    const id = item.dataset.sessionId;
-    const running = activePtyIds.has(id);
-    item.classList.toggle('has-running-pty', running);
-    if (!running) {
-      item.classList.remove('needs-attention', 'response-ready', 'cli-busy');
-      attentionSessions.delete(id);
-      responseReadySessions.delete(id);
-      sessionBusyState.delete(id);
-    }
-    const dot = item.querySelector('.session-status-dot');
-    if (dot) dot.classList.toggle('running', running);
-  });
-  // Update slug group running dots
-  document.querySelectorAll('.slug-group').forEach(group => {
-    const hasRunning = group.querySelector('.session-item.has-running-pty') !== null;
-    const dot = group.querySelector('.slug-group-dot');
-    if (dot) dot.classList.toggle('running', hasRunning);
-  });
-  // Update grid card dots and status text
+  // Build a cheap signature for the current running set.
+  const sig = Array.from(activePtyIds).sort().join(',');
+  const ptySetChanged = sig !== _lastPtySignature;
+  _lastPtySignature = sig;
+
+  if (ptySetChanged) {
+    // Full sidebar DOM scan: only when the set of running sessions changed.
+    // Each call hits every .session-item and every .slug-group in the sidebar
+    // which can be expensive on large projects; skip when nothing moved.
+    document.querySelectorAll('.session-item').forEach(item => {
+      const id = item.dataset.sessionId;
+      const running = activePtyIds.has(id);
+      item.classList.toggle('has-running-pty', running);
+      if (!running) {
+        item.classList.remove('needs-attention', 'response-ready', 'cli-busy');
+        attentionSessions.delete(id);
+        responseReadySessions.delete(id);
+        sessionBusyState.delete(id);
+      }
+      const dot = item.querySelector('.session-status-dot');
+      if (dot) dot.classList.toggle('running', running);
+    });
+    // Update slug group running dots
+    document.querySelectorAll('.slug-group').forEach(group => {
+      const hasRunning = group.querySelector('.session-item.has-running-pty') !== null;
+      const dot = group.querySelector('.slug-group-dot');
+      if (dot) dot.classList.toggle('running', hasRunning);
+    });
+  }
+
+  // Update grid card dots and status text — always run because sessionBusyState
+  // (CLI-busy indicator) can change without affecting activePtyIds.
+  // The gridCards map is bounded (visible grid sessions only) so this is cheap.
   for (const [sid, card] of gridCards) {
     const running = activePtyIds.has(sid);
     const busy = sessionBusyState.get(sid) || false;

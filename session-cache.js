@@ -287,7 +287,11 @@ function refreshFolder(folder, opts = {}) {
  * keeps a single metaMap snapshot per paint. Changes landing inside the
  * throttle window are still picked up by the live watcher.
  */
-const RECONCILE_THROTTLE_MS = 1000;
+// 5s is plenty for sidebar freshness — the live watcher picks up real-time
+// changes; this guard only prevents redundant readdir sweeps triggered by
+// the double loadProjects() call per sidebar paint. Raising from 1s to 5s
+// cuts idle readdirSync churn by 5× with no user-visible staleness.
+const RECONCILE_THROTTLE_MS = 5000;
 let lastReconcileAt = 0;
 function reconcileCacheFromFilesystem() {
   const now = Date.now();
