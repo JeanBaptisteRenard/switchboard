@@ -417,6 +417,10 @@ addProjectBtn.addEventListener('click', () => {
 });
 
 // --- Search (debounced, per-tab FTS) ---
+// Trigram tokenizer makes 1-2 char queries the most expensive (they match
+// enormous row sets). Treat any query shorter than this as "no filter".
+const MIN_SEARCH_CHARS = 3;
+
 let searchDebounceTimer = null;
 const searchClear = document.getElementById('search-clear');
 const searchTitlesToggle = document.getElementById('search-titles-toggle');
@@ -449,7 +453,28 @@ function clearSearch() {
   if (activeTab === 'sessions') {
     searchMatchIds = null;
     searchMatchProjectPaths = null;
-    refreshSidebar({ resort: true });
+    // resort: false — the sort order is unchanged while the filter was active;
+    // skipping the full re-sort cuts the lag when going from a small filtered
+    // set back to the full unfiltered list.
+    refreshSidebar({ resort: false });
+  } else if (activeTab === 'plans') {
+    renderPlans(cachedPlans);
+  } else if (activeTab === 'memory') {
+    renderMemories();
+  } else if (activeTab === 'work-files') {
+    renderWorkFiles();
+  }
+}
+
+// Reset search filter state without clearing the input text.
+// Used when the query drops below MIN_SEARCH_CHARS while the user is still
+// typing — we want no results filter applied, but we must not wipe the
+// partially-typed text.
+function resetSearchFilter() {
+  if (activeTab === 'sessions') {
+    searchMatchIds = null;
+    searchMatchProjectPaths = null;
+    refreshSidebar({ resort: false });
   } else if (activeTab === 'plans') {
     renderPlans(cachedPlans);
   } else if (activeTab === 'memory') {
@@ -469,6 +494,15 @@ async function runSearchQuery() {
   const query = searchInput.value.trim();
   if (!query) {
     clearSearch();
+    return;
+  }
+  // 1-2 char queries are the most expensive for the trigram tokenizer (they
+  // match enormous row sets). Treat them as "no filter" and show the full
+  // unfiltered list — but do NOT call clearSearch(), which would wipe the
+  // partially-typed text; instead use resetSearchFilter() to reset only the
+  // filter state.
+  if (query.length < MIN_SEARCH_CHARS) {
+    resetSearchFilter();
     return;
   }
   try {
