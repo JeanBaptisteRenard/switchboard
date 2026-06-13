@@ -95,6 +95,10 @@ function setupSidebarDom() {
     openSession: () => {},
     loadProjects: () => {},
     launchScheduleCreator: () => {},
+    // buildSlugGroup reads persisted slug expand-state from these (app.js);
+    // tests default to "nothing expanded".
+    getExpandedSlugs: () => new Set(),
+    saveExpandedSlugs: () => {},
   };
 
   for (const [k, v] of Object.entries(stubGlobals)) {
