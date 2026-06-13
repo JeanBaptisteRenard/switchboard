@@ -422,6 +422,10 @@ addProjectBtn.addEventListener('click', () => {
 const MIN_SEARCH_CHARS = 3;
 
 let searchDebounceTimer = null;
+// Pending rAF handle for clearSearch / resetSearchFilter.
+// Cancelled before scheduling a new frame so rapid boundary-crossings
+// (e.g. typing 3→2→1 chars) queue only one full-tree rebuild.
+let clearRenderRaf = null;
 const searchClear = document.getElementById('search-clear');
 const searchTitlesToggle = document.getElementById('search-titles-toggle');
 let searchTitlesOnly = false;
@@ -447,16 +451,20 @@ searchTitlesToggle.addEventListener('click', async () => {
 });
 
 function clearSearch() {
+  // Clear the input and badge immediately so the user sees feedback at once.
   searchInput.value = '';
   searchBar.classList.remove('has-query');
   if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = null; }
   if (activeTab === 'sessions') {
     searchMatchIds = null;
     searchMatchProjectPaths = null;
-    // resort: true — sortedOrder was overwritten during the search render to
-    // contain only matched projects; resorting from data is required to restore
-    // the correct full-list order.
-    refreshSidebar({ resort: true });
+    // Defer the heavy full-tree rebuild to the next animation frame so the
+    // input-cleared state paints first, eliminating the input-to-feedback stall
+    // the user perceives as lag. The resort:true is required because sortedOrder
+    // was overwritten during the search render to contain only matched projects.
+    // Cancel any pending clear-render frame so rapid clears only trigger one rebuild.
+    if (clearRenderRaf) cancelAnimationFrame(clearRenderRaf);
+    clearRenderRaf = requestAnimationFrame(() => { clearRenderRaf = null; refreshSidebar({ resort: true }); });
   } else if (activeTab === 'plans') {
     renderPlans(cachedPlans);
   } else if (activeTab === 'memory') {
@@ -474,9 +482,13 @@ function resetSearchFilter() {
   if (activeTab === 'sessions') {
     searchMatchIds = null;
     searchMatchProjectPaths = null;
-    // resort: true — same reason as clearSearch: sortedOrder may be stale if a
-    // prior 3+ char search ran (and overwrote it with the filtered subset).
-    refreshSidebar({ resort: true });
+    // Defer the heavy full-tree rebuild to the next animation frame so the
+    // partially-typed input keeps its current visual state while the sidebar
+    // resets. resort:true is required — same reason as clearSearch.
+    // Cancel any pending clear-render frame to avoid stacked rebuilds on rapid
+    // boundary crossings (e.g. typing 3→2→1 chars before a frame fires).
+    if (clearRenderRaf) cancelAnimationFrame(clearRenderRaf);
+    clearRenderRaf = requestAnimationFrame(() => { clearRenderRaf = null; refreshSidebar({ resort: true }); });
   } else if (activeTab === 'plans') {
     renderPlans(cachedPlans);
   } else if (activeTab === 'memory') {
