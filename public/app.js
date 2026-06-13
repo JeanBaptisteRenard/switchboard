@@ -447,16 +447,18 @@ searchTitlesToggle.addEventListener('click', async () => {
 });
 
 function clearSearch() {
+  // Clear the input and badge immediately so the user sees feedback at once.
   searchInput.value = '';
   searchBar.classList.remove('has-query');
   if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = null; }
   if (activeTab === 'sessions') {
     searchMatchIds = null;
     searchMatchProjectPaths = null;
-    // resort: true — sortedOrder was overwritten during the search render to
-    // contain only matched projects; resorting from data is required to restore
-    // the correct full-list order.
-    refreshSidebar({ resort: true });
+    // Defer the heavy full-tree rebuild to the next animation frame so the
+    // input-cleared state paints first, eliminating the input-to-feedback stall
+    // the user perceives as lag. The resort:true is required because sortedOrder
+    // was overwritten during the search render to contain only matched projects.
+    requestAnimationFrame(() => refreshSidebar({ resort: true }));
   } else if (activeTab === 'plans') {
     renderPlans(cachedPlans);
   } else if (activeTab === 'memory') {
@@ -474,9 +476,10 @@ function resetSearchFilter() {
   if (activeTab === 'sessions') {
     searchMatchIds = null;
     searchMatchProjectPaths = null;
-    // resort: true — same reason as clearSearch: sortedOrder may be stale if a
-    // prior 3+ char search ran (and overwrote it with the filtered subset).
-    refreshSidebar({ resort: true });
+    // Defer the heavy full-tree rebuild to the next animation frame so the
+    // partially-typed input keeps its current visual state while the sidebar
+    // resets. resort:true is required — same reason as clearSearch.
+    requestAnimationFrame(() => refreshSidebar({ resort: true }));
   } else if (activeTab === 'plans') {
     renderPlans(cachedPlans);
   } else if (activeTab === 'memory') {
