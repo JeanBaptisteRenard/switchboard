@@ -87,15 +87,18 @@ function appendToOutputBuffer(state, data, max) {
   // Collapse the array into a single string in two situations:
   //   (a) the entry count exceeds COALESCE_THRESHOLD — caps per-session slot
   //       pressure (the primary perf goal of this helper).
-  //   (b) the buffer is over budget AND the first entry is ≥ max — this happens
-  //       after step 3 previously trimmed a spine to ~max bytes and one or more
-  //       small new chunks were pushed on top.  Without this coalesce, step 2's
-  //       `length > 1` guard would shift the ~max spine in one call, atomically
-  //       dropping nearly the entire history.  Coalescing first means step 3 can
-  //       do a byte-accurate front-trim instead.
+  //   (b) the buffer is over budget with more than one entry — this happens
+  //       after step 3 previously trimmed a spine to ~max bytes (the line-boundary
+  //       slice leaves a spine of up to max-1 bytes) and one or more small new
+  //       chunks were pushed on top.  Without this coalesce, step 2's `length > 1`
+  //       guard would shift the ~max spine in one call, atomically dropping nearly
+  //       the entire history.  Coalescing first means step 3 can do a byte-accurate
+  //       front-trim instead.  We deliberately do NOT gate on `outputBuffer[0].length
+  //       >= max`: the nl=0 case in step 3 produces a spine of exactly max-1 bytes,
+  //       which would slip under that guard and reintroduce the atomic-drop bug.
   if (
     state.outputBuffer.length > COALESCE_THRESHOLD ||
-    (state.outputBufferSize > max && state.outputBuffer.length > 1 && state.outputBuffer[0].length >= max)
+    (state.outputBufferSize > max && state.outputBuffer.length > 1)
   ) {
     const joined = state.outputBuffer.join('');
     state.outputBuffer = [joined];

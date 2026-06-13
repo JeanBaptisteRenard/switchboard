@@ -204,3 +204,36 @@ test('appendToOutputBuffer: large chunk after many smalls appends in order', () 
   const buf = joined(state);
   assert.ok(buf.endsWith('LAST'), 'last chunk must be at the end');
 });
+
+// ---------------------------------------------------------------------------
+// 10. max-1 spine tip-over: small chunk on a freshly nl-trimmed spine must
+//     coalesce, not atomically shift the spine. Regression for the WARNING in
+//     PR #75 re-review: step 3's nl=0 path leaves a spine of exactly MAX-1
+//     bytes, which slipped under a `spine.length >= MAX` coalesce guard, so the
+//     next small push let step 2 shift() the whole MAX-1 spine (history loss).
+// ---------------------------------------------------------------------------
+
+test('appendToOutputBuffer: small chunk on a MAX-1 spine keeps full history', () => {
+  const state = makeState();
+  // Build a spine of exactly MAX-1 bytes via the nl=0 step-3 path:
+  // 'a'*k + '\n' + 'b'*(MAX-1).  Last MAX chars = '\n' + 'b'*(MAX-1) (nl at 0),
+  // advancing past the '\n' yields 'b'*(MAX-1).
+  const big = 'a'.repeat(10) + '\n' + 'b'.repeat(MAX - 1);
+  appendToOutputBuffer(state, big, MAX);
+  assert.strictEqual(state.outputBufferSize, MAX - 1, 'spine should be exactly MAX-1 bytes');
+
+  // Now tip over MAX with a small chunk.  On the buggy guarded code this
+  // shifts the entire MAX-1 spine (retained drops to chunkSize); on the fix
+  // it coalesces then byte-slices, retaining ~MAX.
+  const chunkSize = 2048;
+  appendToOutputBuffer(state, 'c'.repeat(chunkSize), MAX);
+
+  assert.ok(state.outputBufferSize <= MAX, `buffer ${state.outputBufferSize} > MAX ${MAX}`);
+  assert.ok(
+    state.outputBufferSize >= MAX - chunkSize,
+    `retained ${state.outputBufferSize} bytes is too low — expected ≥${MAX - chunkSize}. ` +
+    'Likely cause: MAX-1 spine shifted whole instead of coalesced+byte-sliced.',
+  );
+  // The newest bytes ('c') must survive at the tail.
+  assert.ok(joined(state).endsWith('c'.repeat(chunkSize)), 'newest chunk must remain at the tail');
+});
