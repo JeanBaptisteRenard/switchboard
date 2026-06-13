@@ -103,11 +103,45 @@ function isAtBottom(terminal) {
   return buf.viewportY >= buf.baseY;
 }
 
-// Fit terminal to container, subtracting 1 row to avoid partial-row clipping.
+// Pure helper: clamp a FitAddon-proposed row count to what the container's
+// content-box height can actually display.
+//
+// Problem: xterm's FitAddon.proposeDimensions() reads
+//   getComputedStyle(container).height  ← the .terminal-container border-box
+// and subtracts only the .xterm element's OWN padding (0 in Switchboard).
+// Under the global `* { box-sizing: border-box }` rule, the computed height
+// already includes the container's 8 px top + 8 px bottom padding, so those
+// 16 px are counted as drawable area. Result: 1–2 extra rows are proposed and
+// the bottom portion is clipped by overflow:hidden (measured: 16 px / ~1.14
+// rows in both single and grid views).
+//
+// Fix: clamp proposed rows to floor((clientHeight − verticalPadding) /
+// cellHeight). clientHeight is the padding-box height (excludes borders only),
+// so subtracting the vertical padding gives the true content-box height.
+// Math.min ensures we only ever shrink an overshoot, never add rows.
+// Returns proposedRows unchanged when cellHeight ≤ 0 (unmeasured state).
+function clampRowsToContentBox(proposedRows, clientHeight, verticalPadding, cellHeight) {
+  if (cellHeight <= 0) return proposedRows;
+  const maxRows = Math.max(1, Math.floor((clientHeight - verticalPadding) / cellHeight));
+  return Math.min(proposedRows, maxRows);
+}
+
+// Fit terminal to container, clamping rows to the container's true content-box
+// height to avoid bottom-row clipping (see clampRowsToContentBox above).
 function safeFit(entry) {
   const dims = entry.fitAddon.proposeDimensions();
   if (dims && dims.rows > 1) {
-    entry.terminal.resize(dims.cols, dims.rows);
+    const el = entry.element; // .terminal-container
+    const cs = getComputedStyle(el);
+    const padV = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+    // Prefer the private xterm render-service path (same source FitAddon uses).
+    // Fall back to measuring the first row element if the internal path is gone.
+    const cellH =
+      entry.terminal._core?._renderService?.dimensions?.css?.cell?.height ||
+      el.querySelector('.xterm-rows')?.firstElementChild?.getBoundingClientRect().height ||
+      0;
+    const clampedRows = clampRowsToContentBox(dims.rows, el.clientHeight, padV, cellH);
+    entry.terminal.resize(dims.cols, clampedRows);
   } else {
     entry.fitAddon.fit();
   }
