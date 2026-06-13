@@ -16,7 +16,7 @@ if (!app.isPackaged && !process.env.SWITCHBOARD_DATA_DIR) {
 }
 
 // getFolderIndexMtimeMs moved to session-cache.js
-const { appendToOutputBuffer } = require('./output-buffer');
+const { appendToOutputBuffer, MAX_BUFFER_SIZE } = require('./output-buffer');
 const { startMcpServer, shutdownMcpServer, shutdownAll: shutdownAllMcp, resolvePendingDiff, rekeyMcpServer, cleanStaleLockFiles } = require('./mcp-bridge');
 const { fetchAndTransformUsage } = require('./claude-auth');
 log.transports.file.level = app.isPackaged ? 'info' : 'debug';
@@ -87,7 +87,7 @@ const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 const PLANS_DIR = path.join(os.homedir(), '.claude', 'plans');
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const STATS_CACHE_PATH = path.join(CLAUDE_DIR, 'stats-cache.json');
-const MAX_BUFFER_SIZE = 256 * 1024;
+// MAX_BUFFER_SIZE imported from output-buffer.js (single source of truth)
 
 // Active PTY sessions
 const activeSessions = new Map();

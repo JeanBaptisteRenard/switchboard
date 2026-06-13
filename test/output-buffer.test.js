@@ -16,9 +16,9 @@
 
 const test  = require('node:test');
 const assert = require('node:assert/strict');
-const { appendToOutputBuffer } = require('../output-buffer');
+const { appendToOutputBuffer, COALESCE_THRESHOLD, MAX_BUFFER_SIZE } = require('../output-buffer');
 
-const MAX = 256 * 1024; // must match output-buffer.js export
+const MAX = MAX_BUFFER_SIZE; // exported from output-buffer.js — single source of truth
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -65,7 +65,6 @@ test('appendToOutputBuffer: retained bytes never exceed MAX_BUFFER_SIZE', () => 
 
 test('appendToOutputBuffer: array length stays bounded after many small pushes', () => {
   const state = makeState();
-  const COALESCE_THRESHOLD = 64; // must match output-buffer.js
   for (let i = 0; i < 1000; i++) {
     appendToOutputBuffer(state, 'tiny', MAX);
   }
@@ -99,7 +98,15 @@ test('appendToOutputBuffer: retained content is the tail of the input stream', (
     expected.endsWith(actual),
     'retained content must be a suffix of the full input stream',
   );
-  assert.ok(actual.length > 0, 'buffer must not be empty');
+  // Lower bound: retained history must be within one chunk of the budget.
+  // This assertion catches the coalesce-after-trim bug: with the wrong step
+  // order the coalesced spine can be atomically dropped on the next push,
+  // leaving ~64 KB retained instead of ~256 KB.
+  assert.ok(
+    actual.length >= MAX - chunkSize,
+    `retained ${actual.length} bytes is too low — expected ≥${MAX - chunkSize} (MAX − one chunk). ` +
+    'Likely cause: coalesce firing after front-trim, building a large spine that gets shift()ed.',
+  );
   assert.ok(actual.length <= MAX, `buffer ${actual.length} exceeds MAX ${MAX}`);
 });
 
