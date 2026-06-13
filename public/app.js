@@ -417,6 +417,10 @@ addProjectBtn.addEventListener('click', () => {
 });
 
 // --- Search (debounced, per-tab FTS) ---
+// Trigram tokenizer makes 1-2 char queries the most expensive (they match
+// enormous row sets). Treat any query shorter than this as "no filter".
+const MIN_SEARCH_CHARS = 3;
+
 let searchDebounceTimer = null;
 const searchClear = document.getElementById('search-clear');
 const searchTitlesToggle = document.getElementById('search-titles-toggle');
@@ -449,6 +453,29 @@ function clearSearch() {
   if (activeTab === 'sessions') {
     searchMatchIds = null;
     searchMatchProjectPaths = null;
+    // resort: true — sortedOrder was overwritten during the search render to
+    // contain only matched projects; resorting from data is required to restore
+    // the correct full-list order.
+    refreshSidebar({ resort: true });
+  } else if (activeTab === 'plans') {
+    renderPlans(cachedPlans);
+  } else if (activeTab === 'memory') {
+    renderMemories();
+  } else if (activeTab === 'work-files') {
+    renderWorkFiles();
+  }
+}
+
+// Reset search filter state without clearing the input text.
+// Used when the query drops below MIN_SEARCH_CHARS while the user is still
+// typing — we want no results filter applied, but we must not wipe the
+// partially-typed text.
+function resetSearchFilter() {
+  if (activeTab === 'sessions') {
+    searchMatchIds = null;
+    searchMatchProjectPaths = null;
+    // resort: true — same reason as clearSearch: sortedOrder may be stale if a
+    // prior 3+ char search ran (and overwrote it with the filtered subset).
     refreshSidebar({ resort: true });
   } else if (activeTab === 'plans') {
     renderPlans(cachedPlans);
@@ -469,6 +496,15 @@ async function runSearchQuery() {
   const query = searchInput.value.trim();
   if (!query) {
     clearSearch();
+    return;
+  }
+  // 1-2 char queries are the most expensive for the trigram tokenizer (they
+  // match enormous row sets). Treat them as "no filter" and show the full
+  // unfiltered list — but do NOT call clearSearch(), which would wipe the
+  // partially-typed text; instead use resetSearchFilter() to reset only the
+  // filter state.
+  if (query.length < MIN_SEARCH_CHARS) {
+    resetSearchFilter();
     return;
   }
   try {
