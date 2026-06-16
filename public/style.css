@@ -3807,6 +3807,12 @@ body { display: flex; flex-direction: column; }
   min-width: 170px;
 }
 
+.popover-separator {
+  height: 1px;
+  background: rgba(255,255,255,0.08);
+  margin: 4px 6px;
+}
+
 .popover-option {
   display: flex;
   align-items: center;

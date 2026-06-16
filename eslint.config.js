@@ -209,6 +209,12 @@ const rendererCrossFileGlobals = {
   updatePtyTitle: 'readonly',
   _shellProfiles: 'writable',
 
+  // Terminal right-click context menu (public/terminal-context-menu.js)
+  terminalRightClickMode: 'writable',
+  setupTerminalContextMenu: 'readonly',
+  showTerminalContextMenu: 'readonly',
+  closeTerminalContextMenuForSession: 'readonly',
+
   // Configurable keyboard shortcuts (public/shortcuts.js + grid-view.js)
   DEFAULT_SHORTCUTS: 'readonly',
   SHORTCUT_DEFS: 'readonly',
@@ -259,7 +265,7 @@ module.exports = [
   // Dual-mode helper: classic <script> in the renderer AND require()-d in tests.
   // Same browser globals as the rest of public/, plus `module` for the CJS footer.
   {
-    files: ['public/shortcuts.js'],
+    files: ['public/shortcuts.js', 'public/terminal-context-menu.js'],
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: 'script',

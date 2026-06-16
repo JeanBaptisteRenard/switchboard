@@ -109,7 +109,7 @@ function setupTerminalDom() {
   // lexical scope — it shadows the window stub, exactly as in production where
   // grid-view.js owns that global. Tests must read grid state via inCtx().
   const ctx = dom.getInternalVMContext();
-  for (const file of ['utils.js', 'shortcuts.js', 'terminal-manager.js', 'grid-view.js']) {
+  for (const file of ['utils.js', 'shortcuts.js', 'terminal-context-menu.js', 'terminal-manager.js', 'grid-view.js']) {
     const src = fs.readFileSync(path.join(PUBLIC_DIR, file), 'utf8');
     vm.runInContext(src, ctx, { filename: file });
   }
@@ -634,7 +634,7 @@ test('safeFit: clamps rows to content box when cell height is available via _cor
   const fs2 = require('node:fs');
   const path2 = require('node:path');
   const vm2 = require('node:vm');
-  for (const file of ['utils.js', 'shortcuts.js', 'terminal-manager.js', 'grid-view.js']) {
+  for (const file of ['utils.js', 'shortcuts.js', 'terminal-context-menu.js', 'terminal-manager.js', 'grid-view.js']) {
     const src = fs2.readFileSync(path2.join(PUBLIC_DIR, file), 'utf8');
     vm2.runInContext(src, ctx, { filename: file });
   }

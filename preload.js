@@ -48,7 +48,9 @@ contextBridge.exposeInMainWorld('api', {
   deleteWorktree: (worktreePath) => ipcRenderer.invoke('delete-worktree', worktreePath),
   worktreeStatus: (worktreePath) => ipcRenderer.invoke('worktree-status', worktreePath),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
+  openPath: (filePath) => ipcRenderer.invoke('open-path', filePath),
   writeClipboard: (text) => ipcRenderer.invoke('clipboard-write-text', text),
+  readClipboard: () => ipcRenderer.invoke('read-clipboard'),
 
   // Send (fire-and-forget)
   sendInput: (id, data) => ipcRenderer.send('terminal-input', id, data),

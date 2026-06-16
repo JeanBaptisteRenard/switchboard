@@ -72,6 +72,7 @@
     const visCountValue = fieldValue('visibleSessionCount', 10);
     const maxAgeValue = fieldValue('sessionMaxAgeDays', 3);
     const themeValue = fieldValue('terminalTheme', 'switchboard');
+    const rightClickValue = fieldValue('terminalRightClick', 'menu');
     const mcpEmulationValue = fieldValue('mcpEmulation', true);
     const shellProfileValue = fieldValue('shellProfile', 'auto');
 
@@ -190,6 +191,21 @@
               ${Object.entries(TERMINAL_THEMES).map(([key, t]) =>
                 `<option value="${key}" ${themeValue === key ? 'selected' : ''}>${escapeHtml(t.label)}</option>`
               ).join('')}
+            </select>
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">Terminal Right-Click</span>
+            <div class="settings-description">What a right-click does in the terminal. "Context menu" offers file-link actions (open in panel / system editor, copy path), copy and paste. Takes effect on the next right-click.</div>
+          </div>
+          <div class="settings-field-control">
+            <select class="settings-select" id="sv-right-click">
+              <option value="menu" ${rightClickValue === 'menu' ? 'selected' : ''}>Context menu (default)</option>
+              <option value="paste" ${rightClickValue === 'paste' ? 'selected' : ''}>Paste clipboard</option>
+              <option value="default" ${rightClickValue === 'default' ? 'selected' : ''}>Native (xterm)</option>
+              <option value="none" ${rightClickValue === 'none' ? 'selected' : ''}>Do nothing</option>
             </select>
           </div>
         </div>
@@ -371,6 +387,7 @@
         settings.visibleSessionCount = parseInt(settingsViewerBody.querySelector('#sv-visible-count').value) || 10;
         settings.sessionMaxAgeDays = parseInt(settingsViewerBody.querySelector('#sv-max-age').value) || 3;
         settings.terminalTheme = settingsViewerBody.querySelector('#sv-terminal-theme').value || 'switchboard';
+        settings.terminalRightClick = settingsViewerBody.querySelector('#sv-right-click').value || 'menu';
         settings.mcpEmulation = settingsViewerBody.querySelector('#sv-mcp-emulation').checked;
         settings.shellProfile = settingsViewerBody.querySelector('#sv-shell-profile').value || 'auto';
         settings.shortcuts = scShortcuts;
@@ -395,6 +412,9 @@
         }
         if (settings.terminalTheme && typeof window._applyTerminalTheme === 'function') {
           window._applyTerminalTheme(settings.terminalTheme);
+        }
+        if (settings.terminalRightClick && typeof window._applyTerminalRightClick === 'function') {
+          window._applyTerminalRightClick(settings.terminalRightClick);
         }
         if (settings.shortcuts && typeof window._applyShortcuts === 'function') {
           window._applyShortcuts(settings.shortcuts);
