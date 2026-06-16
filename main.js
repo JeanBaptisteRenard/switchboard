@@ -577,6 +577,19 @@ ipcMain.handle('open-external', (_event, url) => {
   if (/^https?:\/\//i.test(url)) return shell.openExternal(url);
 });
 
+// --- IPC: open a local file in the OS default app (terminal right-click menu) ---
+ipcMain.handle('open-path', (_event, filePath) => {
+  if (typeof filePath !== 'string' || !filePath) return;
+  const resolved = path.resolve(filePath);
+  // Mirror the read/save-file-for-panel guard: never hand a sensitive path
+  // (~/.ssh, credentials, etc.) to the OS default opener.
+  if (isSensitivePath(resolved)) return;
+  return shell.openPath(resolved);
+});
+
+// --- IPC: read clipboard (terminal right-click paste; see clipboard-write-text) ---
+ipcMain.handle('read-clipboard', () => clipboard.readText());
+
 // --- IPC: clipboard write ---
 // The renderer's navigator.clipboard.writeText is gated on focus/user-activation and
 // is flaky-to-dead on Linux/Wayland (Ozone). The main-process clipboard has no such

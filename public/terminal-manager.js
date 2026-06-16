@@ -313,6 +313,10 @@ function createTerminalEntry(session, opts = {}) {
   container.className = 'terminal-container';
   terminalsEl.appendChild(container);
 
+  // URI of the link currently under the cursor (set by the link hover/leave
+  // callbacks below), so the right-click context menu can offer link actions.
+  let hoveredLinkUri = null;
+
   const terminal = new Terminal({
     fontSize: 12,
     fontFamily: "'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace",
@@ -322,13 +326,19 @@ function createTerminalEntry(session, opts = {}) {
     convertEol: true,
     allowProposedApi: true,
     linkHandler: {
-      activate: (_event, uri) => {
+      activate: (event, uri) => {
+        // xterm fires link activate on any mouseup button (no guard); only act
+        // on a left-click so a right-click goes to the context menu instead of
+        // re-opening the link.
+        if (event && typeof event.button === 'number' && event.button !== 0) return;
         if (uri.startsWith('file://') && typeof openFileInPanel === 'function') {
           try { openFileInPanel(sessionId, decodeURIComponent(new URL(uri).pathname)); } catch {}
         } else {
           window.api.openExternal(uri);
         }
       },
+      hover: (_event, uri) => { hoveredLinkUri = uri; },
+      leave: () => { hoveredLinkUri = null; },
       allowNonHttpProtocols: true,
     },
   });
@@ -353,13 +363,14 @@ function createTerminalEntry(session, opts = {}) {
 
   const fitAddon = new FitAddon.FitAddon();
   terminal.loadAddon(fitAddon);
-  terminal.loadAddon(new WebLinksAddon.WebLinksAddon((_event, url) => {
+  terminal.loadAddon(new WebLinksAddon.WebLinksAddon((event, url) => {
+    if (event && typeof event.button === 'number' && event.button !== 0) return;
     if (url.startsWith('file://') && typeof openFileInPanel === 'function') {
       try { openFileInPanel(sessionId, decodeURIComponent(new URL(url).pathname)); } catch {}
     } else {
       window.api.openExternal(url);
     }
-  }));
+  }, { hover: (_event, url) => { hoveredLinkUri = url; }, leave: () => { hoveredLinkUri = null; } }));
   const searchAddon = new SearchAddon.SearchAddon();
   terminal.loadAddon(searchAddon);
   terminal.loadAddon(new UnicodeGraphemesAddon.UnicodeGraphemesAddon());
@@ -420,6 +431,7 @@ function createTerminalEntry(session, opts = {}) {
     window.api.sendInput(entry.session.sessionId, data);
   });
   setupTerminalKeyBindings(terminal, container, () => entry.session.sessionId, { onFind: openSearchBar });
+  setupTerminalContextMenu(container, terminal, () => entry.session.sessionId, () => hoveredLinkUri);
   setupDragAndDrop(container, () => entry.session.sessionId);
   terminal.onResize(({ cols, rows }) => {
     window.api.resizeTerminal(entry.session.sessionId, cols, rows);
@@ -474,6 +486,9 @@ function restoreTerminalWebgl(sessionId) {
 function destroySession(sessionId) {
   const entry = openSessions.get(sessionId);
   if (!entry) return;
+  // Tear down any open right-click menu for this session before disposing the
+  // terminal — its action closures hold the (about-to-be-disposed) xterm.
+  if (typeof closeTerminalContextMenuForSession === 'function') closeTerminalContextMenuForSession(sessionId);
   window.api.closeTerminal(sessionId);
   // Drop any pending write buffer before disposing — a scheduled rAF/timeout
   // flush would otherwise call terminal.write() on a disposed instance if
