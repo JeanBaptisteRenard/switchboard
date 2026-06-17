@@ -73,6 +73,7 @@
     const maxAgeValue = fieldValue('sessionMaxAgeDays', 3);
     const themeValue = fieldValue('terminalTheme', 'switchboard');
     const rightClickValue = fieldValue('terminalRightClick', 'menu');
+    const restoreStartupValue = fieldValue('restoreOnStartup', 'ask');
     const mcpEmulationValue = fieldValue('mcpEmulation', true);
     const shellProfileValue = fieldValue('shellProfile', 'auto');
 
@@ -206,6 +207,21 @@
               <option value="paste" ${rightClickValue === 'paste' ? 'selected' : ''}>Paste clipboard</option>
               <option value="default" ${rightClickValue === 'default' ? 'selected' : ''}>Native (xterm)</option>
               <option value="none" ${rightClickValue === 'none' ? 'selected' : ''}>Do nothing</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">Restore Sessions on Startup</span>
+            <!-- No live-apply hook — this setting is only read at next app launch. -->
+            <div class="settings-description">Re-open the sessions that were open when Switchboard last closed. Each is resumed in turn.</div>
+          </div>
+          <div class="settings-field-control">
+            <select class="settings-select" id="sv-restore-startup">
+              <option value="off" ${restoreStartupValue === 'off' ? 'selected' : ''}>Don't restore</option>
+              <option value="ask" ${restoreStartupValue === 'ask' ? 'selected' : ''}>Ask on startup (default)</option>
+              <option value="auto" ${restoreStartupValue === 'auto' ? 'selected' : ''}>Restore automatically</option>
             </select>
           </div>
         </div>
@@ -388,6 +404,7 @@
         settings.sessionMaxAgeDays = parseInt(settingsViewerBody.querySelector('#sv-max-age').value) || 3;
         settings.terminalTheme = settingsViewerBody.querySelector('#sv-terminal-theme').value || 'switchboard';
         settings.terminalRightClick = settingsViewerBody.querySelector('#sv-right-click').value || 'menu';
+        settings.restoreOnStartup = settingsViewerBody.querySelector('#sv-restore-startup').value || 'ask';
         settings.mcpEmulation = settingsViewerBody.querySelector('#sv-mcp-emulation').checked;
         settings.shellProfile = settingsViewerBody.querySelector('#sv-shell-profile').value || 'auto';
         settings.shortcuts = scShortcuts;
