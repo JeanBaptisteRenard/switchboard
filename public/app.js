@@ -118,6 +118,117 @@ window._applyTerminalTheme = (themeName) => {
 // Live-apply the terminal right-click behavior (terminalRightClickMode lives in
 // terminal-context-menu.js); takes effect on the next right-click, no relaunch.
 window._applyTerminalRightClick = (mode) => { terminalRightClickMode = mode || 'menu'; };
+
+// --- Working-set persistence (open sessions → global.openWorkingSet) ---
+// Guard: while restoring, suppress incremental persist calls.
+let restoringWorkingSet = false;
+let persistWorkingSetTimer = null;
+const RESTORE_STAGGER_MS = 500;
+
+// Serialise concurrent read-modify-write calls so two async persist paths
+// (e.g. sidebar-resize and a working-set flush arriving in the same tick)
+// cannot interleave and silently drop each other's keys.
+let _persistChain = Promise.resolve();
+
+function persistWorkingSet() {
+  _persistChain = _persistChain.then(async () => {
+    const g = await window.api.getSetting('global');
+    const global = g || {};
+    const set = [];
+    for (const [sessionId, entry] of openSessions) {
+      if (entry.session.type === 'terminal') continue; // exclude plain shells
+      if (entry.closed) continue;
+      set.push({
+        sessionId,
+        projectPath: entry.session.projectPath,
+        active: sessionId === activeSessionId,
+      });
+    }
+    global.openWorkingSet = set;
+    await window.api.setSetting('global', global);
+  }).catch((e) => { console.warn('[switchboard] failed to persist working set', e); });
+  return _persistChain;
+}
+
+function schedulePersistWorkingSet() {
+  if (restoringWorkingSet) return;
+  if (persistWorkingSetTimer) clearTimeout(persistWorkingSetTimer);
+  persistWorkingSetTimer = setTimeout(() => {
+    persistWorkingSetTimer = null;
+    persistWorkingSet();
+  }, 500);
+}
+
+async function runRestore(list) {
+  for (const item of list) {
+    const s = sessionMap.get(item.sessionId);
+    if (!s) continue;
+    if (openSessions.has(item.sessionId)) continue;
+    // Resume with the project's current "new session" defaults, exactly like a
+    // manual session relaunch — not options frozen from a previous launch.
+    await openSession(s);
+    await new Promise(r => setTimeout(r, RESTORE_STAGGER_MS));
+  }
+  // Activate the entry marked active (or the last one)
+  const activeItem = list.find(i => i.active) || list[list.length - 1];
+  if (activeItem && openSessions.has(activeItem.sessionId)) {
+    showSession(activeItem.sessionId);
+  }
+}
+
+async function restoreWorkingSet() {
+  const g = await window.api.getSetting('global');
+  const mode = (g && g.restoreOnStartup) || 'ask';
+  const savedSet = (g && g.openWorkingSet) || [];
+
+  if (mode === 'off' || savedSet.length === 0) return;
+
+  // Filter to sessions still indexed (guard for deleted sessions / vanished worktrees)
+  const candidates = savedSet.filter(item =>
+    sessionMap.has(item.sessionId) && !openSessions.has(item.sessionId)
+  );
+  if (candidates.length === 0) return;
+
+  if (mode === 'auto') {
+    restoringWorkingSet = true;
+    try {
+      await runRestore(candidates);
+    } finally {
+      restoringWorkingSet = false;
+    }
+    persistWorkingSet();
+    return;
+  }
+
+  // mode === 'ask': show a non-modal toast bar
+  const toast = document.createElement('div');
+  toast.id = 'restore-toast';
+  toast.className = 'restore-toast';
+  toast.innerHTML = `<span class="restore-toast-msg">Restore ${candidates.length} session${candidates.length !== 1 ? 's' : ''} from last time?</span>` +
+    `<button class="restore-toast-btn restore-toast-restore">Restore</button>` +
+    `<button class="restore-toast-btn restore-toast-dismiss">Dismiss</button>`;
+  document.body.appendChild(toast);
+
+  toast.querySelector('.restore-toast-restore').addEventListener('click', async () => {
+    toast.remove();
+    restoringWorkingSet = true;
+    try {
+      await runRestore(candidates);
+    } finally {
+      restoringWorkingSet = false;
+    }
+    persistWorkingSet();
+  });
+  toast.querySelector('.restore-toast-dismiss').addEventListener('click', () => {
+    toast.remove();
+  });
+}
+
+// Expose for tests
+window._persistWorkingSet = () => persistWorkingSet();
+window._restoreWorkingSet = () => restoreWorkingSet();
+window._runRestore = (list) => runRestore(list);
+
 let searchMatchIds = null; // null = no search active; Set<string> = matched session IDs
 let searchMatchProjectPaths = null; // Set<string> of project paths matched by name
 
@@ -259,6 +370,7 @@ window.api.onSessionForked((oldId, newId) => {
       if (summary) terminalHeaderName.textContent = summary.textContent;
     }
   });
+  schedulePersistWorkingSet();
   pollActiveSessions();
 });
 
@@ -315,6 +427,8 @@ window.api.onProcessExited((sessionId, exitCode) => {
     gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
   }
 
+  // Claude session exited → update persisted working set (entry.closed=true → excluded from set)
+  schedulePersistWorkingSet();
   pollActiveSessions();
 });
 
@@ -870,6 +984,7 @@ async function launchNewSession(project, sessionOptions) {
   if (typeof setSessionMcpActive === 'function') setSessionMcpActive(sessionId, !!result.mcpActive);
 
   showSession(sessionId);
+  schedulePersistWorkingSet();
   pollActiveSessions();
 }
 
@@ -937,6 +1052,7 @@ async function openSession(session, customOptions) {
   if (typeof setSessionMcpActive === 'function') setSessionMcpActive(sessionId, !!result.mcpActive);
 
   showSession(sessionId);
+  schedulePersistWorkingSet();
   pollActiveSessions();
 }
 
@@ -1170,16 +1286,21 @@ setTimeout(() => {
 // Let the settings panel push updated key bindings live (no restart needed).
 window._applyShortcuts = (stored) => setAppShortcuts(stored);
 
-loadProjects().then(() => {
+loadProjects().then(async () => {
   // Restore grid view preference before opening sessions so they enter grid mode
   if (localStorage.getItem('gridViewActive') === '1') {
     showGridView();
   }
-  // Restore active session after reload
+  // Restore active session after reload (sessionStorage — lost on full restart).
+  // Must be awaited so openSessions is populated before restoreWorkingSet runs its
+  // !openSessions.has(id) filter — otherwise the session can pass the filter and
+  // be opened a second time (duplicate PTY / duplicate claude --resume).
   if (activeSessionId && !openSessions.has(activeSessionId)) {
     const session = sessionMap.get(activeSessionId);
-    if (session) openSession(session);
+    if (session) await openSession(session);
   }
+  // Restore working set (persisted across full restarts via global settings)
+  await restoreWorkingSet();
 });
 
 // Live-reload sidebar when filesystem changes are detected
