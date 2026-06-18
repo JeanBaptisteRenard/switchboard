@@ -59,6 +59,22 @@ Switchboard monitors all your sessions in the background and shows status indica
 | `Cmd+F` / `Ctrl+F` | Find in file (also works in terminal) |
 | `Cmd+G` / `Ctrl+G` | Go to line |
 
+## Documentation
+
+Full user-facing documentation lives in [docs/](docs/README.md):
+
+- [Session Browser](docs/session-browser.md) — sidebar, project grouping, full-text search, archive, star, filters
+- [Terminal](docs/terminal.md) — built-in terminal, configurable right-click, drag-and-drop, in-terminal find
+- [Grid Overview](docs/grid-overview.md) — bird's-eye live grid of all open sessions
+- [IDE Emulation](docs/ide-emulation.md) — file diffs in a side panel, inline and side-by-side, partial accept
+- [Subagents](docs/subagents.md) — subagent index, hierarchy, live status, read-only transcript viewer
+- [Session Restore](docs/session-restore.md) — persist open sessions and restore them on restart
+- [Keyboard Shortcuts](docs/keyboard-shortcuts.md) — editor/terminal shortcuts and rebindable session-nav keys
+- [Notifications](docs/notifications.md) — sidebar status badges
+- [Plans, Memory, and Work Files](docs/plans-memory-workfiles.md) — CodeMirror panels for plan files, CLAUDE.md, and `.work-files/`
+- [Activity Stats](docs/activity-stats.md) — coding activity heatmap
+- [Settings Reference](docs/settings.md) — every field in Global and Project Settings
+
 ## Download
 
 Grab the latest release for your platform:
