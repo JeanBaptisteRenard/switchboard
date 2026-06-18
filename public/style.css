@@ -3476,6 +3476,14 @@ body { display: flex; flex-direction: column; }
   cursor: not-allowed;
 }
 
+/* The native option-list popup defaults to a white background in dark theme
+   (Chromium renders it from the OS palette, not the control's CSS). Force a
+   dark palette on the options so the dropdown matches the theme. */
+.settings-select option {
+  background-color: #1e1e2a;
+  color: #c0c0d0;
+}
+
 /* --- Wide input fields (full-width row below) --- */
 .settings-field.settings-field-wide {
   flex-direction: column;
