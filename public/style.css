@@ -3346,7 +3346,7 @@ body { display: flex; flex-direction: column; }
 .settings-hint {
   font-size: 11px;
   color: #6a6a80;
-  margin: -2px 0 6px;
+  margin: 10px 0 6px;
   padding-left: 18px;
 }
 
@@ -3835,7 +3835,8 @@ body { display: flex; flex-direction: column; }
 }
 
 /* ========== NEW SESSION POPOVER ========== */
-.new-session-popover {
+.new-session-popover,
+.terminal-context-menu {
   position: fixed;
   z-index: 1001;
   background: #1e1e2a;
