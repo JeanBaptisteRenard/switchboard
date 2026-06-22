@@ -163,13 +163,20 @@ test('searchViaWorker: falls back to searchByType when worker is not ready', asy
 });
 
 // ---------------------------------------------------------------------------
-// 4. exit event drains pending promises (resolve with [], do not hang)
+// 4. exit event drains pending promises (resolve with [], do not hang);
+//    circuit-breaker open → subsequent searchViaWorker routes to sync fallback
 // ---------------------------------------------------------------------------
 
 test('exit event drains in-flight promises with [] before restarting', async () => {
-  // Use maxRestarts=0 so the exit handler does not try to respawn (would need
-  // a second workerFactory call and complicate the test).
-  const { client, getMock, fireExit } = makeClient({ maxRestarts: 0 });
+  // Use maxRestarts=0 so the circuit-breaker trips on the first failure.
+  const syncResults = [{ id: 99, snippet: 'sync-fallback result' }];
+  let syncCallCount = 0;
+  const searchByType = (type, query, limit, titleOnly) => {
+    syncCallCount++;
+    return syncResults;
+  };
+
+  const { client, getMock, fireExit } = makeClient({ maxRestarts: 0, searchByType });
   const mock = getMock();
 
   // Queue two in-flight searches without the worker replying.
@@ -188,6 +195,12 @@ test('exit event drains in-flight promises with [] before restarting', async () 
   const [r1, r2] = await Promise.all([p1, p2]);
   assert.deepEqual(r1, [], 'first pending promise should resolve with []');
   assert.deepEqual(r2, [], 'second pending promise should resolve with []');
+
+  // Circuit-breaker is now open (failureCount=1 >= maxRestarts=0).
+  // Subsequent searches must route to the synchronous fallback.
+  const r3 = await client.searchViaWorker('session', 'post-breaker', false);
+  assert.deepEqual(r3, syncResults, 'post-breaker search should use sync fallback');
+  assert.equal(syncCallCount, 1, 'searchByType should have been called once for post-breaker query');
 });
 
 // ---------------------------------------------------------------------------
@@ -209,4 +222,49 @@ test('drainPending is idempotent: double-drain does not throw', () => {
   client.drainPending();
   // Drain again (exit handler path) — should be a no-op, no throw.
   assert.doesNotThrow(() => client.drainPending());
+});
+
+// ---------------------------------------------------------------------------
+// 6. shutdown() while backoff timer is armed — no worker spawned afterward
+// ---------------------------------------------------------------------------
+
+test('shutdown() while backoff is armed cancels restart, no worker spawned after', async () => {
+  // Use maxRestarts=2 so the first failure arms backoff (failureCount=1 < 2).
+  // We need to track worker creation attempts after shutdown.
+  let workerCreateCount = 0;
+  let createdMock = null;
+  let createdListeners = null;
+
+  const client = createSearchWorkerClient({
+    workerFactory: () => {
+      workerCreateCount++;
+      const { mock, listeners } = makeMockWorker({ goOnlineImmediately: true });
+      createdMock = mock;
+      createdListeners = listeners;
+      return mock;
+    },
+    searchByType: () => [],
+    log: { warn: () => {}, error: () => {} },
+    dbPath: '/fake/db.sqlite',
+    maxRestarts: 2,
+    restartWindowMs: 1000000,
+    // Use a very short backoff delay so the timer would fire quickly if not cancelled.
+    // We cannot override delay directly, but we can use failureCount=1, delay=250ms.
+  });
+
+  client.startWorker();
+  assert.equal(workerCreateCount, 1, 'worker created once on startWorker()');
+
+  // Trigger a failure (non-zero exit) to arm the backoff timer.
+  // failureCount becomes 1 (< maxRestarts=2) → restartTimer is armed.
+  createdListeners['exit'](1);
+
+  // Immediately shut down — restartTimer must be cleared.
+  client.shutdown();
+
+  // Wait longer than the backoff delay (250ms for failureCount=1) to confirm
+  // the timer does not fire and no new worker is created.
+  await new Promise((resolve) => setTimeout(resolve, 400));
+
+  assert.equal(workerCreateCount, 1, 'no additional worker should be created after shutdown()');
 });

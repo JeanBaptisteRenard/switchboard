@@ -38,6 +38,8 @@ function createSearchWorkerClient(deps) {
   // Circuit-breaker state
   let failureCount = 0;
   let failureWindowTimer = null;
+  let restartTimer = null;
+  let shuttingDown = false;
 
   /**
    * Resolve all in-flight search promises with [] and clear the map.
@@ -53,6 +55,7 @@ function createSearchWorkerClient(deps) {
   }
 
   function startWorker() {
+    if (shuttingDown) return;
     worker = workerFactory(dbPath);
 
     worker.on('online', () => {
@@ -117,7 +120,8 @@ function createSearchWorkerClient(deps) {
           `(failure ${failureCount}/${maxRestarts}); ` +
           `restarting in ${delay} ms`
         );
-        setTimeout(() => startWorker(), delay);
+        restartTimer = setTimeout(() => startWorker(), delay);
+        if (restartTimer.unref) restartTimer.unref();
       }
     });
   }
@@ -144,6 +148,9 @@ function createSearchWorkerClient(deps) {
    * after the DB connection has already been closed.
    */
   function shutdown() {
+    shuttingDown = true;
+    clearTimeout(restartTimer);
+    restartTimer = null;
     if (worker) {
       worker.removeAllListeners('exit'); // suppress backoff / restart
       worker.terminate();
