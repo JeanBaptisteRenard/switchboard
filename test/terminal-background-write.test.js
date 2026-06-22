@@ -307,9 +307,9 @@ test('Stage A: raw replay buffer cap drops oldest chunks when exceeded', () => {
   try {
     window.createTerminalEntry({ sessionId: 's1' });
 
-    const capBytes = inCtx('RAW_REPLAY_BUFFER_CAP_BYTES');
+    const capBytes = inCtx('RAW_REPLAY_BUFFER_CAP_CHARS');
     assert.ok(typeof capBytes === 'number' && capBytes >= 1_000_000,
-      'RAW_REPLAY_BUFFER_CAP_BYTES should be at least 1 MB');
+      'RAW_REPLAY_BUFFER_CAP_CHARS should be at least 1 M chars');
 
     // Inject directly into rawReplayBuffers to bypass the write buffer path
     inCtx(`rawReplayBuffers.set('s1', [])`);
@@ -328,7 +328,7 @@ test('Stage A: raw replay buffer cap drops oldest chunks when exceeded', () => {
 
     const arr = inCtx(`rawReplayBuffers.get('s1')`);
     const total = arr.reduce((s, c) => s + c.length, 0);
-    assert.ok(total <= capBytes, 'total bytes after cap enforcement must be within cap');
+    assert.ok(total <= capBytes, 'total chars after cap enforcement must be within cap');
     // The sentinel (pushed first) should have been dropped (oldest)
     const combined = arr.join('');
     assert.ok(!combined.includes('SENTINEL_START'), 'oldest chunk dropped when cap exceeded');

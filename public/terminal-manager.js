@@ -171,9 +171,12 @@ const terminalWriteBuffers = new Map(); // sessionId → { chunks, syncDepth, ra
 // size and is imperceptible for streaming text (worst-case added latency: 33 ms).
 const MIN_FLUSH_INTERVAL_MS = 33; // ~30 fps
 
-// Background sessions (non-visible) flush much less often — no point parsing VT
-// at 30 fps when the terminal is hidden (display:none or in a non-visible grid card).
-// ~0.5 fps reduces parse CPU for idle background sessions without correctness risk.
+// Background sessions (non-visible) flush much less often. Stage A already eliminates
+// VT parse cost (write() is skipped), so the benefit of Stage B is reducing background
+// coalescing/buffer-append overhead (fewer rawReplayBuffers.push + enforceReplayBufferCap
+// calls). The wider coalescing window also extends the period where a quick re-visibility
+// avoids the raw-buffer path entirely — data that arrives during the 2s gap goes straight
+// to terminal.write() on the next frame if the session becomes visible before the timer fires.
 const BACKGROUND_FLUSH_INTERVAL_MS = 2000;
 
 const lastFlushAt = new Map(); // sessionId → performance.now() of last flush
@@ -199,14 +202,17 @@ const rawReplayBuffers = new Map();
 // Hard cap to avoid unbounded memory for long-background high-throughput sessions.
 // Oldest chunks are dropped when total exceeds the cap (lossy, matching the
 // existing scrollback LRU trade-off: the user accepted data loss on background eviction).
-const RAW_REPLAY_BUFFER_CAP_BYTES = 2 * 1024 * 1024; // 2 MB
+// Budget is in UTF-16 code units (String.prototype.length), not bytes. Terminal output
+// is overwhelmingly ASCII, so chars≈bytes in practice — the cheap .length measure avoids
+// TextEncoder allocation on every flush.
+const RAW_REPLAY_BUFFER_CAP_CHARS = 2 * 1024 * 1024; // ~2 MB for ASCII-dominant output
 
 // Enforce the per-session cap: drop oldest chunks from the front until total ≤ cap.
 function enforceReplayBufferCap(sessionId) {
   const arr = rawReplayBuffers.get(sessionId);
   if (!arr) return;
   let total = arr.reduce((s, c) => s + c.length, 0);
-  while (total > RAW_REPLAY_BUFFER_CAP_BYTES && arr.length > 0) {
+  while (total > RAW_REPLAY_BUFFER_CAP_CHARS && arr.length > 0) {
     const dropped = arr.shift();
     total -= dropped.length;
   }
@@ -294,8 +300,8 @@ function scheduleFlush(sessionId, buf) {
   const last = lastFlushAt.get(sessionId);
   const elapsed = last === undefined ? Infinity : performance.now() - last;
 
-  // Stage B: use a longer flush interval for non-visible sessions to reduce VT
-  // parse frequency. Visible sessions keep the 33 ms / ~30 fps budget unchanged.
+  // Stage B: use a longer flush interval for non-visible sessions to reduce
+  // background coalescing overhead. Visible sessions keep the 33 ms / ~30 fps budget unchanged.
   const effectiveMin = isSessionVisible(sessionId) ? MIN_FLUSH_INTERVAL_MS : BACKGROUND_FLUSH_INTERVAL_MS;
 
   if (elapsed >= effectiveMin) {

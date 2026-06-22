@@ -210,7 +210,7 @@ const rendererCrossFileGlobals = {
   BACKGROUND_FLUSH_INTERVAL_MS: 'readonly',
   lastFlushAt: 'readonly',
   rawReplayBuffers: 'readonly',
-  RAW_REPLAY_BUFFER_CAP_BYTES: 'readonly',
+  RAW_REPLAY_BUFFER_CAP_CHARS: 'readonly',
   enforceReplayBufferCap: 'readonly',
   isSessionVisible: 'readonly',
   drainReplayBuffer: 'readonly',
