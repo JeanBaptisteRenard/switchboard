@@ -19,7 +19,6 @@
 // writers on the main thread and vice-versa.
 
 const { parentPort, workerData } = require('worker_threads');
-const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 
@@ -33,14 +32,23 @@ if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 // Open read-only to avoid any accidental write and to allow this connection to
 // coexist without locking the WAL writer on the main thread.
 // readonly:true → SQLite OPEN_READONLY flag; throws if the file does not exist.
-// If the DB doesn't exist yet (first launch before indexing), catch below and
-// respond with empty results rather than crashing the worker.
+// If better-sqlite3 fails to load (ABI mismatch) or the DB is unavailable,
+// catch below and respond to every incoming query with [] rather than crashing —
+// an uncaught throw here would cause the worker to exit, which triggers an
+// immediate restart in main.js, creating an infinite tight loop.
 let db;
 try {
+  // require() is inside the try block so a native-module load failure (e.g.
+  // ABI mismatch after npm rebuild) is caught rather than thrown at top level.
+  const Database = require('better-sqlite3');
   db = new Database(DB_PATH, { readonly: true });
-  db.pragma('journal_mode = WAL');
+  // WAL coexistence: the main thread's connection sets journal_mode=WAL at startup.
+  // A readonly connection in WAL mode never blocks writers and vice-versa.
+  // Setting journal_mode on a SQLITE_OPEN_READONLY connection is a no-op, so we
+  // rely on the DB-level mode rather than issuing a redundant pragma here.
 } catch {
-  // DB not yet created — respond to every incoming query with [].
+  // DB not yet created or native module unavailable — respond to every incoming
+  // query with [] so the renderer gets a result rather than hanging.
   parentPort.on('message', (msg) => {
     parentPort.postMessage({ id: msg.id, results: [] });
   });

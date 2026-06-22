@@ -103,67 +103,29 @@ const {
 // A dedicated worker is used instead of the existing scan-projects worker because
 // that worker is used for cold-start indexing and may be occupied with a long
 // sequential scan when the user types a query.
-let searchWorker = null;
-let searchWorkerReady = false;
-const pendingSearches = new Map(); // correlationId → { resolve, reject }
-let searchCorrelationCounter = 0;
+//
+// Protocol logic (correlation IDs, pending map, drain, backoff, circuit-breaker)
+// lives in search-worker-client.js so it can be unit-tested without Electron.
+const { createSearchWorkerClient } = require('./search-worker-client');
 
-function startSearchWorker() {
-  searchWorker = new Worker(path.join(__dirname, 'workers', 'search-query.js'), {
-    workerData: { dbPath: DB_PATH },
-  });
-  searchWorker.on('online', () => {
-    searchWorkerReady = true;
-  });
-  searchWorker.on('message', (msg) => {
-    const pending = pendingSearches.get(msg.id);
-    if (!pending) return;
-    pendingSearches.delete(msg.id);
-    if (msg.error) {
-      // Resolve with empty results rather than rejecting — same behaviour as
-      // the synchronous searchByType catch branch.
-      pending.resolve([]);
-    } else {
-      pending.resolve(msg.results);
-    }
-  });
-  searchWorker.on('error', (err) => {
-    log.error('[search-worker] error:', err.message);
-    // Drain all pending promises with empty results.
-    for (const [id, pending] of pendingSearches) {
-      pending.resolve([]);
-      pendingSearches.delete(id);
-    }
-    searchWorkerReady = false;
-  });
-  searchWorker.on('exit', (code) => {
-    searchWorkerReady = false;
-    searchWorker = null;
-    if (code !== 0) {
-      log.warn(`[search-worker] exited with code ${code}; restarting`);
-      startSearchWorker();
-    }
-  });
-}
+const searchClient = createSearchWorkerClient({
+  workerFactory: (dbPath) => new Worker(
+    path.join(__dirname, 'workers', 'search-query.js'),
+    { workerData: { dbPath } }
+  ),
+  searchByType,
+  log,
+  dbPath: DB_PATH,
+});
 
-startSearchWorker();
+searchClient.startWorker();
 
 /**
  * Send a search query to the worker and return a Promise<results[]>.
  * Falls back to the synchronous searchByType on the main thread if the
- * worker is not yet ready.
+ * worker is not yet ready (first-launch race or circuit-breaker open).
  */
-function searchViaWorker(type, query, titleOnly) {
-  if (!searchWorkerReady || !searchWorker) {
-    // Worker not ready yet (first-launch race) — fall back to synchronous call.
-    return Promise.resolve(searchByType(type, query, 50, !!titleOnly));
-  }
-  return new Promise((resolve) => {
-    const id = String(++searchCorrelationCounter);
-    pendingSearches.set(id, { resolve });
-    searchWorker.postMessage({ id, type, query, limit: 50, titleOnly: !!titleOnly });
-  });
-}
+const searchViaWorker = searchClient.searchViaWorker;
 
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 const PLANS_DIR = path.join(os.homedir(), '.claude', 'plans');
@@ -2281,10 +2243,7 @@ app.on('before-quit', () => {
 app.on('will-quit', () => {
   // Terminate the search worker gracefully before closing the DB, so the
   // worker's read-only connection is released before the WAL checkpoint.
-  if (searchWorker) {
-    searchWorker.removeAllListeners('exit'); // suppress the restart logic
-    searchWorker.terminate();
-    searchWorker = null;
-  }
+  // shutdown() suppresses the restart logic before calling terminate().
+  searchClient.shutdown();
   closeDb();
 });
