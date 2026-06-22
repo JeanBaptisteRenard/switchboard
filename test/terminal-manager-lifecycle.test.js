@@ -329,6 +329,9 @@ test('30fps cap: flushTerminalBuffer records lastFlushAt timestamp when it write
   const { window, spies, inCtx, destroy } = setupTerminalDom();
   try {
     window.createTerminalEntry({ sessionId: 's1' });
+    // Make the session visible so flushTerminalBuffer calls terminal.write()
+    // (non-visible sessions now redirect to rawReplayBuffers instead).
+    window.openSessions.get('s1').element.classList.add('visible');
 
     assert.strictEqual(inCtx('lastFlushAt.has("s1")'), false, 'no entry before first flush');
 
@@ -349,6 +352,10 @@ test('30fps cap: scheduleFlush takes rAF path when interval has elapsed, timerId
   const { window, inCtx, destroy } = setupTerminalDom();
   try {
     window.createTerminalEntry({ sessionId: 's1' });
+    // Make the session visible so scheduleFlush uses MIN_FLUSH_INTERVAL_MS (33 ms), not
+    // BACKGROUND_FLUSH_INTERVAL_MS. These tests validate the 30fps throttle logic for
+    // visible sessions; the background interval is tested in terminal-background-write.test.js.
+    window.openSessions.get('s1').element.classList.add('visible');
 
     // Case 1: no prior flush (lastFlushAt has no entry) → elapsed is infinite → rAF path.
     inCtx(`terminalWriteBuffers.set('s1', { chunks: ['a'], syncDepth: 0, rafId: 0, timerId: 0 })`);
@@ -381,6 +388,8 @@ test('30fps cap: destroySession clears lastFlushAt and cancels a pending throttl
   const { window, spies, inCtx, destroy } = setupTerminalDom();
   try {
     window.createTerminalEntry({ sessionId: 's1' });
+    // Make the session visible so flushTerminalBuffer calls terminal.write().
+    window.openSessions.get('s1').element.classList.add('visible');
 
     // Populate lastFlushAt by direct flush.
     inCtx(`terminalWriteBuffers.set('s1', { chunks: ['a'], syncDepth: 0, rafId: 0, timerId: 0 })`);

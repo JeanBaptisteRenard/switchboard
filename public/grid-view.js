@@ -167,6 +167,9 @@ function wrapInGridCard(sessionId) {
   // Build the card DOM
   card.appendChild(header);
   entry.element.classList.add('visible', 'grid-mode');
+  // Drain any data that accumulated while this session was non-visible.
+  // Must happen after classList.add so isSessionVisible returns true.
+  if (typeof drainReplayBuffer === 'function') drainReplayBuffer(sessionId);
   card.appendChild(entry.element);
   card.appendChild(footer);
 
