@@ -598,6 +598,14 @@ ipcMain.handle('clipboard-write-text', (_event, text) => {
   if (typeof text === 'string') clipboard.writeText(text);
 });
 
+// --- IPC: does the clipboard hold an image? ---
+// A terminal is a text stream, so an image can't ride a text paste. When one is on
+// the clipboard the renderer forwards Ctrl+V (0x16) to the PTY instead of doing a
+// text paste, so the child — e.g. Claude Code — runs its own native clipboard paste
+// and reads the image straight off the system clipboard (the same thing a regular
+// terminal does). This just reports whether to take that path.
+ipcMain.handle('clipboard-has-image', () => !clipboard.readImage().isEmpty());
+
 // --- IPC: MCP bridge ---
 ipcMain.on('mcp-diff-response', (_event, sessionId, diffId, action, editedContent) => {
   resolvePendingDiff(sessionId, diffId, action, editedContent);
