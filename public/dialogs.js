@@ -65,12 +65,13 @@ async function launchScheduleCreator(project) {
   const entry = createTerminalEntry(session);
   // Resume the pre-seeded session
   options.appendSystemPrompt = result.systemPrompt;
-  const openResult = await window.api.openTerminal(result.sessionId, project.projectPath, false, options);
+  const openResult = await window.api.openTerminal(result.sessionId, project.projectPath, false, options, entry.initialSize);
   if (!openResult.ok) {
     entry.terminal.write(`\r\nError: ${openResult.error}\r\n`);
     entry.closed = true;
     return;
   }
+  syncPtySizeAfterOpen(entry);
   if (typeof setSessionMcpActive === 'function') setSessionMcpActive(result.sessionId, !!openResult.mcpActive);
   showSession(result.sessionId);
   pollActiveSessions();
@@ -158,12 +159,13 @@ async function launchTerminalSession(project) {
 
   const entry = createTerminalEntry(session);
 
-  const result = await window.api.openTerminal(sessionId, projectPath, true, { type: 'terminal' });
+  const result = await window.api.openTerminal(sessionId, projectPath, true, { type: 'terminal' }, entry.initialSize);
   if (!result.ok) {
     entry.terminal.write(`\r\nError: ${result.error}\r\n`);
     entry.closed = true;
     return;
   }
+  syncPtySizeAfterOpen(entry);
 
   showSession(sessionId);
   pollActiveSessions();

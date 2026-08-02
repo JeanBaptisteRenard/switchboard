@@ -126,22 +126,36 @@ function clampRowsToContentBox(proposedRows, clientHeight, verticalPadding, cell
   return Math.min(proposedRows, maxRows);
 }
 
+// Measure the dimensions the terminal should have for its current container,
+// clamped to the container's true content-box height (see clampRowsToContentBox).
+// Returns null when the container cannot be measured (hidden, unrendered, or
+// xterm has no valid cell size yet) — FitAddon.proposeDimensions() itself
+// returns undefined when cell width/height are 0.
+//
+// This is the ONLY DOM-measuring call in the resize path. Everything that wants
+// to re-fit goes through it, so the cost of a refit is one proposeDimensions()
+// plus one getComputedStyle() per terminal — and only when something asked.
+function proposeFittedDimensions(entry) {
+  const dims = entry.fitAddon.proposeDimensions();
+  if (!dims || !(dims.rows > 1)) return null;
+  const el = entry.element; // .terminal-container
+  const cs = getComputedStyle(el);
+  const padV = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+  // Prefer the private xterm render-service path (same source FitAddon uses).
+  // Fall back to measuring the first row element if the internal path is gone.
+  const cellH =
+    entry.terminal._core?._renderService?.dimensions?.css?.cell?.height ||
+    el.querySelector('.xterm-rows')?.firstElementChild?.getBoundingClientRect().height ||
+    0;
+  return { cols: dims.cols, rows: clampRowsToContentBox(dims.rows, el.clientHeight, padV, cellH) };
+}
+
 // Fit terminal to container, clamping rows to the container's true content-box
 // height to avoid bottom-row clipping (see clampRowsToContentBox above).
 function safeFit(entry) {
-  const dims = entry.fitAddon.proposeDimensions();
-  if (dims && dims.rows > 1) {
-    const el = entry.element; // .terminal-container
-    const cs = getComputedStyle(el);
-    const padV = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
-    // Prefer the private xterm render-service path (same source FitAddon uses).
-    // Fall back to measuring the first row element if the internal path is gone.
-    const cellH =
-      entry.terminal._core?._renderService?.dimensions?.css?.cell?.height ||
-      el.querySelector('.xterm-rows')?.firstElementChild?.getBoundingClientRect().height ||
-      0;
-    const clampedRows = clampRowsToContentBox(dims.rows, el.clientHeight, padV, cellH);
-    entry.terminal.resize(dims.cols, clampedRows);
+  const dims = proposeFittedDimensions(entry);
+  if (dims) {
+    entry.terminal.resize(dims.cols, dims.rows);
   } else {
     entry.fitAddon.fit();
   }
@@ -157,6 +171,100 @@ function fitAndScroll(entry) {
       entry.terminal.scrollToBottom();
     }
   });
+}
+
+// --- PTY size synchronisation ---
+//
+// Symptom this closes: xterm.js and the PTY disagree on the column count.
+// Whatever the shell/TUI writes is already wrapped for the width IT believes
+// in; xterm re-wraps against a different width, and the TUI's next cursor-up
+// lands one line too low — "lignes qui sautent".
+//
+// Three sources of drift existed:
+//   1. The PTY was spawned at a hard-coded 120x30 and only learned the real
+//      size on the first refit (see createTerminalEntry / open-terminal).
+//   2. Refits only ran on window resize, tab switch and session focus — a
+//      geometry change from wake-from-sleep, a DPI change or a move to another
+//      monitor produced none of those.
+//   3. Every refit re-sent a resize even when nothing had changed.
+//
+// Deliberately NOT fixed with a polling timer: proposeDimensions() reads the
+// DOM, and doing that on an interval for every open terminal costs real CPU
+// while idle. The mechanisms below are all event-driven — they cost nothing
+// when the geometry does not move.
+
+// Record the size last handed to the PTY for this session and report whether it
+// actually changed. This is what makes every refit point idempotent: a refit
+// that proposes the same dimensions produces no IPC and no pty.resize().
+function ptySizeChanged(entry, cols, rows) {
+  const last = entry.lastPtySize;
+  if (last && last.cols === cols && last.rows === rows) return false;
+  entry.lastPtySize = { cols, rows };
+  return true;
+}
+
+// Send one resize to the PTY unconditionally, right after open-terminal
+// resolved. Two reasons this is not deduplicated:
+//   - the main process arms its reattach "nudge" (cols+1 then cols, which
+//     forces a TUI repaint) on the FIRST terminal-resize it receives for a
+//     session; with the spawn size now already correct, no organic resize may
+//     ever arrive and a resumed session would never repaint;
+//   - it is the acknowledgement that the size we asked to spawn with is the
+//     size xterm actually ended up with.
+// Cost: exactly one fire-and-forget IPC per session open.
+function syncPtySizeAfterOpen(entry) {
+  if (!entry || !entry.terminal) return;
+  const { cols, rows } = entry.terminal;
+  if (!cols || !rows) return;
+  entry.lastPtySize = { cols, rows };
+  window.api.resizeTerminal(entry.session.sessionId, cols, rows);
+}
+
+// Debounce for container-geometry changes. A window drag fires the observer on
+// every frame; 80 ms collapses a drag into a single refit at the end of it
+// without being perceptible.
+const CONTAINER_RESIZE_DEBOUNCE_MS = 80;
+
+// Watch the terminal container's own geometry. This is the piece that covers
+// the cases no existing hook did (wake-from-sleep, DPI change, monitor change,
+// sidebar drag): the browser only calls back when the box really changed, so
+// the idle cost is zero. The observer is disconnected in destroySession —
+// a leaked observer would be exactly the recurring cost we are avoiding.
+function observeContainerResize(entry) {
+  if (typeof ResizeObserver !== 'function') return; // jsdom / very old runtimes
+  let timer = 0;
+  const observer = new ResizeObserver(() => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = 0;
+      // Cheap guard before any measuring call: a hidden container (inactive
+      // tab, grid card scrolled out) has nothing to fit.
+      if (!entry.element.isConnected || entry.element.clientHeight === 0) return;
+      safeFit(entry);
+    }, CONTAINER_RESIZE_DEBOUNCE_MS);
+  });
+  observer.observe(entry.element);
+  entry.stopObservingResize = () => {
+    clearTimeout(timer);
+    timer = 0;
+    try { observer.disconnect(); } catch {}
+    entry.stopObservingResize = null;
+  };
+}
+
+// Re-fit whatever is currently on screen. Wired to window resize, page
+// visibilitychange and window focus in app.js. Thanks to ptySizeChanged, a call
+// that finds nothing changed sends no IPC at all.
+function refitOpenTerminals() {
+  if (gridViewActive) {
+    for (const entry of openSessions.values()) {
+      fitAndScroll(entry);
+    }
+    return;
+  }
+  if (activeSessionId && openSessions.has(activeSessionId)) {
+    safeFit(openSessions.get(activeSessionId));
+  }
 }
 
 // --- Terminal write buffering ---
@@ -375,6 +483,15 @@ function createTerminalEntry(session, opts = {}) {
   terminal.loadAddon(searchAddon);
   terminal.loadAddon(new UnicodeGraphemesAddon.UnicodeGraphemesAddon());
   terminal.unicode.activeVersion = '15';
+  // Lay the container out (without painting it) for the duration of
+  // terminal.open() and the initial measurement below. .terminal-container is
+  // display:none until showSession adds .visible, and xterm's CharSizeService
+  // measures 0x0 in a display:none subtree — which makes
+  // FitAddon.proposeDimensions() return undefined, which is precisely why the
+  // PTY used to be spawned at a hard-coded 120x30. `.measuring` is
+  // display:block + visibility:hidden: real layout, no paint, and the
+  // container is position:absolute so no sibling reflows.
+  container.classList.add('measuring');
   terminal.open(container);
   container.style.backgroundColor = TERMINAL_THEME.background;
 
@@ -420,10 +537,37 @@ function createTerminalEntry(session, opts = {}) {
   searchBar.querySelector('.terminal-search-prev').addEventListener('click', () => searchAddon.findPrevious(searchInput.value, searchOpts));
   searchBar.querySelector('.terminal-search-close').addEventListener('click', closeSearchBar);
 
-  const entry = { terminal, element: container, fitAddon, searchAddon, openSearchBar, closeSearchBar, session, closed: false, webglAddon: null };
+  const entry = { terminal, element: container, fitAddon, searchAddon, openSearchBar, closeSearchBar, session, closed: false, webglAddon: null, lastPtySize: null, initialSize: null, stopObservingResize: null };
+
+  // Measure NOW, before the caller spawns the PTY, so the shell is born with
+  // the width it will actually be displayed at instead of 120x30. The caller
+  // passes entry.initialSize to window.api.openTerminal(); when the measure
+  // fails (returns null) the main process falls back to its historical
+  // defaults.
+  //
+  // Known residual: on the very first session of a fresh window,
+  // #terminal-header is still display:none, so #terminals is one header taller
+  // than it will be once showSession reveals it — the measured row count is a
+  // few rows high. showSession's fitAndScroll corrects it on the next frame,
+  // and thanks to ptySizeChanged that correction is a single resize instead of
+  // the permanent 120x30 mismatch it replaces.
+  try {
+    const dims = proposeFittedDimensions(entry);
+    if (dims) {
+      entry.initialSize = dims;
+      entry.lastPtySize = dims; // set BEFORE resize() so onResize sends no IPC
+      terminal.resize(dims.cols, dims.rows);
+    }
+  } catch {
+    // Measurement is best-effort: never let it block terminal creation.
+  } finally {
+    container.classList.remove('measuring');
+  }
+
   openSessions.set(sessionId, entry);
   lruTouch(sessionId);
   loadTerminalWebgl(entry);
+  observeContainerResize(entry);
 
   // Wire up IPC (use entry.session.sessionId so fork re-keying works)
   terminal.onData(data => {
@@ -434,6 +578,8 @@ function createTerminalEntry(session, opts = {}) {
   setupTerminalContextMenu(container, terminal, () => entry.session.sessionId, () => hoveredLinkUri);
   setupDragAndDrop(container, () => entry.session.sessionId);
   terminal.onResize(({ cols, rows }) => {
+    // Only tell the PTY when the size really moved — see ptySizeChanged.
+    if (!ptySizeChanged(entry, cols, rows)) return;
     window.api.resizeTerminal(entry.session.sessionId, cols, rows);
   });
   terminal.onTitleChange(title => {
@@ -489,6 +635,11 @@ function destroySession(sessionId) {
   // Tear down any open right-click menu for this session before disposing the
   // terminal — its action closures hold the (about-to-be-disposed) xterm.
   if (typeof closeTerminalContextMenuForSession === 'function') closeTerminalContextMenuForSession(sessionId);
+  // Drop the container ResizeObserver (and any pending debounce) first: an
+  // observer that outlives its entry would keep firing safeFit on a disposed
+  // terminal, and leaking one per session is exactly the kind of standing cost
+  // this change is supposed to avoid.
+  if (entry.stopObservingResize) entry.stopObservingResize();
   window.api.closeTerminal(sessionId);
   // Drop any pending write buffer before disposing — a scheduled rAF/timeout
   // flush would otherwise call terminal.write() on a disposed instance if

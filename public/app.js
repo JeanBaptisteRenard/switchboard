@@ -974,13 +974,14 @@ async function launchNewSession(project, sessionOptions) {
   const entry = createTerminalEntry(session);
 
   // Open terminal in main process with session options
-  const result = await window.api.openTerminal(sessionId, projectPath, true, sessionOptions || null);
+  const result = await window.api.openTerminal(sessionId, projectPath, true, sessionOptions || null, entry.initialSize);
   if (!result.ok) {
     entry.terminal.write(`\r\nError: ${result.error}\r\n`);
     entry.closed = true;
     showSession(sessionId);
     return;
   }
+  syncPtySizeAfterOpen(entry);
   if (typeof setSessionMcpActive === 'function') setSessionMcpActive(sessionId, !!result.mcpActive);
 
   showSession(sessionId);
@@ -1042,13 +1043,14 @@ async function openSession(session, customOptions) {
 
   // Open terminal in main process
   const resumeOptions = customOptions || await resolveDefaultSessionOptions({ projectPath });
-  const result = await window.api.openTerminal(sessionId, projectPath, false, resumeOptions);
+  const result = await window.api.openTerminal(sessionId, projectPath, false, resumeOptions, entry.initialSize);
   if (!result.ok) {
     entry.terminal.write(`\r\nError: ${result.error}\r\n`);
     entry.closed = true;
     showSession(sessionId);
     return;
   }
+  syncPtySizeAfterOpen(entry);
   if (typeof setSessionMcpActive === 'function') setSessionMcpActive(sessionId, !!result.mcpActive);
 
   showSession(sessionId);
@@ -1056,19 +1058,23 @@ async function openSession(session, customOptions) {
   pollActiveSessions();
 }
 
-// Handle window resize
-window.addEventListener('resize', () => {
-  if (gridViewActive) {
-    for (const entry of openSessions.values()) {
-      fitAndScroll(entry);
-    }
-    return;
-  }
-  if (activeSessionId && openSessions.has(activeSessionId)) {
-    const entry = openSessions.get(activeSessionId);
-    safeFit(entry);
-  }
+// --- Terminal geometry re-sync ---
+// All three listeners funnel into refitOpenTerminals() (terminal-manager.js),
+// which only sends a resize to the PTY when the measured size actually changed.
+// No polling: these are pure event handlers and cost nothing while idle.
+
+// Window resize — the historical hook (window drag, sidebar drag, maximise).
+window.addEventListener('resize', refitOpenTerminals);
+
+// Safety net for the geometry changes that fire no 'resize' on this window:
+// returning from sleep, the window being moved to a screen with a different
+// DPI, or the renderer being un-hidden after Chromium throttled it. Each one
+// used to leave xterm and the PTY disagreeing on the width until the user
+// happened to resize the window or switch session.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refitOpenTerminals();
 });
+window.addEventListener('focus', refitOpenTerminals);
 
 // --- Tab switching ---
 document.querySelectorAll('.sidebar-tab').forEach(tab => {
