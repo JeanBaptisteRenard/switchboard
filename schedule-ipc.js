@@ -42,7 +42,7 @@ cron: <5-field cron expression>
 enabled: true
 slug: <short-kebab-case-id>
 cli:
-  permission-mode: acceptEdits
+  permission-mode: auto
   allowed-tools: <select based on task needs>
   # only include these if the user specified them:
   # model: <model>
@@ -75,7 +75,7 @@ Examples:
 - **Code refactor** → \`Bash,Read,Write,Edit,Glob,Grep\`
 - **Report generator** → \`Bash,Read,Write,Glob,Grep,WebFetch\`
 
-Default permission-mode is \`acceptEdits\`. Always include at least \`Read\` and \`Glob\`.
+Default permission-mode is \`auto\` (Claude classifies each action, allowing routine work and stopping for risky ones). Always include at least \`Read\` and \`Glob\`.
 
 ## Rules
 

@@ -192,6 +192,31 @@ function assertSafe(field, value) {
   return value;
 }
 
+// Permission mode used when a schedule's frontmatter doesn't name one. Matches
+// SETTING_DEFAULTS.permissionMode in main.js: 'auto' lets Claude classify each
+// action, allowing routine work and stopping for risky ones, which is a better
+// fit for an unattended headless run than acceptEdits' blanket edit approval.
+//
+// This is only the FALLBACK. A schedule that sets `cli: permission-mode: <x>`
+// keeps <x> verbatim — see resolvePermissionMode.
+const DEFAULT_SCHEDULE_PERMISSION_MODE = 'auto';
+
+/**
+ * Pick the permission mode for a scheduled run.
+ *
+ * An explicitly-configured mode always wins, even if it equals the old default.
+ * Only an absent key (or a blank value, which `--permission-mode` would reject)
+ * falls through to DEFAULT_SCHEDULE_PERMISSION_MODE. Deliberately not written as
+ * `cli['permission-mode'] || DEFAULT` so the absent-vs-configured distinction is
+ * visible rather than riding on truthiness.
+ */
+function resolvePermissionMode(cli) {
+  const configured = cli['permission-mode'];
+  if (configured === undefined || configured === null) return DEFAULT_SCHEDULE_PERMISSION_MODE;
+  const trimmed = String(configured).trim();
+  return trimmed === '' ? DEFAULT_SCHEDULE_PERMISSION_MODE : trimmed;
+}
+
 /**
  * Build the argv for a scheduled claude invocation.
  * Returns `{ claudeArgs: string[] }` — a plain argv array, with zero shell interpretation.
@@ -202,7 +227,7 @@ function buildScheduleCommand(sessionId, schedule) {
   const args = [
     '--resume', assertSafe('sessionId', sessionId),
     '-p', 'Run the scheduled task',
-    '--permission-mode', assertSafe('permission-mode', cli['permission-mode'] || 'acceptEdits'),
+    '--permission-mode', assertSafe('permission-mode', resolvePermissionMode(cli)),
   ];
 
   if (cli.model) args.push('--model', assertSafe('model', cli.model));
