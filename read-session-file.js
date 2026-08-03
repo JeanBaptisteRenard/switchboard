@@ -128,6 +128,11 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
     let aiTitle = null;
     let agentId = null;
     let sidechainSeen = false;
+    // Real conversation time bounds. Resuming a session appends untimestamped
+    // bookkeeping records (last-prompt, mode, ai-title, …) which bump the file's
+    // mtime without any actual activity, so mtime can't be the displayed time.
+    let firstTimestamp = null;
+    let lastTimestamp = null;
     for (const line of lines) {
       // Per-line try/catch: a JSONL file being written concurrently by a live
       // Claude CLI session can have its tail captured mid-write — one truncated
@@ -135,6 +140,11 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
       // keep parsing.
       let entry;
       try { entry = JSON.parse(line); } catch { continue; }
+      if (entry.timestamp) {
+        // ISO-8601 UTC strings — lexicographic comparison is chronological
+        if (!firstTimestamp || entry.timestamp < firstTimestamp) firstTimestamp = entry.timestamp;
+        if (!lastTimestamp || entry.timestamp > lastTimestamp) lastTimestamp = entry.timestamp;
+      }
       if (entry.slug && !slug) slug = entry.slug;
       if (entry.agentId && !agentId) agentId = entry.agentId;
       if (entry.isSidechain) sidechainSeen = true;
@@ -201,8 +211,12 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
     return {
       sessionId: fileBase, folder, projectPath,
       summary, firstPrompt: summary,
-      created: stat.birthtime.toISOString(),
-      modified: stat.mtime.toISOString(),
+      // created/modified are display+sort values from message timestamps;
+      // fileMtime is the cache-invalidation key (compared against stat.mtime
+      // in refreshFolder). Old transcripts without timestamps fall back to stat.
+      created: firstTimestamp || stat.birthtime.toISOString(),
+      modified: lastTimestamp || stat.mtime.toISOString(),
+      fileMtime: stat.mtime.toISOString(),
       messageCount, textContent, slug, customTitle, aiTitle,
       dailyMetrics,
     };

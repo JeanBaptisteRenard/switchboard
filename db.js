@@ -3,9 +3,10 @@ const path = require('path');
 const os = require('os');
 
 // SWITCHBOARD_DATA_DIR lets dev/agent runs use a separate DB from the
-// installed AppImage so they don't race on session_cache. Default stays
-// ~/.switchboard so existing installs keep working. Resolve env var at
-// require-time (any later mutation would be ignored).
+// installed AppImage so they don't race on session_cache (main.js also
+// isolates Electron userData / the single-instance lock off the same
+// variable). Default stays ~/.switchboard so existing installs keep working.
+// Resolve env var at require-time (any later mutation would be ignored).
 const DATA_DIR = process.env.SWITCHBOARD_DATA_DIR
   ? path.resolve(process.env.SWITCHBOARD_DATA_DIR.replace(/^~(?=$|\/)/, os.homedir()))
   : path.join(os.homedir(), '.switchboard');
@@ -14,8 +15,9 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const DB_PATH = path.join(DATA_DIR, 'switchboard.db');
 
-// Migrate from old locations if needed
-const OLD_LOCATIONS = [
+// Migrate from old locations if needed — never when running against an
+// override dir, so a dev instance can't relocate the real app's legacy DB.
+const OLD_LOCATIONS = process.env.SWITCHBOARD_DATA_DIR ? [] : [
   path.join(os.homedir(), '.claude', 'browser', 'switchboard.db'),
   path.join(os.homedir(), '.claude', 'browser', 'session-browser.db'),
   path.join(os.homedir(), '.claude', 'session-browser.db'),
@@ -68,7 +70,8 @@ db.exec(`
     parentSessionId TEXT,
     agentId TEXT,
     subagentType TEXT,
-    description TEXT
+    description TEXT,
+    fileMtime TEXT
   )
 `);
 
@@ -180,6 +183,20 @@ const migrations = [
     try { db.exec('VACUUM'); } catch {}
     searchFtsRecreated = true;
   },
+  // v7: Split display time from cache invalidation. `modified` now holds the last
+  // message timestamp from the JSONL (resuming a session appends untimestamped
+  // bookkeeping records that bump mtime, making idle sessions show "just now");
+  // the new fileMtime column takes over as the re-index change-detection key.
+  // Clear cache so a re-index repopulates both columns.
+  //
+  // Upstream numbered this v4; here it lands as v7 because migrations are
+  // index-addressed (db_version == migrations.length) and our v4-v6 already
+  // shipped. Installs sitting at db_version 6 run exactly this one on upgrade.
+  (db) => {
+    try { db.exec('ALTER TABLE session_cache ADD COLUMN fileMtime TEXT'); } catch {}
+    try { db.exec('DELETE FROM session_cache'); } catch {}
+    try { db.exec('DELETE FROM cache_meta'); } catch {}
+  },
 ];
 
 const currentDbVersion = (() => {
@@ -257,24 +274,31 @@ const stmts = {
   cacheCount: db.prepare('SELECT COUNT(*) as cnt FROM session_cache'),
   cacheGetAll: db.prepare('SELECT * FROM session_cache'),
   cacheUpsert: db.prepare(`
-    INSERT INTO session_cache (sessionId, folder, projectPath, summary, firstPrompt, created, modified, messageCount, slug, aiTitle, parentSessionId, agentId, subagentType, description)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO session_cache (sessionId, folder, projectPath, summary, firstPrompt, created, modified, messageCount, slug, aiTitle, parentSessionId, agentId, subagentType, description, fileMtime)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(sessionId) DO UPDATE SET
       folder = excluded.folder, projectPath = excluded.projectPath,
       summary = excluded.summary, firstPrompt = excluded.firstPrompt,
       created = excluded.created, modified = excluded.modified,
       messageCount = excluded.messageCount, slug = excluded.slug,
-      aiTitle = excluded.aiTitle,
+      aiTitle = excluded.aiTitle, fileMtime = excluded.fileMtime,
       parentSessionId = excluded.parentSessionId, agentId = excluded.agentId,
       subagentType = excluded.subagentType, description = excluded.description
   `),
   cacheGetByParent: db.prepare('SELECT * FROM session_cache WHERE parentSessionId = ? ORDER BY created ASC'),
+  // Kept as SELECT * (upstream narrowed this to sessionId+fileMtime): our
+  // reconcile path in session-cache.js caches the whole row so a header-only
+  // refresh can merge display fields without re-reading the transcript body.
+  // fileMtime still comes through, so upstream's invalidation key works.
   cacheGetByFolder: db.prepare('SELECT * FROM session_cache WHERE folder = ?'),
   cacheGetFolder: db.prepare('SELECT folder FROM session_cache WHERE sessionId = ?'),
   cacheGetSession: db.prepare('SELECT * FROM session_cache WHERE sessionId = ?'),
   cacheDeleteSession: db.prepare('DELETE FROM session_cache WHERE sessionId = ?'),
   cacheDeleteFolder: db.prepare('DELETE FROM session_cache WHERE folder = ?'),
-  cacheTouchModified: db.prepare('UPDATE session_cache SET modified = ? WHERE sessionId = ?'),
+  // Bumps both columns: `modified` drives sidebar sort order, `fileMtime` is the
+  // re-index invalidation key (upstream's v7 split). Leaving fileMtime behind
+  // would make the touched row look dirty forever.
+  cacheTouchModified: db.prepare('UPDATE session_cache SET modified = ?, fileMtime = ? WHERE sessionId = ?'),
   // Session metrics statements (per-(session,date,model) token/tool/message counts)
   metricsDeleteBySession: db.prepare('DELETE FROM session_metrics WHERE sessionId = ?'),
   metricsDeleteByFolder: db.prepare('DELETE FROM session_metrics WHERE sessionId IN (SELECT sessionId FROM session_cache WHERE folder = ?)'),
@@ -384,7 +408,8 @@ const upsertCachedSessionsBatch = db.transaction((sessions) => {
       s.firstPrompt, s.created, s.modified, s.messageCount || 0,
       s.slug || null, s.aiTitle || null,
       s.parentSessionId || null, s.agentId || null,
-      s.subagentType || null, s.description || null
+      s.subagentType || null, s.description || null,
+      s.fileMtime || null
     );
   }
 });
@@ -693,7 +718,7 @@ function closeDb() {
 module.exports = {
   getMeta, getAllMeta, setName, toggleStar, setArchived,
   isCachePopulated, getAllCached, getCachedByFolder, getCachedByParent, getCachedFolder, getCachedSession, upsertCachedSessions,
-  touchCachedModified: (sessionId, modified) => stmts.cacheTouchModified.run(modified, sessionId),
+  touchCachedModified: (sessionId, modified, fileMtime = modified) => stmts.cacheTouchModified.run(modified, fileMtime, sessionId),
   deleteCachedSession, deleteCachedFolder,
   replaceSessionMetrics,
   getFolderMeta, getAllFolderMeta, setFolderMeta,

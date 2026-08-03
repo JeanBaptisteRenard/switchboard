@@ -107,6 +107,11 @@ const rendererCrossFileGlobals = {
   escapeHtml: 'readonly',
   shellEscape: 'readonly',
   encodeProjectPath: 'readonly',
+  // Both defined in public/utils.js (upstream a7698f4 / 94a7ec0). Upstream has
+  // no ESLint config, so new cross-file renderer symbols have to be declared
+  // here when syncing or no-undef fires across five consumers.
+  shortProjectPath: 'readonly',
+  PERMISSION_MODES: 'readonly',
   showSession: 'readonly',
   confirmAndStopSession: 'readonly',
   pollActiveSessions: 'readonly',
@@ -265,7 +270,7 @@ module.exports = [
   // Dual-mode helper: classic <script> in the renderer AND require()-d in tests.
   // Same browser globals as the rest of public/, plus `module` for the CJS footer.
   {
-    files: ['public/shortcuts.js', 'public/terminal-context-menu.js'],
+    files: ['public/shortcuts.js', 'public/terminal-context-menu.js', 'public/terminal-manager.js'],
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: 'script',

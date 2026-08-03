@@ -19,6 +19,15 @@ if (!app.isPackaged && !process.env.SWITCHBOARD_DATA_DIR) {
 const { appendToOutputBuffer, MAX_BUFFER_SIZE } = require('./output-buffer');
 const { startMcpServer, shutdownMcpServer, shutdownAll: shutdownAllMcp, resolvePendingDiff, rekeyMcpServer, cleanStaleLockFiles } = require('./mcp-bridge');
 const { fetchAndTransformUsage } = require('./claude-auth');
+
+// SWITCHBOARD_DATA_DIR isolates a dev/test instance from the installed app:
+// db.js puts switchboard.db under it, and pointing userData there gives the
+// instance its own single-instance lock (requestSingleInstanceLock keys on
+// userData), so both can run side by side.
+if (process.env.SWITCHBOARD_DATA_DIR) {
+  app.setPath('userData', path.resolve(process.env.SWITCHBOARD_DATA_DIR, 'electron'));
+}
+
 log.transports.file.level = app.isPackaged ? 'info' : 'debug';
 log.transports.console.level = app.isPackaged ? 'info' : 'debug';
 
@@ -41,7 +50,6 @@ const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslS
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 const { isSensitivePath, isAllowedMemoryPath: _isAllowedMemoryPath } = require('./ipc-path-validator');
-
 
 
 // --- Auto-updater (only in packaged builds) ---
@@ -320,7 +328,6 @@ sessionCache.init({
 const { readSessionFile, readFolderFromFilesystem, refreshFolder, reconcileCacheFromFilesystem,
         buildProjectsFromCache, notifyRendererProjectsChanged, sendStatus, populateCacheViaWorker } = sessionCache;
 const { resolveJsonlPath, enumerateSessionFiles } = require('./read-session-file');
-
 
 // --- IPC: browse-folder ---
 ipcMain.handle('browse-folder', async () => {
@@ -703,6 +710,10 @@ ipcMain.handle('get-projects', async (_event, showArchived) => {
       reconcileCacheFromFilesystem();
     }
 
+    // Pick up folders changed while the app was closed, or never indexed by an
+    // older build, so sessions/worktrees don't silently go missing. Stat-gated,
+    // so it's cheap when nothing has changed.
+    reconcileCacheFromFilesystem();
     return buildProjectsFromCache(showArchived);
   } catch (err) {
     console.error('Error listing projects:', err);
@@ -954,8 +965,10 @@ ipcMain.handle('get-memories', () => {
         if (projectPath && hiddenProjects.has(projectPath)) continue;
 
         // Use same 2-deep short path as Sessions tab (e.g. "dev/MyClaude")
+        // Splits on both separators — `cwd` is backslash-separated on Windows,
+        // where splitting on '/' alone left the whole path as one segment.
         const shortName = projectPath
-          ? projectPath.split('/').filter(Boolean).slice(-2).join('/')
+          ? projectPath.split(/[\\/]/).filter(Boolean).slice(-2).join('/')
           : folderToShortPath(folder);
         const files = [];
         const seenPaths = new Set();
@@ -1607,21 +1620,21 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         }
       }, 300);
     } else {
-      // Build claude command with session options
-      let claudeCmd;
+      // Build claude command, using array to prevent accidental shell injection
+      const claudeArgs = [];
       if (sessionOptions?.forkFrom) {
-        claudeCmd = `claude --resume "${sessionOptions.forkFrom}" --fork-session`;
+        claudeArgs.push('--resume', String(sessionOptions.forkFrom), '--fork-session');
       } else if (isNew) {
-        claudeCmd = `claude --session-id "${sessionId}"`;
+        claudeArgs.push('--session-id', String(sessionId));
       } else {
-        claudeCmd = `claude --resume "${sessionId}"`;
+        claudeArgs.push('--resume', String(sessionId));
       }
 
       if (sessionOptions) {
         if (sessionOptions.dangerouslySkipPermissions) {
-          claudeCmd += ' --dangerously-skip-permissions';
+          claudeArgs.push('--dangerously-skip-permissions');
         } else if (sessionOptions.permissionMode) {
-          claudeCmd += ` --permission-mode "${sessionOptions.permissionMode}"`;
+          claudeArgs.push('--permission-mode', String(sessionOptions.permissionMode));
         }
         // --worktree only applies when STARTING a session — it creates a fresh
         // isolated git worktree. Resuming (isNew === false) must reuse the
@@ -1630,31 +1643,35 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         // creator, fork, …). Otherwise a resume tries to spin up a new worktree
         // and fails to attach.
         if (isNew && sessionOptions.worktree) {
-          claudeCmd += ' --worktree';
+          claudeArgs.push('--worktree');
           if (sessionOptions.worktreeName) {
-            claudeCmd += ` "${sessionOptions.worktreeName}"`;
+            claudeArgs.push(String(sessionOptions.worktreeName));
           }
         }
         if (sessionOptions.chrome) {
-          claudeCmd += ' --chrome';
+          claudeArgs.push('--chrome');
         }
         if (sessionOptions.addDirs) {
-          const dirs = sessionOptions.addDirs.split(',').map(d => d.trim()).filter(Boolean);
+          const dirs = String(sessionOptions.addDirs).split(',').map(d => d.trim()).filter(Boolean);
           for (const dir of dirs) {
-            claudeCmd += ` --add-dir "${dir}"`;
+            claudeArgs.push('--add-dir', dir);
           }
         }
       }
 
       if (sessionOptions?.appendSystemPrompt) {
-        // Write to a temp file and use shell substitution to avoid quoting issues
-        const tmpPrompt = path.join(os.tmpdir(), `switchboard-prompt-${sessionId}.md`);
-        fs.writeFileSync(tmpPrompt, sessionOptions.appendSystemPrompt);
-        claudeCmd += ` --append-system-prompt "$(cat '${tmpPrompt}')"`;
+        claudeArgs.push('--append-system-prompt', String(sessionOptions.appendSystemPrompt));
       }
 
+      let claudeCmd = 'claude ' + quoteArgvForShell(shell, claudeArgs);
+
+      // preLaunchCmd is raw shell by design (e.g. "aws-vault exec profile --") — block newlines only
       if (sessionOptions?.preLaunchCmd) {
-        claudeCmd = sessionOptions.preLaunchCmd + ' ' + claudeCmd;
+        const pre = String(sessionOptions.preLaunchCmd);
+        if (/[\r\n]/.test(pre)) {
+          return { ok: false, error: 'preLaunchCmd must not contain newlines' };
+        }
+        claudeCmd = pre + ' ' + claudeCmd;
       }
 
       // Start MCP server for this session so Claude CLI sends diffs/file opens to Switchboard

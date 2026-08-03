@@ -160,26 +160,19 @@ function isWslShell(shellPath) {
   return base === 'wsl.exe' || base === 'wsl';
 }
 
-// Shell-quote one argv token per shell family.
-// This is the "safe re-serialisation" layer: buildScheduleCommand returns a
-// plain argv array (no quoting needed for execFile/spawn with shell:false), but
-// runScheduleCommand must pass a command *string* to the user's login shell so
-// that shell profile initialisation (PATH, pyenv, nvm, …) runs first.
-// Each token is wrapped so the outer shell passes it verbatim to claude.
+// Shell-quote one argv token per shell family
 function quoteArgForShell(shellPath, value) {
   const s = value == null ? '' : String(value);
   const base = path.basename(shellPath).toLowerCase();
-  const isBashLike = base.includes('bash') || base.includes('zsh') ||
-    base === 'sh' || base === 'dash' || base === 'ksh' ||
-    base === 'fish' || base === 'nu' || isWslShell(shellPath);
+  const isBashLike = base.includes('bash') || base.includes('zsh') || base === 'sh' || base === 'dash' || base === 'ksh' || base === 'fish' || base === 'nu' || isWslShell(shellPath);
   const isPowerShell = base.includes('powershell') || base.includes('pwsh');
 
   if (isBashLike) {
-    // POSIX single-quote: wrap in '...', escape embedded ' as '\''
+    // POSIX: wrap in single quotes, escape embedded single quotes as '\''
     return "'" + s.replace(/'/g, "'\\''") + "'";
   }
   if (isPowerShell) {
-    // PowerShell single-quoted string: escape ' as ''
+    // PowerShell: single-quoted string, escape ' as ''
     return "'" + s.replace(/'/g, "''") + "'";
   }
   // cmd.exe: double-quote, escape " as \" and ^-escape shell metachars

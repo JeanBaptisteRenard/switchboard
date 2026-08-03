@@ -43,8 +43,16 @@ test('readSessionFile: golden output matches fixture — full shape', () => {
   // slug from JSONL content
   assert.equal(row.slug, 'golden-slug-abc123');
 
-  // modified = stat.mtime.toISOString()
-  assert.equal(row.modified, stat.mtime.toISOString());
+  // modified = last MESSAGE timestamp in the transcript, not the file's mtime.
+  // Upstream split the two: resuming a session appends untimestamped bookkeeping
+  // records that bump mtime without real activity, so mtime made idle sessions
+  // read "just now". fileMtime carries the mtime and is the re-index key.
+  assert.equal(row.modified, '2024-03-15T10:01:01.000Z',
+    'modified must be the last message timestamp from the fixture');
+  assert.equal(row.created, '2024-03-15T10:00:00.000Z',
+    'created must be the first message timestamp from the fixture');
+  assert.equal(row.fileMtime, stat.mtime.toISOString(),
+    'fileMtime carries the filesystem mtime (cache-invalidation key)');
 
   // dailyMetrics: all 4 messages share the same date (2024-03-15)
   // The 2 assistant turns are on claude-opus-4-5; the 2 user turns bucket under ''
@@ -94,7 +102,13 @@ test('readSessionDisplayHeader: parity with readSessionFile on summary / slug / 
     'slug must match between full and header read');
   assert.equal(header.sessionId, full.sessionId,
     'sessionId (from filename) must match');
-  // modified: both derive from stat.mtime — should be identical
-  assert.equal(header.modified, full.modified,
-    'modified timestamp must match');
+  // `modified` deliberately does NOT match any more. The full read reports the
+  // last message timestamp; the header read only sees the first 256 KB of the
+  // transcript, so it cannot know that and still reports the file mtime — which
+  // is what full.fileMtime holds. Asserting the pairing rather than equality
+  // keeps the divergence intentional instead of latent.
+  assert.equal(header.modified, full.fileMtime,
+    'header modified falls back to file mtime, which the full read exposes as fileMtime');
+  assert.notEqual(header.modified, full.modified,
+    'header cannot recover the last-message time from a head-only read');
 });

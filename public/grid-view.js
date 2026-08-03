@@ -122,7 +122,7 @@ function wrapInGridCard(sessionId) {
   if (!session || !entry) return;
 
   const displayName = cleanDisplayName(session.name || session.aiTitle || session.summary) || sessionId;
-  const shortProject = session.projectPath ? session.projectPath.split('/').filter(Boolean).slice(-2).join('/') : '';
+  const shortProject = shortProjectPath(session.projectPath);
 
   // Create card wrapper
   const card = document.createElement('div');
@@ -160,7 +160,7 @@ function wrapInGridCard(sessionId) {
   footer.className = 'grid-card-footer';
   const statusSpan = document.createElement('span');
   const timeSpan = document.createElement('span');
-  timeSpan.textContent = formatDate(lastActivityTime.get(sessionId) || new Date(session.modified));
+  timeSpan.textContent = formatDate(new Date(session.modified));
   footer.appendChild(statusSpan);
   footer.appendChild(timeSpan);
 
@@ -182,7 +182,7 @@ function wrapInGridCard(sessionId) {
       targetHeading = document.createElement('div');
       targetHeading.className = 'grid-project-heading';
       targetHeading.dataset.projectPath = pp;
-      targetHeading.textContent = pp ? pp.split('/').filter(Boolean).slice(-2).join('/') : 'Other';
+      targetHeading.textContent = pp ? shortProjectPath(pp) : 'Other';
       // Insert heading in sortedOrder position
       const orderIndex = new Map(sortedOrder.map((e, i) => [e.projectPath, i]));
       const myIdx = orderIndex.get(pp);
@@ -335,7 +335,7 @@ function showGridView() {
       const heading = document.createElement('div');
       heading.className = 'grid-project-heading';
       heading.dataset.projectPath = projectPath;
-      heading.textContent = projectPath.split('/').filter(Boolean).slice(-2).join('/');
+      heading.textContent = shortProjectPath(projectPath);
       terminalsEl.appendChild(heading);
     }
     wrapInGridCard(sid);
