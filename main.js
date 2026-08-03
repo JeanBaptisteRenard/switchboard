@@ -1266,7 +1266,14 @@ ipcMain.handle('delete-setting', (_event, key) => {
 const scheduleIpc = require('./schedule-ipc');
 
 const SETTING_DEFAULTS = {
-  permissionMode: null,
+  // 'auto' is Claude Code's own default permission mode (checks each tool
+  // call for risk, auto-approves the low-risk ones, blocks the rest). It
+  // only applies when NEITHER global nor project settings have ever been
+  // saved for this key (see get-effective-settings below) — a user who
+  // explicitly picked "Default" (prompt for all actions, --permission-mode
+  // omitted) has that choice persisted as an explicit `null`, which is
+  // honored as-is and never silently promoted to 'auto'.
+  permissionMode: 'auto',
   dangerouslySkipPermissions: false,
   worktree: false,
   worktreeName: '',
@@ -1294,10 +1301,20 @@ ipcMain.handle('get-effective-settings', (_event, projectPath) => {
   const project = projectPath ? (getSetting('project:' + projectPath) || {}) : {};
   const effective = { ...SETTING_DEFAULTS };
   for (const key of Object.keys(SETTING_DEFAULTS)) {
-    if (global[key] !== undefined && global[key] !== null) {
+    // Only `undefined` (key never saved at this scope) falls through to
+    // SETTING_DEFAULTS. An explicit `null` — e.g. permissionMode's "Default"
+    // choice, saved by the settings panel as `value || null` — is a real,
+    // deliberate value and must be honored, not conflated with "unset".
+    // Previously this also skipped on `!== null`, which meant a user who
+    // explicitly saved "Default" could never be distinguished from a user
+    // who never touched settings at all; both collapsed to whatever
+    // SETTING_DEFAULTS[key] happened to be. That conflation is exactly what
+    // would have silently flipped an intentional "Default" (prompt for all
+    // actions) into 'auto' the moment permissionMode's default changed.
+    if (global[key] !== undefined) {
       effective[key] = global[key];
     }
-    if (project[key] !== undefined && project[key] !== null) {
+    if (project[key] !== undefined) {
       effective[key] = project[key];
     }
   }

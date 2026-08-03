@@ -181,13 +181,7 @@ async function showNewSessionDialog(project) {
   let selectedMode = effective.permissionMode || null;
   let dangerousSkip = effective.dangerouslySkipPermissions || false;
 
-  const modes = [
-    { value: null, label: 'Default', desc: 'Prompt for all actions' },
-    { value: 'acceptEdits', label: 'Accept Edits', desc: 'Auto-accept file edits, prompt for others' },
-    { value: 'plan', label: 'Plan Mode', desc: 'Read-only exploration, no writes' },
-    { value: 'dontAsk', label: "Don't Ask", desc: 'Auto-deny tools not explicitly allowed' },
-    { value: 'bypassPermissions', label: 'Bypass', desc: 'Auto-accept all tool calls' },
-  ];
+  const modes = PERMISSION_MODES;
 
   function renderModeGrid() {
     return modes.map(m => {
@@ -315,13 +309,7 @@ async function showResumeSessionDialog(session) {
   let selectedMode = effective.permissionMode || null;
   let dangerousSkip = effective.dangerouslySkipPermissions || false;
 
-  const modes = [
-    { value: null, label: 'Default', desc: 'Prompt for all actions' },
-    { value: 'acceptEdits', label: 'Accept Edits', desc: 'Auto-accept file edits, prompt for others' },
-    { value: 'plan', label: 'Plan Mode', desc: 'Read-only exploration, no writes' },
-    { value: 'dontAsk', label: "Don't Ask", desc: 'Auto-deny tools not explicitly allowed' },
-    { value: 'bypassPermissions', label: 'Bypass', desc: 'Auto-accept all tool calls' },
-  ];
+  const modes = PERMISSION_MODES;
 
   function renderModeGrid() {
     return modes.map(m => {

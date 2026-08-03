@@ -107,6 +107,7 @@ const rendererCrossFileGlobals = {
   escapeHtml: 'readonly',
   shellEscape: 'readonly',
   encodeProjectPath: 'readonly',
+  PERMISSION_MODES: 'readonly',
   showSession: 'readonly',
   confirmAndStopSession: 'readonly',
   pollActiveSessions: 'readonly',

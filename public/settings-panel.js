@@ -100,11 +100,12 @@
           </div>
           <div class="settings-field-control">
             <select class="settings-select" id="sv-perm-mode" ${fieldDisabled('permissionMode')}>
-              <option value="">Default (none)</option>
-              <option value="acceptEdits" ${permModeValue === 'acceptEdits' ? 'selected' : ''}>Accept Edits</option>
-              <option value="plan" ${permModeValue === 'plan' ? 'selected' : ''}>Plan Mode</option>
-              <option value="dontAsk" ${permModeValue === 'dontAsk' ? 'selected' : ''}>Don't Ask</option>
-              <option value="bypassPermissions" ${permModeValue === 'bypassPermissions' ? 'selected' : ''}>Bypass</option>
+              ${PERMISSION_MODES.map(m => {
+                const value = m.value === null ? '' : m.value;
+                const label = m.value === null ? 'Default (none)' : m.label;
+                const selected = (permModeValue || '') === value ? 'selected' : '';
+                return `<option value="${escapeHtml(value)}" ${selected}>${escapeHtml(label)}</option>`;
+              }).join('')}
             </select>
           </div>
         </div>
