@@ -1279,7 +1279,13 @@ ipcMain.handle('delete-setting', (_event, key) => {
 const scheduleIpc = require('./schedule-ipc');
 
 const SETTING_DEFAULTS = {
-  permissionMode: null,
+  // 'auto' is Claude Code's own default permission mode (it classifies each
+  // action, allows routine work, and stops for risky ones). It applies only
+  // when NEITHER global nor project settings have ever saved this key — see
+  // get-effective-settings below. A user who explicitly picked "Default"
+  // (prompt for all actions, --permission-mode omitted) has that stored as an
+  // explicit `null`, which is honored as-is and never promoted to 'auto'.
+  permissionMode: 'auto',
   dangerouslySkipPermissions: false,
   worktree: false,
   worktreeName: '',
@@ -1307,10 +1313,20 @@ ipcMain.handle('get-effective-settings', (_event, projectPath) => {
   const project = projectPath ? (getSetting('project:' + projectPath) || {}) : {};
   const effective = { ...SETTING_DEFAULTS };
   for (const key of Object.keys(SETTING_DEFAULTS)) {
-    if (global[key] !== undefined && global[key] !== null) {
+    // Only `undefined` (key never saved at this scope) falls through to the
+    // next-broader scope. An explicit `null` — e.g. permissionMode's "Default"
+    // choice, which settings-panel.js persists as `value || null` — is a real,
+    // deliberate value and must win.
+    //
+    // This previously also skipped on `!== null`, which made an explicitly
+    // saved "Default" indistinguishable from "never configured". Two
+    // consequences: a project that narrowed permissionMode back to Default
+    // silently kept inheriting the global mode, and any SETTING_DEFAULTS value
+    // other than null was unreachable at project scope.
+    if (global[key] !== undefined) {
       effective[key] = global[key];
     }
-    if (project[key] !== undefined && project[key] !== null) {
+    if (project[key] !== undefined) {
       effective[key] = project[key];
     }
   }
