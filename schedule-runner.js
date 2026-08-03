@@ -179,12 +179,9 @@ function createScheduleSession(schedule) {
   return { sessionId, jsonlPath };
 }
 
-// Defense-in-depth: reject control characters in frontmatter scalar values.
-// The real injection defense is the argv array (no shell interpretation), but
-// control chars have no legitimate use in CLI flag values and indicate tampering.
+// Defense-in-depth: reject control chars in frontmatter values (shell-quoter is the real defense)
 function isSafeScalar(s) {
   if (s == null) return true;
-  // Allow printable ASCII + extended unicode; reject C0 control chars (except \t)
   return !/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(String(s));
 }
 
@@ -197,9 +194,8 @@ function assertSafe(field, value) {
 
 /**
  * Build the argv for a scheduled claude invocation.
- * Returns `{ claudeArgs: string[] }` — a plain argv array with zero shell
- * interpretation. Callers that need a shell command string must shell-quote
- * via quoteArgvForShell() from shell-profiles.js.
+ * Returns `{ claudeArgs: string[] }` — a plain argv array, with zero shell interpretation.
+ * The caller is responsible for shell-quoting when constructing a shell command string.
  */
 function buildScheduleCommand(sessionId, schedule) {
   const cli = schedule.cli || {};
@@ -210,7 +206,6 @@ function buildScheduleCommand(sessionId, schedule) {
   ];
 
   if (cli.model) args.push('--model', assertSafe('model', cli.model));
-
   if (cli['max-budget-usd']) {
     const budget = String(cli['max-budget-usd']).trim();
     if (!/^\d+(\.\d+)?$/.test(budget)) {
@@ -218,18 +213,15 @@ function buildScheduleCommand(sessionId, schedule) {
     }
     args.push('--max-budget-usd', budget);
   }
-
   args.push('--allowedTools', assertSafe('allowed-tools', cli['allowed-tools'] || 'Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch'));
-
   if (cli['append-system-prompt']) {
-    // Newlines (\n, \r) and tabs are valid in prompt text; reject other control chars
+    // Allow newlines in prompt text, but not control chars other than \n, \r, \t
     const prompt = String(cli['append-system-prompt']);
     if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(prompt)) {
       throw new Error('Schedule field "append-system-prompt" contains unsafe characters');
     }
     args.push('--append-system-prompt', prompt);
   }
-
   if (cli['add-dirs']) {
     for (const dir of String(cli['add-dirs']).split(',').map(d => d.trim()).filter(Boolean)) {
       args.push('--add-dir', assertSafe('add-dirs', dir));

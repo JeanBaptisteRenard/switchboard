@@ -93,14 +93,21 @@ test('refreshFolder: only the changed-mtime file gets upserted; unchanged files 
     writeSession(fileB, projectPath);
     writeSession(fileC, projectPath);
 
-    // Simulate A and B already cached with their current mtime
+    // Simulate A and B already cached with their current mtime.
+    // The skip decision keys off fileMtime, NOT modified — `modified` is the
+    // last-message display time and deliberately differs from the file mtime.
+    // Giving the rows a clearly-unrelated `modified` proves the two aren't
+    // conflated: if refreshFolder ever compares `modified` again, A and B start
+    // looking dirty and this test fails.
     const statA = fs.statSync(fileA).mtime.toISOString();
     const statB = fs.statSync(fileB).mtime.toISOString();
     // C is not in cache at all → it's NEW and must be upserted
     const cachedRows = [
-      { sessionId: 'session-a', folder, projectPath, modified: statA, filePath: fileA,
+      { sessionId: 'session-a', folder, projectPath, fileMtime: statA,
+        modified: '2024-01-01T00:00:00.000Z', filePath: fileA,
         parentSessionId: null, agentId: null },
-      { sessionId: 'session-b', folder, projectPath, modified: statB, filePath: fileB,
+      { sessionId: 'session-b', folder, projectPath, fileMtime: statB,
+        modified: '2024-01-01T00:00:00.000Z', filePath: fileB,
         parentSessionId: null, agentId: null },
     ];
 

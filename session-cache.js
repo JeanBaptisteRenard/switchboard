@@ -164,7 +164,13 @@ function refreshFolder(folder, opts = {}) {
 
     if (cachedDbId !== null) currentIds.add(cachedDbId);
 
-    if (cachedEntry && cachedEntry.modified === fileMtime) {
+    // Invalidation compares against the dedicated fileMtime column, not
+    // `modified`. Upstream split the two (v7 migration): `modified` now holds
+    // the last *message* timestamp for display, so it no longer tracks the
+    // file's mtime and can't serve as the change-detection key. Comparing
+    // `modified` here would miss on nearly every row and re-read every dirty
+    // file on every watcher flush.
+    if (cachedEntry && cachedEntry.fileMtime === fileMtime) {
       continue; // unchanged, skip
     }
 
@@ -178,7 +184,14 @@ function refreshFolder(folder, opts = {}) {
           folder, projectPath,
           summary: h.summary || cachedEntry.summary,
           firstPrompt: h.firstPrompt || cachedEntry.firstPrompt,
+          // The header read only sees the first 256 KB of the transcript, so it
+          // cannot know the last message timestamp that upstream's `modified`
+          // now means. Keep bumping `modified` to the file mtime here so live
+          // sessions still sort to the top of the sidebar; the cold-start full
+          // read (readSessionFile) corrects it to the real last-message time.
+          // Same class of trade-off as the stale-FTS-body note above.
           modified: fileMtime,
+          fileMtime,
           slug: h.slug || cachedEntry.slug,
           aiTitle: h.aiTitle || cachedEntry.aiTitle,
           parentSessionId: h.parentSessionId || cachedEntry.parentSessionId,
@@ -191,9 +204,12 @@ function refreshFolder(folder, opts = {}) {
           namesToSet.push({ id: merged.sessionId, name: h.customTitle });
         }
       } else {
-        // Header read couldn't extract signal — just bump mtime so sort order stays current.
+        // Header read couldn't extract signal — just bump mtime so sort order
+        // stays current. fileMtime has to move too, otherwise this file stays
+        // permanently "dirty" and gets re-read on every watcher flush.
         touchCachedModified(cachedDbId, fileMtime);
         cachedEntry.modified = fileMtime;
+        cachedEntry.fileMtime = fileMtime;
       }
       changed = true;
       continue;

@@ -123,16 +123,22 @@ function buildUsageSection(usage) {
   const grid = document.createElement('div');
   grid.className = 'usage-grid';
 
-  const items = [
-    { key: 'session', label: 'Current session', resetKey: 'sessionReset' },
-    { key: 'weekAll', label: 'Week (all models)', resetKey: 'weekAllReset' },
-    { key: 'weekSonnet', label: 'Week (Sonnet)', resetKey: 'weekSonnetReset' },
-    { key: 'weekOpus', label: 'Week (Opus)', resetKey: 'weekOpusReset' },
-  ];
+  // Prefer the API's self-describing `limits` rows: they carry their own label
+  // and cover model-scoped windows (e.g. "Week (Fable)") that no fixed key list
+  // can anticipate. The flat keys below are the fallback for an older response
+  // shape — the per-model ones among them have gone null server-side.
+  const items = Array.isArray(usage.limits) && usage.limits.length
+    ? usage.limits.map(l => ({ label: l.label, pct: l.percent, reset: l.reset }))
+    : [
+      { key: 'session', label: 'Current session', resetKey: 'sessionReset' },
+      { key: 'weekAll', label: 'Week (all models)', resetKey: 'weekAllReset' },
+      { key: 'weekSonnet', label: 'Week (Sonnet)', resetKey: 'weekSonnetReset' },
+      { key: 'weekOpus', label: 'Week (Opus)', resetKey: 'weekOpusReset' },
+    ].map(i => ({ label: i.label, pct: usage[i.key], reset: usage[i.resetKey] }));
 
   for (const item of items) {
-    if (usage[item.key] === undefined) continue;
-    const pct = usage[item.key];
+    if (item.pct === undefined || item.pct === null) continue;
+    const pct = item.pct;
     const card = document.createElement('div');
     card.className = 'usage-card';
 
@@ -152,14 +158,14 @@ function buildUsageSection(usage) {
     track.className = 'usage-track';
     const fill = document.createElement('div');
     fill.className = 'usage-fill' + (pct >= 80 ? ' usage-fill-high' : '');
-    fill.style.width = Math.max(pct, 1) + '%';
+    fill.style.width = Math.min(Math.max(pct, 1), 100) + '%';
     track.appendChild(fill);
     card.appendChild(track);
 
-    if (usage[item.resetKey]) {
+    if (item.reset) {
       const reset = document.createElement('div');
       reset.className = 'usage-card-reset';
-      reset.textContent = 'Resets ' + usage[item.resetKey];
+      reset.textContent = 'Resets ' + item.reset;
       card.appendChild(reset);
     }
 

@@ -1,6 +1,6 @@
 // --- Sidebar rendering ---
 // Depends on globals: sidebarContent, openSessions, activeSessionId, activePtyIds,
-// pendingSessions, sessionMap, lastActivityTime, sortedOrder, searchMatchIds,
+// pendingSessions, sessionMap, sortedOrder, searchMatchIds,
 // searchMatchProjectPaths, showStarredOnly, showRunningOnly, showTodayOnly,
 // visibleSessionCount, sessionMaxAgeDays, attentionSessions, responseReadySessions,
 // sessionBusyState, cachedProjects, cachedAllProjects, gridCards, gridViewActive (app.js)
@@ -118,13 +118,10 @@ function buildSlugGroup(slug, sessions) {
   group.className = expanded ? 'slug-group js-stateful' : 'slug-group collapsed js-stateful';
   group.id = id;
 
-  const mostRecent = sessions.reduce((a, b) => {
-    const aTime = lastActivityTime.get(a.sessionId) || new Date(a.modified);
-    const bTime = lastActivityTime.get(b.sessionId) || new Date(b.modified);
-    return bTime > aTime ? b : a;
-  });
+  const mostRecent = sessions.reduce((a, b) =>
+    new Date(b.modified) > new Date(a.modified) ? b : a);
   const displayName = cleanDisplayName(mostRecent.name || mostRecent.aiTitle || mostRecent.summary || slug);
-  const mostRecentTime = lastActivityTime.get(mostRecent.sessionId) || new Date(mostRecent.modified);
+  const mostRecentTime = new Date(mostRecent.modified);
   const timeStr = formatDate(mostRecentTime);
 
   const header = document.createElement('div');
@@ -480,7 +477,9 @@ function renderProjects(projects, resort) {
     const header = document.createElement('div');
     header.className = 'project-header js-stateful';
     header.id = 'ph-' + fId;
-    const shortName = project.projectPath.split('/').filter(Boolean).slice(-2).join('/');
+    // shortProjectPath() is upstream's shared helper (utils.js); escapeHtml stays
+    // because this is innerHTML — upstream's variant interpolates the raw path.
+    const shortName = shortProjectPath(project.projectPath);
     const missingIcon = project.missing ? '<svg class="project-missing-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> ' : '';
     header.innerHTML = `<span class="arrow">&#9660;</span> ${missingIcon}<span class="project-name">${escapeHtml(shortName)}</span>`;
 
@@ -694,7 +693,7 @@ function rebindSidebarEvents(projects) {
         e.stopPropagation();
         const sessions = project.sessions.filter(s => !s.archived);
         if (sessions.length === 0) return;
-        const shortName = project.projectPath.split('/').filter(Boolean).slice(-2).join('/');
+        const shortName = shortProjectPath(project.projectPath);
         if (!confirm(`Archive all ${sessions.length} session${sessions.length > 1 ? 's' : ''} in ${shortName}?`)) return;
         for (const s of sessions) {
           if (activePtyIds.has(s.sessionId)) {
@@ -935,7 +934,7 @@ function buildSessionItem(session) {
   if (sessionBusyState.get(session.sessionId)) item.classList.add('cli-busy');
   item.dataset.sessionId = session.sessionId;
 
-  const modified = lastActivityTime.get(session.sessionId) || new Date(session.modified);
+  const modified = new Date(session.modified);
   const timeStr = formatDate(modified);
   const displayName = cleanDisplayName(session.name || session.aiTitle || session.summary);
 
@@ -961,13 +960,19 @@ function buildSessionItem(session) {
   summaryEl.className = 'session-summary';
   summaryEl.textContent = displayName;
 
-  const idEl = document.createElement('div');
-  idEl.className = 'session-id';
-  idEl.textContent = session.sessionId;
-
+  // Compact meta line: time + msgs on the left, first UUID segment on the right
+  // (replaces the full-width session-id line). The 30s label ticker in app.js
+  // updates .session-time only, so it must stay its own span.
   const metaEl = document.createElement('div');
   metaEl.className = 'session-meta';
-  metaEl.textContent = timeStr + (session.messageCount ? ' \u00b7 ' + session.messageCount + ' msgs' : '');
+  const timeEl = document.createElement('span');
+  timeEl.className = 'session-time';
+  timeEl.textContent = timeStr + (session.messageCount ? ' \u00b7 ' + session.messageCount + ' msgs' : '');
+  const shortIdEl = document.createElement('span');
+  shortIdEl.className = 'session-short-id';
+  shortIdEl.title = session.sessionId;
+  shortIdEl.textContent = session.sessionId.split('-')[0];
+  metaEl.append(timeEl, shortIdEl);
 
   if (session.type === 'terminal') {
     const badge = document.createElement('span');
@@ -976,7 +981,6 @@ function buildSessionItem(session) {
     summaryEl.prepend(badge);
   }
   info.appendChild(summaryEl);
-  info.appendChild(idEl);
   info.appendChild(metaEl);
 
   // Action buttons container

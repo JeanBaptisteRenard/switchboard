@@ -246,7 +246,15 @@ let searchMatchProjectPaths = null; // Set<string> of project paths matched by n
 const attentionSessions = new Set(); // sessions needing user action (OSC 9)
 const responseReadySessions = new Set(); // Claude finished, user hasn't looked (terminal state)
 const sessionBusyState = new Map(); // sessionId → boolean (currently active)
-const lastActivityTime = new Map(); // sessionId → Date of last terminal output
+// sessionId → Date of last terminal output.
+//
+// Upstream removed this map (and trackActivity below) when it made
+// session.modified the real last-message timestamp, which the sidebar and grid
+// now sort and label from. We keep it because terminal-manager.js still calls
+// trackActivity() on every data chunk — dropping the declaration alone turns
+// that call into a ReferenceError on the terminal hot path. It is currently
+// write-only; see the sync deliverable for the follow-up cleanup decision.
+const lastActivityTime = new Map();
 
 // Noise patterns — these don't count as activity
 const activityNoiseRe = /file-history-snapshot|^\s*$/;
@@ -644,7 +652,7 @@ async function runSearchQuery() {
       if (searchTitlesOnly) {
         const lowerQ = query.toLowerCase();
         for (const p of cachedAllProjects) {
-          const shortName = p.projectPath.split('/').filter(Boolean).slice(-2).join('/');
+          const shortName = shortProjectPath(p.projectPath);
           if (shortName.toLowerCase().includes(lowerQ)) {
             if (!searchMatchProjectPaths) searchMatchProjectPaths = new Set();
             searchMatchProjectPaths.add(p.projectPath);
@@ -842,15 +850,14 @@ scheduleActiveSessionsPoll();
 
 // Refresh sidebar timeago labels every 30s so "just now" ticks forward
 setInterval(() => {
-  if (lastActivityTime.size === 0) return;
-  for (const [sessionId, time] of lastActivityTime) {
+  for (const [sessionId, session] of sessionMap) {
+    if (!session.modified) continue;
     const item = document.getElementById('si-' + sessionId);
     if (!item) continue;
-    const meta = item.querySelector('.session-meta');
-    if (!meta) continue;
-    const session = sessionMap.get(sessionId);
-    const msgSuffix = session?.messageCount ? ' \u00b7 ' + session.messageCount + ' msgs' : '';
-    meta.textContent = formatDate(time) + msgSuffix;
+    const timeEl = item.querySelector('.session-time');
+    if (!timeEl) continue;
+    const msgSuffix = session.messageCount ? ' \u00b7 ' + session.messageCount + ' msgs' : '';
+    timeEl.textContent = formatDate(new Date(session.modified)) + msgSuffix;
   }
 }, 30000);
 
@@ -1394,6 +1401,71 @@ const updaterHandler = (type, data) => {
   }
 };
 window.api.onUpdaterEvent(updaterHandler);
+
+// --- Quota gauges in status bar ---
+// One bar per limit window the usage API reports — a 5-hour session window, a
+// weekly all-models window, and a weekly window per model. Which one bites
+// first varies, and the 5-hour is usually the emptiest while resetting within
+// the day, so showing a single window would read as "plenty left" while a
+// weekly one is the one actually running out. Rows come from the API
+// self-describing, so a newly launched model gets a bar without a code change.
+const quotaGaugeEl = document.getElementById('status-bar-quota');
+
+// Full labels ("Week (all models)") are too long for a status bar; the tooltip
+// carries them in full.
+function shortQuotaLabel(row) {
+  if (row.kind === 'session') return '5h';
+  if (row.kind === 'weekly_all') return 'Week';
+  return row.model || 'Week';
+}
+
+function buildQuotaBar(row) {
+  const wrap = document.createElement('span');
+  wrap.className = 'quota-item';
+
+  const label = document.createElement('span');
+  label.className = 'quota-label';
+  label.textContent = shortQuotaLabel(row);
+  wrap.appendChild(label);
+
+  const track = document.createElement('span');
+  track.className = 'quota-track';
+  const fill = document.createElement('span');
+  const pct = row.percent;
+  fill.className = 'quota-fill' + (pct >= 80 ? ' quota-high' : pct >= 60 ? ' quota-mid' : '');
+  fill.style.width = Math.min(Math.max(pct, 1), 100) + '%';
+  track.appendChild(fill);
+  wrap.appendChild(track);
+
+  const pctEl = document.createElement('span');
+  pctEl.className = 'quota-pct';
+  pctEl.textContent = pct + '%';
+  wrap.appendChild(pctEl);
+
+  wrap.title = `${row.label}: ${pct}%` + (row.reset ? ` \u2014 resets ${row.reset}` : '');
+  return wrap;
+}
+
+async function refreshQuotaGauge() {
+  try {
+    const usage = await window.api.getUsage();
+    // Prefer the API's self-describing rows; fall back to the flat 5-hour keys.
+    const rows = Array.isArray(usage?.limits) && usage.limits.length
+      ? usage.limits
+      : (usage?.session !== undefined
+        ? [{ kind: 'session', label: 'Current session', percent: usage.session, reset: usage.sessionReset }]
+        : []);
+    if (!rows.length) { quotaGaugeEl.style.display = 'none'; return; }
+
+    quotaGaugeEl.replaceChildren(...rows.map(buildQuotaBar));
+    quotaGaugeEl.style.display = '';
+  } catch {}
+}
+refreshQuotaGauge();
+setInterval(refreshQuotaGauge, 5 * 60 * 1000);
+quotaGaugeEl.addEventListener('click', () => {
+  document.querySelector('.sidebar-tab[data-tab="stats"]')?.click();
+});
 
 // --- Initialize file panel (MCP bridge UI) ---
 if (typeof initFilePanel === 'function') initFilePanel();
