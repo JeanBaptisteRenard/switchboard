@@ -1372,6 +1372,17 @@ body { display: flex; flex-direction: column; }
   display: block;
 }
 
+/* Transient state used by createTerminalEntry: lay the container out so xterm
+   can measure its cell size and FitAddon can propose real dimensions BEFORE
+   the PTY is spawned, without ever painting it. display:none would give a 0x0
+   measurement (the reason the PTY used to be spawned at a hard-coded 120x30);
+   visibility:hidden keeps the box out of sight, and position:absolute (from
+   .terminal-container) keeps siblings from reflowing. */
+.terminal-container.measuring {
+  display: block;
+  visibility: hidden;
+}
+
 .terminal-container.drag-over {
   outline: 2px solid rgba(128, 136, 255, 0.6);
   outline-offset: -2px;
