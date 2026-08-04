@@ -53,6 +53,7 @@ contextBridge.exposeInMainWorld('api', {
   openPath: (filePath) => ipcRenderer.invoke('open-path', filePath),
   writeClipboard: (text) => ipcRenderer.invoke('clipboard-write-text', text),
   readClipboard: () => ipcRenderer.invoke('read-clipboard'),
+  clipboardHasImage: () => ipcRenderer.invoke('clipboard-has-image'),
 
   // Send (fire-and-forget)
   sendInput: (id, data) => ipcRenderer.send('terminal-input', id, data),

@@ -90,11 +90,33 @@ function setupTerminalKeyBindings(terminal, container, getSessionId, { onFind } 
       return false;
     }
 
-    // On Windows/Linux, Ctrl+V is captured by xterm as a control character (0x16)
-    // instead of triggering a paste. Return false to block xterm's key pipeline and
-    // let Electron's Edit menu { role: 'paste' } handle the actual clipboard paste.
-    if (!isMac && e.key === 'v' && e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
-      return false;
+    // Paste. Two jobs:
+    //  1. Image paste — a terminal is a text stream, so an image can't ride a text
+    //     paste. On any paste shortcut (Ctrl/Cmd+V or Shift+Insert), ask the main
+    //     process whether the clipboard holds an image; if it does, forward Ctrl+V
+    //     (0x16) to the PTY so the child (e.g. Claude Code) does its own native
+    //     clipboard paste — it reads the image straight off the system clipboard and
+    //     shows an [image] placeholder, exactly like a regular terminal. A text-only
+    //     clipboard skips this and falls through to the normal text paste below.
+    //  2. Text paste — on Windows/Linux, Ctrl+V is otherwise captured by xterm as a
+    //     control character (0x16); return false to block xterm's key pipeline and
+    //     let Electron's Edit menu { role: 'paste' } do the text paste. On Mac the
+    //     default Cmd+V text paste already works, and Shift+Insert text paste arrives
+    //     via Chromium's native paste event, so for both we fall through (return true)
+    //     and only add the image forward.
+    const isCtrlOrCmdV = isMac
+      ? (e.key === 'v' && e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey)
+      : (e.key === 'v' && e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey);
+    const isShiftInsert = e.key === 'Insert' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
+    if (isCtrlOrCmdV || isShiftInsert) {
+      if (e.type === 'keydown') {
+        window.api.clipboardHasImage().then(hasImage => {
+          if (hasImage) window.api.sendInput(getSessionId(), '\x16');
+        });
+      }
+      // Only Ctrl+V needs xterm blocked so Electron's { role: 'paste' } runs;
+      // Cmd+V and Shift+Insert paste text through their own native paths.
+      if (isCtrlOrCmdV && !isMac) return false;
     }
 
     // On Windows/Linux, Ctrl+C with a selection should copy instead of sending SIGINT.
