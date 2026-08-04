@@ -197,6 +197,10 @@ const migrations = [
     try { db.exec('DELETE FROM session_cache'); } catch {}
     try { db.exec('DELETE FROM cache_meta'); } catch {}
   },
+  // Upstream replaced its own v4 with a () => {} no-op and moved the fileMtime
+  // ALTER into the schema-reconciliation pass below. Our array is
+  // index-addressed with v4-v6 already shipped, so v7 stays as the fast path
+  // for fork installs; the reconciliation block covers foreign-version DBs.
 ];
 
 const currentDbVersion = (() => {
@@ -211,6 +215,59 @@ for (let i = currentDbVersion; i < migrations.length; i++) {
 }
 if (migrations.length > currentDbVersion) {
   db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('db_version', ?)").run(JSON.stringify(migrations.length));
+}
+
+// --- Schema reconciliation ---
+// Version-numbered migrations cannot be trusted to add columns: a DB already
+// migrated to a HIGHER version by a build from a parallel branch skips this
+// branch's migrations entirely (a db_version-5 DB from the subagent branch
+// never ran our v4, so the fileMtime ALTER never happened and every prepare()
+// below crashed the app at startup). Required columns are therefore ensured by
+// inspecting the actual schema, independent of db_version. Errors here are
+// deliberately NOT swallowed: a transient failure (e.g. SQLITE_BUSY) must not
+// be recorded as migrated — the next launch simply retries.
+{
+  const cols = new Set(db.prepare('PRAGMA table_info(session_cache)').all().map(c => c.name));
+  let mustReindex = false;
+  if (!cols.has('aiTitle')) db.exec('ALTER TABLE session_cache ADD COLUMN aiTitle TEXT');
+  // Fork columns (shipped in our v4): a foreign-version DB may have skipped
+  // that migration the same way. Their absence means subagent rows were never
+  // indexed, so a re-index is needed too.
+  for (const col of ['parentSessionId', 'agentId', 'subagentType', 'description']) {
+    if (!cols.has(col)) {
+      db.exec(`ALTER TABLE session_cache ADD COLUMN ${col} TEXT`);
+      mustReindex = true;
+    }
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_session_cache_parent ON session_cache(parentSessionId)');
+  // Fork table (shipped in our v5), referenced unconditionally by prepare()
+  // below — must exist whatever db_version claims.
+  db.exec(`CREATE TABLE IF NOT EXISTS session_metrics (
+    sessionId TEXT NOT NULL,
+    date TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    messageCount INTEGER DEFAULT 0,
+    toolCallCount INTEGER DEFAULT 0,
+    inputTokens INTEGER DEFAULT 0,
+    outputTokens INTEGER DEFAULT 0,
+    cacheReadTokens INTEGER DEFAULT 0,
+    cacheCreationTokens INTEGER DEFAULT 0,
+    PRIMARY KEY (sessionId, date, model)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_session_metrics_date ON session_metrics(date)');
+  if (!cols.has('fileMtime')) {
+    db.exec('ALTER TABLE session_cache ADD COLUMN fileMtime TEXT');
+    // fileMtime's introduction changed what `modified` means (file mtime →
+    // last-message timestamp), so cached values written by pre-fileMtime code
+    // are stale. Clear the cache to force a full re-index; without this,
+    // dormant folders would keep mtime-based times indefinitely because the
+    // folder-level index gate never re-reads them.
+    mustReindex = true;
+  }
+  if (mustReindex) {
+    db.exec('DELETE FROM session_cache');
+    db.exec('DELETE FROM cache_meta');
+  }
 }
 
 // --- FTS5 full-text search (external-content table) ---
