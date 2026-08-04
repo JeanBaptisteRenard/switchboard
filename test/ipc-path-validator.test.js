@@ -93,7 +93,9 @@ test('isAllowedMemoryPath: allows ~/.claude itself', () => {
 });
 
 test('isAllowedMemoryPath: allows file under active project path', () => {
-  const projectPath = '/home/user/project';
+  // path.resolve keeps the entry comparable with the resolved candidate on
+  // Windows too (a bare '/home/...' literal would miss the drive letter).
+  const projectPath = path.resolve('/home/user/project');
   assert.equal(
     isAllowedMemoryPath(path.join(projectPath, 'CLAUDE.md'), [projectPath]),
     true,
@@ -101,7 +103,7 @@ test('isAllowedMemoryPath: allows file under active project path', () => {
 });
 
 test('isAllowedMemoryPath: allows .work-files under active project', () => {
-  const projectPath = '/home/user/project';
+  const projectPath = path.resolve('/home/user/project');
   assert.equal(
     isAllowedMemoryPath(path.join(projectPath, '.work-files', 'notes.md'), [projectPath]),
     true,
@@ -130,8 +132,10 @@ test('isAllowedMemoryPath: rejects file that is a prefix-match but not a subpath
 });
 
 test('isAllowedMemoryPath: accepts multiple project paths, first matching wins', () => {
-  const projectA = '/home/user/projectA';
-  const projectB = '/home/user/projectB';
+  // path.resolve keeps the entries comparable with the resolved candidate on
+  // Windows too (a bare '/home/...' literal would miss the drive letter).
+  const projectA = path.resolve('/home/user/projectA');
+  const projectB = path.resolve('/home/user/projectB');
   assert.equal(
     isAllowedMemoryPath(path.join(projectB, 'plans', 'plan.md'), [projectA, projectB]),
     true,

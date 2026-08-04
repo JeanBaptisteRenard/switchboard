@@ -23,7 +23,10 @@ const path   = require('path');
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function mkTmp() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'sw-trigger-'));
+  // realpath the sandbox: on Windows os.tmpdir() can be an 8.3 short name
+  // (C:\Users\JEAN-B~1\...) and fs.watch on a short-name path trips a libuv
+  // assertion (src\win\fs-event.c) that kills the test process.
+  return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'sw-trigger-')));
 }
 
 function cleanup(dir) {

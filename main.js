@@ -50,6 +50,7 @@ const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslS
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 const { isSensitivePath, isAllowedMemoryPath: _isAllowedMemoryPath } = require('./ipc-path-validator');
+const { normalizePtySize } = require('./pty-size');
 
 
 // --- Auto-updater (only in packaged builds) ---
@@ -1514,7 +1515,7 @@ ipcMain.handle('archive-session', (_event, sessionId, archived) => {
 });
 
 // --- IPC: open-terminal ---
-ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, sessionOptions) => {
+ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, sessionOptions, initialSize) => {
   if (!mainWindow) return { ok: false, error: 'no window' };
 
   // Reattach to existing session
@@ -1546,6 +1547,14 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   if (!fs.existsSync(projectPath)) {
     return { ok: false, error: `project directory no longer exists: ${projectPath}` };
   }
+
+  // Spawn at the size the renderer actually measured for the terminal
+  // container. Spawning at a fixed 120x30 and only correcting on the first
+  // terminal-resize left every session running against a wrong width until
+  // then — the shell wrapped its output for 120 columns while xterm displayed
+  // another, and TUI cursor moves landed a line off. normalizePtySize falls
+  // back to the historical 120x30 when the renderer could not measure.
+  const { cols: spawnCols, rows: spawnRows } = normalizePtySize(initialSize);
 
   const isPlainTerminal = sessionOptions?.type === 'terminal';
 
@@ -1615,8 +1624,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       const claudeShim = 'claude() { echo "\\033[33mTo start a Claude session, use the + button in the sidebar.\\033[0m"; return 1; }; export -f claude 2>/dev/null;';
       ptyProcess = pty.spawn(shell, shellArgs(shell, undefined, shellExtraArgs), {
         name: 'xterm-256color',
-        cols: 120,
-        rows: 30,
+        cols: spawnCols,
+        rows: spawnRows,
         cwd: isWsl ? os.homedir() : projectPath,
         env: {
           ...cleanPtyEnv,
@@ -1712,8 +1721,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
 
       ptyProcess = pty.spawn(shell, shellArgs(shell, claudeCmd, shellExtraArgs), {
         name: 'xterm-256color',
-        cols: 120,
-        rows: 30,
+        cols: spawnCols,
+        rows: spawnRows,
         cwd: isWsl ? os.homedir() : projectPath,
         // TERM_PROGRAM=iTerm.app: Claude Code checks this to decide whether to emit
         // OSC 9 notifications (e.g. "needs your attention"). Without it, the packaged
