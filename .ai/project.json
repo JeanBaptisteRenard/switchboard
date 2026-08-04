@@ -45,7 +45,7 @@
   },
   "context_engineering_profile": "electron-flat",
   "remotes": {
-    "origin": "https://github.com/JeanBaptisteRenard/switchboard.git",
+    "origin": "https://github.com/devsuitup/switchboard.git",
     "upstream": "https://github.com/doctly/switchboard.git"
   }
 }
