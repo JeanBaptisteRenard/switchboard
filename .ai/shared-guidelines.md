@@ -73,6 +73,12 @@ Skaleet workspace convention. Use it for session notes, proposals, plans, scratc
 
 Workspace-level rule (`~/workspace/CLAUDE.md`). Applies to commits and MR/PR descriptions.
 
+### 6. Overnight / unattended work: don't touch the live app while a session is mid-run
+
+If you're working autonomously (overnight, AFK mode) while the user's AppImage is live with an active session open, treat the app as **read-only from the outside** for the duration: no `npm run build:linux` / `task build` without the `--config.npmRebuild=false` flag (§2), no `cp` to `~/Applications/Switchboard.AppImage` (§2 — `appimagelauncherd` can silently kill the running instance), and no second `npx electron .` (§1 — it just quits and steals focus instead of giving you a usable dev process). None of these produce an obvious error at the time you run them; the damage shows up later as a dead session the user didn't ask to lose. If you need a live process to test against, use `SWITCHBOARD_DATA_DIR` isolation (§1) and only do the disruptive steps (uncontrolled rebuild, `cp` swap) once the user is ready to restart.
+
+> This is a Switchboard-specific writeup of a more general pattern — "don't touch shared mutable state a human is actively using" applies to any AI agent working unattended alongside a live app. Worth considering as a skaleet-ai convention someday; not proposed here.
+
 ## Fork-specific features (not in upstream)
 
 These exist on `JeanBaptisteRenard/switchboard` main but not on `doctly/switchboard` main. If an agent claims a feature is "upstream", verify with `git log upstream/main -- <file>`:
