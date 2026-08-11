@@ -277,6 +277,10 @@ if (migrations.length > currentDbVersion) {
 // enough text for useful snippet() previews.
 const FTS_BODY_MAX_CHARS = 32768; // 32 768 JS characters (UTF-16 code units); surrogate-pair split at the boundary is negligible for ASCII transcripts
 
+// Query cap + MATCH-expression construction live in fts-match.js, shared with
+// workers/search-query.js so the two query paths cannot drift apart.
+const { buildFtsMatch } = require('./fts-match');
+
 // search_content holds the plaintext the fts5 index reads columns from.
 // It is the single authoritative copy: title is full-length; body is
 // truncated to FTS_BODY_MAX_CHARS. Keeping this separate from search_map
@@ -621,11 +625,10 @@ function updateSearchTitle(id, type, title) {
 
 function searchByType(type, query, limit = 50, titleOnly = false) {
   try {
-    // Wrap in double quotes for exact substring matching with trigram tokenizer.
-    // This prevents FTS5 from splitting on punctuation (e.g. "spec.md" → "spec" + "md")
-    const escaped = '"' + query.replace(/"/g, '""') + '"';
-    // FTS5 column filter: prefix with "title:" to restrict match to title column
-    const match = titleOnly ? 'title:' + escaped : escaped;
+    // Cap + escape via the shared fts-match.js helper — a long pasted string
+    // (e.g. a GitLab MR URL) otherwise becomes a huge trigram phrase intersect
+    // that can block this thread for ~60 s. See fts-match.js for the details.
+    const match = buildFtsMatch(query, titleOnly);
     return stmts.searchQuery.all(type, match, limit);
   } catch {
     return [];
@@ -785,4 +788,7 @@ module.exports = {
   getDailyActivity,
   getDailyMetrics, getDailyModelTokens, getModelUsage, getTotalCounts,
   closeDb,
+  // Exported so main.js can pass the resolved path to the search-query worker
+  // without re-deriving the SWITCHBOARD_DATA_DIR logic in a second place.
+  DB_PATH,
 };
