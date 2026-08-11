@@ -1553,13 +1553,20 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
 
   // For a Claude resume, spawn in the session's real recorded cwd (e.g. its
   // worktree) rather than the possibly-collapsed projectPath — otherwise
-  // `claude --resume` can't find the conversation. Only the spawn side moves:
+  // `claude --resume` can't find the conversation. Forks resume too (they run
+  // `claude --resume <forkFrom> --fork-session` despite isNew being true), so
+  // they need the fork source's real cwd. Only the spawn side moves:
   // project-level settings stay keyed on the collapsed projectPath, which is
-  // also what the renderer header uses to display the shell profile. New
-  // sessions and plain terminals keep the requested projectPath.
+  // also what the renderer header uses to display the shell profile. Genuinely
+  // new sessions and plain terminals keep the requested projectPath.
   let spawnCwd = projectPath;
-  if (!isNew && sessionOptions?.type !== 'terminal') {
-    const realCwd = resolveSessionRealCwd(PROJECTS_DIR, sessionId);
+  const resumeSourceId = sessionOptions?.forkFrom
+    ? String(sessionOptions.forkFrom)
+    : (!isNew ? sessionId : null);
+  if (resumeSourceId && sessionOptions?.type !== 'terminal') {
+    const realCwd = resolveSessionRealCwd(
+      PROJECTS_DIR, resumeSourceId, projectPath ? encodeProjectPath(projectPath) : null
+    );
     if (realCwd && fs.existsSync(realCwd)) spawnCwd = realCwd;
   }
 

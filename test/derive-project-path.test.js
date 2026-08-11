@@ -299,3 +299,46 @@ test('resolveSessionRealCwd: uses the bounded scan — cwd on line 1 of a >256 K
     cleanup(tmp);
   }
 });
+
+test('resolveSessionRealCwd: checks the preferredFolder hint before the alphabetical scan', () => {
+  const tmp = mkTmp();
+  try {
+    // Two folders BOTH hold a transcript named after the session; the
+    // alphabetically-first one would win a naive scan. The hint must win.
+    const decoyCwd = path.join(tmp, 'decoy');
+    const realCwd = path.join(tmp, 'real');
+    fs.mkdirSync(path.join(tmp, '-aaa-decoy'));
+    fs.mkdirSync(path.join(tmp, '-zzz-hinted'));
+    fs.writeFileSync(
+      path.join(tmp, '-aaa-decoy', 'sess-h.jsonl'),
+      JSON.stringify({ type: 'summary', cwd: decoyCwd }) + '\n', 'utf8'
+    );
+    fs.writeFileSync(
+      path.join(tmp, '-zzz-hinted', 'sess-h.jsonl'),
+      JSON.stringify({ type: 'summary', cwd: realCwd }) + '\n', 'utf8'
+    );
+    assert.equal(resolveSessionRealCwd(tmp, 'sess-h', '-zzz-hinted'), realCwd);
+    assert.equal(resolveSessionRealCwd(tmp, 'sess-h'), decoyCwd);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('resolveSessionRealCwd: falls back to the full scan when the preferredFolder does not hold the transcript', () => {
+  const tmp = mkTmp();
+  try {
+    // Fork-of-worktree-session shape: the caller hints the collapsed parent's
+    // folder, but the fork source's transcript lives under the worktree folder.
+    const cwd = path.join(tmp, 'repo', '.worktrees', 'agent-w');
+    fs.mkdirSync(path.join(tmp, '-repo'));
+    fs.mkdirSync(path.join(tmp, '-repo--worktrees-agent-w'));
+    fs.writeFileSync(
+      path.join(tmp, '-repo--worktrees-agent-w', 'sess-fork-src.jsonl'),
+      JSON.stringify({ type: 'summary', cwd }) + '\n', 'utf8'
+    );
+    assert.equal(resolveSessionRealCwd(tmp, 'sess-fork-src', '-repo'), cwd);
+    assert.equal(resolveSessionRealCwd(tmp, 'sess-fork-src', '-not-even-a-folder'), cwd);
+  } finally {
+    cleanup(tmp);
+  }
+});

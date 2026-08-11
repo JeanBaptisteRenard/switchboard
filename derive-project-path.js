@@ -85,9 +85,20 @@ function deriveProjectPath(folderPath) {
 // cwd-scoped — resumed from the parent it reports "No conversation found with
 // session ID". Reads go through the bounded extractCwdFromJsonl scan (see
 // CWD_SCAN_BYTES above) so a giant live-session JSONL can't peg the caller.
-function resolveSessionRealCwd(projectsDir, sessionId) {
+// `preferredFolder` (optional) is the encoded folder the caller expects the
+// transcript to live in — checked first so the common non-worktree resume
+// answers without scanning every project folder.
+function resolveSessionRealCwd(projectsDir, sessionId, preferredFolder) {
   try {
-    for (const folder of fs.readdirSync(projectsDir)) {
+    const folders = fs.readdirSync(projectsDir);
+    if (preferredFolder) {
+      const i = folders.indexOf(preferredFolder);
+      if (i > 0) {
+        folders.splice(i, 1);
+        folders.unshift(preferredFolder);
+      }
+    }
+    for (const folder of folders) {
       const jsonl = path.join(projectsDir, folder, sessionId + '.jsonl');
       if (!fs.existsSync(jsonl)) continue;
       return extractCwdFromJsonl(jsonl);
