@@ -157,6 +157,9 @@ function createSearchWorkerClient(deps) {
       worker = null;
     }
     workerReady = false;
+    // The suppressed exit handler would normally drain — do it here so an
+    // in-flight search never leaves the renderer awaiting a dead promise.
+    drainPending();
   }
 
   return { startWorker, searchViaWorker, drainPending, shutdown };

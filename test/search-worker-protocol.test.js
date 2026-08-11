@@ -268,3 +268,33 @@ test('shutdown() while backoff is armed cancels restart, no worker spawned after
 
   assert.equal(workerCreateCount, 1, 'no additional worker should be created after shutdown()');
 });
+
+// ---------------------------------------------------------------------------
+// 7. shutdown() drains in-flight promises — a search awaited across app quit
+//    resolves with [] instead of hanging forever
+// ---------------------------------------------------------------------------
+
+test('shutdown() drains pending promises (in-flight search resolves with [])', async () => {
+  let createdMock = null;
+  const client = createSearchWorkerClient({
+    workerFactory: () => {
+      const { mock } = makeMockWorker({ goOnlineImmediately: true });
+      createdMock = mock;
+      return mock;
+    },
+    searchByType: () => { throw new Error('fallback must not be used here'); },
+    log: { warn: () => {}, error: () => {} },
+    dbPath: '/fake/db.sqlite',
+  });
+
+  client.startWorker();
+  assert.ok(createdMock, 'worker created');
+
+  // In-flight query: the mock worker never replies.
+  const inFlight = client.searchViaWorker('session', 'query', false);
+
+  client.shutdown();
+
+  const results = await inFlight;
+  assert.deepEqual(results, [], 'in-flight promise must resolve with [] on shutdown');
+});
