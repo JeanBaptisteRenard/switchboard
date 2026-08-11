@@ -2,7 +2,7 @@
 
 @~/.skaleet-ai/conventions/rules.md
 
-This is JB's fork (`JeanBaptisteRenard/switchboard`) of `doctly/switchboard`. The fork carries features not (yet) upstream — read this before editing anything.
+This is JB's fork (`devsuitup/switchboard`, transferred from `JeanBaptisteRenard/switchboard` on 2026-08-11) of `doctly/switchboard`. The fork carries features not (yet) upstream — read this before editing anything.
 
 **Caveat on the universal rules import above**: Switchboard is an **Electron desktop app**, not a Skaleet backend service. The following sections from `rules.md` do NOT apply here:
 - DDD/CQRS architecture (no Domain/Application/Infrastructure layers — this is a renderer + main-process app)
@@ -81,7 +81,7 @@ If you're working autonomously (overnight, AFK mode) while the user's AppImage i
 
 ## Fork-specific features (not in upstream)
 
-These exist on `JeanBaptisteRenard/switchboard` main but not on `doctly/switchboard` main. If an agent claims a feature is "upstream", verify with `git log upstream/main -- <file>`:
+These exist on `devsuitup/switchboard` main but not on `doctly/switchboard` main. If an agent claims a feature is "upstream", verify with `git log upstream/main -- <file>`:
 
 - **Subagent support** — index, search, transcript viewer (PR #47 upstream, merged on fork)
 - **Subagent observability** — hierarchy, live transitions, status badges (PR #48 upstream)
@@ -94,6 +94,14 @@ These exist on `JeanBaptisteRenard/switchboard` main but not on `doctly/switchbo
 - **`SWITCHBOARD_DATA_DIR`** env var for DB isolation in dev (fork)
 - **Wayland clipboard fix** — main-process IPC + OSC 52 (fork PR #18 = port of upstream PR #55)
 - **Missing project remap** — detect + UI + atomic JSONL rewrite (fork PR #20 = port of upstream PR #35, with subagent-aware enum + active-session guard added on top)
+- **Trigger watcher** — file-based command injection into open PTYs, single + chained (fork PR #24 and follow-ups); see [contexts/trigger-watcher.md](contexts/trigger-watcher.md)
+- **Schedule runner** — in-process cron spawning headless Claude tasks from `schedule-*.md` files; see [contexts/schedule-runner.md](contexts/schedule-runner.md)
+- **Session restore** — persist + restore the open working set across restarts (fork PR #80)
+- **Perf campaign v0.0.33–41** — 30fps terminal flush cap, WebGL virtualization, LRU xterm cap, targeted refreshes, idle-CPU fixes (fork PRs #55–#70)
+- **Search off the main thread + bounded FTS query** — worker relay + 48-char cap (fork PR #97, v0.0.44)
+- **Resume/fork in real recorded cwd** for worktree sessions (fork PR #96, v0.0.44)
+
+(Not exhaustive — `git log --oneline upstream/main..main` is the ground truth.)
 
 ## Patterns to reuse, not reinvent
 
@@ -118,7 +126,7 @@ These exist on `JeanBaptisteRenard/switchboard` main but not on `doctly/switchbo
 
 1. `task check` (lint + test). 0 errors. Pre-existing warnings are fine.
 2. Squash to clear commits. No `Co-Authored-By`. Imperative subject, brief why-body.
-3. `gh pr create` against `JeanBaptisteRenard/switchboard:main` (the fork's main, not upstream's). Title format: `(area): short imperative`.
+3. `gh pr create` against `devsuitup/switchboard:main` (the fork's main, not upstream's). Title format: `(area): short imperative`.
 4. If the change is a port of an upstream PR, **credit the upstream author** in the body with a link. We want abasiri to see we're not stealing.
 
 ## Upstreaming work

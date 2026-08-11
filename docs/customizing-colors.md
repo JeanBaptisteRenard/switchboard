@@ -30,7 +30,7 @@ L'interface est livrée avec un **thème sombre** bleu-violet. Comme l'applicati
 
 ## 3. Installer Switchboard
 
-1. Ouvrez la page des versions : `https://github.com/doctly/switchboard/releases/latest`
+1. Ouvrez la page des versions : `https://github.com/devsuitup/switchboard/releases/latest`
 2. Dans **Assets**, téléchargez l'installeur Windows `.exe` (type `Switchboard-Setup-x.y.z.exe`). *(macOS : `.dmg` ; Linux : `.AppImage` ou `.deb`.)*
 3. Lancez l'`.exe`. Comme l'application n'est pas signée, **SmartScreen** affichera « Windows a protégé votre PC » → cliquez sur **Informations complémentaires** puis **Exécuter quand même**.
 4. Suivez l'installeur. Au premier lancement, Switchboard scanne `~/.claude/projects` et liste vos sessions par projet.
