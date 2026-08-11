@@ -10,6 +10,8 @@ Each session is resumed using the project's current session-launch settings (per
 
 Sessions that no longer exist in the index (deleted JSONL files, removed worktrees) are silently skipped during restore.
 
+> **Technical note (for contributors):** "restore" is a **respawn**, not a reattach. The underlying terminal process (PTY) is a child of the Electron main process and is killed when Switchboard quits — nothing survives the process boundary. On restart, Switchboard spawns a brand-new PTY per restored session (using `claude --resume <sessionId>` for Claude sessions), it does not reconnect to anything left running. True reattach — replaying buffered terminal output onto an existing, still-running PTY — only happens *within* a single app run (e.g. the renderer reloads, or you click back into a session tab), gated on the session still being present in the in-memory `activeSessions` map. Once the app has fully quit, that map is empty, so restore always takes the "spawn new PTY" path.
+
 ## Restore on Startup setting
 
 Open **Global Settings** and look for **Restore Sessions on Startup**:

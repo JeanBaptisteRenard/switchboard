@@ -197,6 +197,16 @@ npm run release   # builds + publishes to GitHub Releases
 
 Set `GH_TOKEN` in your environment (a GitHub personal access token with `repo` scope).
 
+### Fork release-flow gotchas
+
+This fork's `main` is branch-protected and its `main` branch tracks `upstream/main`, both of which trip up the generic release flow above:
+
+- **A bare `git push` (no remote) targets `upstream` (`doctly/switchboard`), not `origin`** — it will fail with a permissions error. Always `git push origin ...` explicitly.
+- **Direct pushes to `main` are rejected** ("repository rule violations"). The version-bump commit must land via a PR (admin-merge is fine).
+- **Tag the merged commit on `main`, after the PR merges — never the local pre-merge bump commit.** Tagging first and then squash-merging creates a tag that isn't an ancestor of `main`; `git describe --tags` and release-notes generation then skip it. Correct order: PR-merge the bump → `git reset --hard origin/main` locally → tag → `git push origin <tag>`. If a build already started from a bad tag, cancel the run (`gh run cancel`) and delete + recreate the tag.
+- **Unsigned macOS builds need both `"mac": {"identity": null}` in `package.json` and `notarize: false`.** A `CSC_LINK` env that's set-but-empty (e.g. `${{ secrets.CSC_LINK || '' }}`) is read by electron-builder as a certificate *file path* — `stat('')` resolves to the CI working directory, and the mac job fails with `... not a file` only on tag-triggered (release) runs, never on PR builds. Gating `CSC_IDENTITY_AUTO_DISCOVERY` on whether the secret is set does **not** fix this; `identity: null` does.
+- **`gh release upload`/`create` can hit an intermittent 401 from `uploads.github.com` on a single asset** (often a `.blockmap`), aborting a batch upload and leaving a partial draft release. Upload assets one at a time with a retry loop (`for i in 1..5; do gh release upload "$TAG" "$f" --clobber && break; sleep 2; done`) instead of a single `gh release create ... dist/*` call.
+
 ## Auto-Updates
 
 The app uses `electron-updater` to check for updates from GitHub Releases on launch and every 4 hours. Updates are only checked in packaged builds (not during development). The flow:
