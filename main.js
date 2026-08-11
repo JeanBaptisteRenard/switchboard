@@ -311,7 +311,7 @@ function buildMenu() {
 
 // --- Session cache helpers ---
 
-const { deriveProjectPath } = require('./derive-project-path');
+const { deriveProjectPath, resolveSessionRealCwd } = require('./derive-project-path');
 
 // Session cache → session-cache.js
 const sessionCache = require('./session-cache');
@@ -1551,9 +1551,28 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     return { ok: true, reattached: true, mcpActive: !!session.mcpServer };
   }
 
+  // For a Claude resume, spawn in the session's real recorded cwd (e.g. its
+  // worktree) rather than the possibly-collapsed projectPath — otherwise
+  // `claude --resume` can't find the conversation. Forks resume too (they run
+  // `claude --resume <forkFrom> --fork-session` despite isNew being true), so
+  // they need the fork source's real cwd. Only the spawn side moves:
+  // project-level settings stay keyed on the collapsed projectPath, which is
+  // also what the renderer header uses to display the shell profile. Genuinely
+  // new sessions and plain terminals keep the requested projectPath.
+  let spawnCwd = projectPath;
+  const resumeSourceId = sessionOptions?.forkFrom
+    ? String(sessionOptions.forkFrom)
+    : (!isNew ? sessionId : null);
+  if (resumeSourceId && sessionOptions?.type !== 'terminal') {
+    const realCwd = resolveSessionRealCwd(
+      PROJECTS_DIR, resumeSourceId, projectPath ? encodeProjectPath(projectPath) : null
+    );
+    if (realCwd && fs.existsSync(realCwd)) spawnCwd = realCwd;
+  }
+
   // Spawn new PTY
-  if (!fs.existsSync(projectPath)) {
-    return { ok: false, error: `project directory no longer exists: ${projectPath}` };
+  if (!fs.existsSync(spawnCwd)) {
+    return { ok: false, error: `project directory no longer exists: ${spawnCwd}` };
   }
 
   // Spawn at the size the renderer actually measured for the terminal
@@ -1588,7 +1607,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   // For WSL, convert Windows path to /mnt/ path and pass via --cd;
   // the spawn cwd must remain a valid Windows path for wsl.exe itself.
   if (isWsl) {
-    const wslCwd = windowsToWslPath(projectPath);
+    const wslCwd = windowsToWslPath(spawnCwd);
     shellExtraArgs.unshift('--cd', wslCwd);
   }
   log.info(`[shell] profile=${shellProfile.id} shell=${shell} args=${JSON.stringify(shellExtraArgs)}`);
@@ -1599,7 +1618,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
 
   if (!isPlainTerminal) {
     // Snapshot existing .jsonl files before spawning (for new session + fork/plan detection)
-    projectFolder = encodeProjectPath(projectPath);
+    projectFolder = encodeProjectPath(spawnCwd);
     const claudeProjectDir = path.join(PROJECTS_DIR, projectFolder);
     if (fs.existsSync(claudeProjectDir)) {
       try {
@@ -1634,7 +1653,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         name: 'xterm-256color',
         cols: spawnCols,
         rows: spawnRows,
-        cwd: isWsl ? os.homedir() : projectPath,
+        cwd: isWsl ? os.homedir() : spawnCwd,
         env: {
           ...cleanPtyEnv,
           TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
@@ -1711,7 +1730,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       // (skip if user disabled IDE emulation in global settings)
       if (sessionOptions?.mcpEmulation !== false) {
         try {
-          mcpServer = await startMcpServer(sessionId, [projectPath], mainWindow, log);
+          mcpServer = await startMcpServer(sessionId, [spawnCwd], mainWindow, log);
           claudeCmd += ' --ide';
         } catch (err) {
           log.error(`[mcp] Failed to start MCP server for ${sessionId}: ${err.message}`);
@@ -1731,7 +1750,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         name: 'xterm-256color',
         cols: spawnCols,
         rows: spawnRows,
-        cwd: isWsl ? os.homedir() : projectPath,
+        cwd: isWsl ? os.homedir() : spawnCwd,
         // TERM_PROGRAM=iTerm.app: Claude Code checks this to decide whether to emit
         // OSC 9 notifications (e.g. "needs your attention"). Without it, the packaged
         // app's minimal Electron environment won't trigger those sequences.

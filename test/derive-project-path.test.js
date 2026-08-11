@@ -4,7 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { deriveProjectPath, resolveWorktreePath } = require('../derive-project-path');
+const { deriveProjectPath, resolveWorktreePath, resolveSessionRealCwd } = require('../derive-project-path');
 
 function mkTmp() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-dpp-'));
@@ -214,6 +214,130 @@ test('extractCwdFromJsonl: does not throw when the 256 KB boundary cuts a line m
     let result;
     assert.doesNotThrow(() => { result = deriveProjectPath(folder); });
     assert.equal(result, cwd);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// resolveSessionRealCwd — locates a session's transcript across project
+// folders and returns its recorded cwd via the bounded scan. Used on resume
+// so a worktree session spawns in its real cwd, not the collapsed parent.
+// ---------------------------------------------------------------------------
+
+test('resolveSessionRealCwd: finds the cwd of a session in any project folder', () => {
+  const tmp = mkTmp();
+  try {
+    const cwd = path.join(tmp, 'repo', '.claude', 'worktrees', 'agent-xyz');
+    fs.mkdirSync(path.join(tmp, '-other-project'));
+    fs.mkdirSync(path.join(tmp, '-home-user-repo'));
+    fs.writeFileSync(
+      path.join(tmp, '-other-project', 'aaaa.jsonl'),
+      JSON.stringify({ type: 'summary', cwd: '/elsewhere' }) + '\n', 'utf8'
+    );
+    fs.writeFileSync(
+      path.join(tmp, '-home-user-repo', 'sess-1.jsonl'),
+      JSON.stringify({ type: 'summary', cwd }) + '\n' +
+      JSON.stringify({ type: 'user', message: 'hello' }) + '\n', 'utf8'
+    );
+    assert.equal(resolveSessionRealCwd(tmp, 'sess-1'), cwd);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('resolveSessionRealCwd: returns null when no folder holds the session transcript', () => {
+  const tmp = mkTmp();
+  try {
+    fs.mkdirSync(path.join(tmp, '-some-project'));
+    fs.writeFileSync(
+      path.join(tmp, '-some-project', 'unrelated.jsonl'),
+      JSON.stringify({ type: 'summary', cwd: '/x' }) + '\n', 'utf8'
+    );
+    assert.equal(resolveSessionRealCwd(tmp, 'missing-session'), null);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('resolveSessionRealCwd: returns null when the transcript has no cwd field', () => {
+  const tmp = mkTmp();
+  try {
+    fs.mkdirSync(path.join(tmp, '-p'));
+    fs.writeFileSync(
+      path.join(tmp, '-p', 'sess-2.jsonl'),
+      JSON.stringify({ type: 'assistant', message: 'no cwd here' }) + '\n', 'utf8'
+    );
+    assert.equal(resolveSessionRealCwd(tmp, 'sess-2'), null);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('resolveSessionRealCwd: returns null when the projects dir does not exist', () => {
+  assert.equal(resolveSessionRealCwd('/nonexistent-projects-dir', 'sess'), null);
+});
+
+test('resolveSessionRealCwd: uses the bounded scan — cwd on line 1 of a >256 KB transcript is found', () => {
+  const tmp = mkTmp();
+  try {
+    fs.mkdirSync(path.join(tmp, '-big'));
+    const cwd = path.join(tmp, 'bigproject');
+    const filePath = path.join(tmp, '-big', 'sess-big.jsonl');
+    const header = JSON.stringify({ type: 'summary', cwd }) + '\n';
+    const fillerLine = JSON.stringify({ type: 'assistant', message: 'x'.repeat(80) }) + '\n';
+    const fillerCount = Math.ceil((300 * 1024 - header.length) / fillerLine.length) + 10;
+    fs.writeFileSync(filePath, header, 'utf8');
+    const fd = fs.openSync(filePath, 'a');
+    for (let i = 0; i < fillerCount; i++) {
+      fs.writeSync(fd, fillerLine);
+    }
+    fs.closeSync(fd);
+    assert.ok(fs.statSync(filePath).size > CWD_SCAN_BYTES, 'precondition: file must exceed scan window');
+    assert.equal(resolveSessionRealCwd(tmp, 'sess-big'), cwd);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('resolveSessionRealCwd: checks the preferredFolder hint before the alphabetical scan', () => {
+  const tmp = mkTmp();
+  try {
+    // Two folders BOTH hold a transcript named after the session; the
+    // alphabetically-first one would win a naive scan. The hint must win.
+    const decoyCwd = path.join(tmp, 'decoy');
+    const realCwd = path.join(tmp, 'real');
+    fs.mkdirSync(path.join(tmp, '-aaa-decoy'));
+    fs.mkdirSync(path.join(tmp, '-zzz-hinted'));
+    fs.writeFileSync(
+      path.join(tmp, '-aaa-decoy', 'sess-h.jsonl'),
+      JSON.stringify({ type: 'summary', cwd: decoyCwd }) + '\n', 'utf8'
+    );
+    fs.writeFileSync(
+      path.join(tmp, '-zzz-hinted', 'sess-h.jsonl'),
+      JSON.stringify({ type: 'summary', cwd: realCwd }) + '\n', 'utf8'
+    );
+    assert.equal(resolveSessionRealCwd(tmp, 'sess-h', '-zzz-hinted'), realCwd);
+    assert.equal(resolveSessionRealCwd(tmp, 'sess-h'), decoyCwd);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('resolveSessionRealCwd: falls back to the full scan when the preferredFolder does not hold the transcript', () => {
+  const tmp = mkTmp();
+  try {
+    // Fork-of-worktree-session shape: the caller hints the collapsed parent's
+    // folder, but the fork source's transcript lives under the worktree folder.
+    const cwd = path.join(tmp, 'repo', '.worktrees', 'agent-w');
+    fs.mkdirSync(path.join(tmp, '-repo'));
+    fs.mkdirSync(path.join(tmp, '-repo--worktrees-agent-w'));
+    fs.writeFileSync(
+      path.join(tmp, '-repo--worktrees-agent-w', 'sess-fork-src.jsonl'),
+      JSON.stringify({ type: 'summary', cwd }) + '\n', 'utf8'
+    );
+    assert.equal(resolveSessionRealCwd(tmp, 'sess-fork-src', '-repo'), cwd);
+    assert.equal(resolveSessionRealCwd(tmp, 'sess-fork-src', '-not-even-a-folder'), cwd);
   } finally {
     cleanup(tmp);
   }
