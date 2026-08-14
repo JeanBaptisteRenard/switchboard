@@ -11,7 +11,7 @@ public/codemirror-bundle.js
 .cache/
 dev-app-update.yml
 
-# Scratch space (Skaleet workspace convention)
+# Gitignored scratch space, surfaced in the Work Files sidebar tab
 .work-files/
 
 

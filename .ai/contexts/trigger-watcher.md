@@ -6,7 +6,7 @@
 
 | File | LOC | Role |
 |---|---|---|
-| `trigger-watcher.js` | ~175 | The entire module: directory setup, `fs.watch` listener, idle-wait logic, PTY write, result file. |
+| `trigger-watcher.js` | ~800 | The entire module: directory setup, `fs.watch` listener, idle-wait logic, single + chained trigger processing, submit-with-verify busy-rise/fall polling, input validation, PTY write, result file. |
 | `main.js` (wiring) | 15 | `require('./trigger-watcher').start(ctx)` in the `app.whenReady` block, right after `startScheduler`. |
 
 ## Public surface
@@ -43,7 +43,8 @@ Drop a file at `SWITCHBOARD_TRIGGERS_DIR/<uuid>.json` (default `~/.switchboard/t
 
 Fields:
 - `sessionId` — must match a key in `activeSessions` (`main.js`)
-- `command` — written verbatim as `command + '\r'` to the PTY
+- `command` — written to the PTY, then Enter is sent as a SEPARATE write (discrete submit; a `\r` concatenated onto the text can be absorbed by the composer). Mutually exclusive with `chain`.
+- `chain` — array of up to 20 `{command, ...}` steps (`MAX_CHAIN_LENGTH`), injected sequentially; each step's submission is verified (busy-rise) with one bare-Enter retry before the next step is sent. Mutually exclusive with `command`; exactly one of the two is required.
 - `wait` — `"none"` (default) | `"idle"`.  `"idle"` polls `isSessionBusy` every 100 ms until the session goes idle or the timeout fires.
 - `timeout_ms` — optional positive integer, ≤ 600 000 ms.  Overrides both the env var and the default for this trigger only.  On invalid value → `{ok:false, error:"invalid timeout_ms"}`, semaphore released, no PTY write.
 
@@ -78,4 +79,3 @@ Trigger file is **deleted** after processing (success or failure).
 - If you rename `_cliBusy` on `session` in `main.js`, update `isSessionBusy` in the `start(ctx)` wiring block.
 - If you rename `activeSessions` or change the structure (`session.pty` → `session.ptyProcess`), update both `getPtyForSession` and `isSessionBusy` in the wiring block.
 - Tests live in `test/trigger-watcher.test.js`.  They use `SWITCHBOARD_TRIGGERS_DIR` env override — do not hardcode paths there.
-- The convention doc for harness script authors lives at `~/.skaleet-ai/conventions/how-to/switchboard-trigger.md`.

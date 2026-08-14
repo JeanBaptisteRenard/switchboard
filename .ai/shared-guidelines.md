@@ -1,18 +1,8 @@
 # Switchboard — Notes for Claude (and other AI agents)
 
-@~/.skaleet-ai/conventions/rules.md
+This is JB's fork (`devsuitup/switchboard`, transferred from `JeanBaptisteRenard/switchboard` on 2026-08-11) of `doctly/switchboard`. The fork carries features not (yet) upstream — read this before editing anything.
 
-This is JB's fork (`JeanBaptisteRenard/switchboard`) of `doctly/switchboard`. The fork carries features not (yet) upstream — read this before editing anything.
-
-**Caveat on the universal rules import above**: Switchboard is an **Electron desktop app**, not a Skaleet backend service. The following sections from `rules.md` do NOT apply here:
-- DDD/CQRS architecture (no Domain/Application/Infrastructure layers — this is a renderer + main-process app)
-- `docker compose exec` runtime gating (we run npm / node directly on the host; only deps for the *target* repos are Dockerised)
-- `monitor-ci` skill (we use GitHub Actions, not GitLab CI; check status via `gh pr checks`)
-- `glab` rules (replaced by `gh` CLI for this fork)
-- `/pre-commit` skill (husky pre-commit runs `task check` automatically; the skill is for Skaleet PHP projects)
-- Conventional Commits — we use a looser style (`feat(scope): ...`, `fix(scope): ...`, but no strict footer rules)
-
-Everything else (HANDOFF protocol, agent dispatch rules, sub-agent model gate, worktree isolation requirement, no Co-Authored-By, shell-command pitfalls, memory hygiene) **does apply**.
+Switchboard is an **Electron desktop app**: renderer + main-process, no Domain/Application/Infrastructure layering. Runtimes (npm, node) run directly on the host — nothing here is Dockerised. CI is GitHub Actions (check status via `gh pr checks`); the `gh` CLI is used for PRs, not `glab`. The husky pre-commit hook runs `task check` automatically. Commit style is a loose `feat(scope): ...` / `fix(scope): ...`, with no strict footer rules.
 
 ## Quick orientation
 
@@ -26,6 +16,7 @@ Everything else (HANDOFF protocol, agent dispatch rules, sub-agent model gate, w
 | Change Plans/Memory/.work-files panels (CodeMirror) | [contexts/viewer-panel.md](contexts/viewer-panel.md) |
 | Change the renderer (sidebar, terminal, app.js) | `public/*.js` — entry is `app.js` |
 | Write a test | `test/*.test.js` — node:test + jsdom for renderer files |
+| Working practices for AI agents (HANDOFF format, shell pitfalls, review loop) | [agent-practices.md](agent-practices.md) |
 
 For a guided tour of the codebase architecture, start at [contexts/README.md](contexts/README.md).
 
@@ -44,7 +35,7 @@ task dev   # Taskfile already sets SWITCHBOARD_DATA_DIR=~/.switchboard-dev by de
 
 The AppImage uses `~/.switchboard/switchboard.db`. The dev electron uses `~/.switchboard-dev/switchboard.db`. They cannot collide.
 
-### 2. Running `npm run build:linux` CAN kill the running instance — `cp` does not
+### 2. Running `npm run build:linux` CAN kill the running instance — and so can the `cp` to ~/Applications
 
 **Corrected 2026-05-31** — the previous version of this section claimed the build was safe. It isn't.
 
@@ -67,7 +58,7 @@ After the agent completes, **remove the worktree manually** — `git worktree re
 
 ### 4. `.work-files/` is gitignored scratch space
 
-Skaleet workspace convention. Use it for session notes, proposals, plans, scratch JSONLs. It's enumerated by the Work Files sidebar tab — files appear there automatically.
+Gitignored scratch space. Use it for session notes, proposals, plans, scratch JSONLs. It's enumerated by the Work Files sidebar tab — files appear there automatically.
 
 ### 5. No `Co-Authored-By` trailers in commits
 
@@ -77,11 +68,11 @@ Workspace-level rule (`~/workspace/CLAUDE.md`). Applies to commits and MR/PR des
 
 If you're working autonomously (overnight, AFK mode) while the user's AppImage is live with an active session open, treat the app as **read-only from the outside** for the duration: no `npm run build:linux` / `task build` without the `--config.npmRebuild=false` flag (§2), no `cp` to `~/Applications/Switchboard.AppImage` (§2 — `appimagelauncherd` can silently kill the running instance), and no second `npx electron .` (§1 — it just quits and steals focus instead of giving you a usable dev process). None of these produce an obvious error at the time you run them; the damage shows up later as a dead session the user didn't ask to lose. If you need a live process to test against, use `SWITCHBOARD_DATA_DIR` isolation (§1) and only do the disruptive steps (uncontrolled rebuild, `cp` swap) once the user is ready to restart.
 
-> This is a Switchboard-specific writeup of a more general pattern — "don't touch shared mutable state a human is actively using" applies to any AI agent working unattended alongside a live app. Worth considering as a skaleet-ai convention someday; not proposed here.
+> This is a Switchboard-specific writeup of a more general pattern — "don't touch shared mutable state a human is actively using" applies to any AI agent working unattended alongside a live app.
 
 ## Fork-specific features (not in upstream)
 
-These exist on `JeanBaptisteRenard/switchboard` main but not on `doctly/switchboard` main. If an agent claims a feature is "upstream", verify with `git log upstream/main -- <file>`:
+These exist on `devsuitup/switchboard` main but not on `doctly/switchboard` main. If an agent claims a feature is "upstream", verify with `git log upstream/main -- <file>`:
 
 - **Subagent support** — index, search, transcript viewer (PR #47 upstream, merged on fork)
 - **Subagent observability** — hierarchy, live transitions, status badges (PR #48 upstream)
@@ -94,6 +85,14 @@ These exist on `JeanBaptisteRenard/switchboard` main but not on `doctly/switchbo
 - **`SWITCHBOARD_DATA_DIR`** env var for DB isolation in dev (fork)
 - **Wayland clipboard fix** — main-process IPC + OSC 52 (fork PR #18 = port of upstream PR #55)
 - **Missing project remap** — detect + UI + atomic JSONL rewrite (fork PR #20 = port of upstream PR #35, with subagent-aware enum + active-session guard added on top)
+- **Trigger watcher** — file-based command injection into open PTYs, single + chained (fork PR #24 and follow-ups); see [contexts/trigger-watcher.md](contexts/trigger-watcher.md)
+- **Schedule runner** — in-process cron spawning headless Claude tasks from `schedule-*.md` files; see [contexts/schedule-runner.md](contexts/schedule-runner.md)
+- **Session restore** — persist + restore the open working set across restarts (fork PR #80)
+- **Perf campaign v0.0.33–41** — 30fps terminal flush cap, WebGL virtualization, LRU xterm cap, targeted refreshes, idle-CPU fixes (fork PRs #55–#70; a second perf wave #73–#76 shipped in v0.0.38)
+- **Search off the main thread + bounded FTS query** — worker relay + 48-char cap (fork PR #97, v0.0.44)
+- **Resume/fork in real recorded cwd** for worktree sessions (fork PR #96, v0.0.44)
+
+(Not exhaustive — `git log --oneline upstream/main..main` is the ground truth.)
 
 ## Patterns to reuse, not reinvent
 
@@ -118,7 +117,7 @@ These exist on `JeanBaptisteRenard/switchboard` main but not on `doctly/switchbo
 
 1. `task check` (lint + test). 0 errors. Pre-existing warnings are fine.
 2. Squash to clear commits. No `Co-Authored-By`. Imperative subject, brief why-body.
-3. `gh pr create` against `JeanBaptisteRenard/switchboard:main` (the fork's main, not upstream's). Title format: `(area): short imperative`.
+3. `gh pr create` against `devsuitup/switchboard:main` (the fork's main, not upstream's). Title format: `(area): short imperative`.
 4. If the change is a port of an upstream PR, **credit the upstream author** in the body with a link. We want abasiri to see we're not stealing.
 
 ## Upstreaming work

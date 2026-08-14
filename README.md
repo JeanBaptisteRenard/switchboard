@@ -6,6 +6,22 @@ Switchboard is a desktop app that gives you a unified view of all your Claude Co
 
 ![Switchboard](build/screenshot.png)
 
+## About this fork
+
+This repository is a fork of **[doctly/switchboard](https://github.com/doctly/switchboard)** — all credit for the original app goes to its author. The fork tracks upstream (features are ported in both directions when they fit) and is currently ~160 commits ahead. Highlights of what it adds:
+
+- **Subagent support & observability** — subagent transcripts are indexed and searchable, the sidebar shows the parent→child hierarchy with live spawn/completion indicators and status badges, and clicking a subagent opens a read-only transcript viewer instead of re-spawning Claude. See [docs/subagents.md](docs/subagents.md).
+- **Session restore** — reopen your whole working set (open sessions, order, active one) after a restart. See [docs/session-restore.md](docs/session-restore.md).
+- **Automation** — an in-process scheduler fires Claude tasks from cron-style `schedule-*.md` files, and a file-based trigger API lets external scripts inject commands (single or chained) into open sessions. See [docs/automation.md](docs/automation.md).
+- **Performance work** — terminal write-flush capped at ~30 fps, WebGL context virtualization and LRU caps on grid cards, differentiated scrollback, targeted watcher refreshes, header-only reads for cached sessions, idle-CPU fixes. Measured compositor load on a busy grid dropped from 40–60% to 8–10%.
+- **Search hardening** — full-text search runs in a dedicated worker thread with bounded query length, so a pasted URL can no longer freeze the app; explicit reindex via Enter or the refresh button.
+- **Worktree tools** — sessions started in a git worktree resume and fork in their real recorded cwd; a rich delete dialog shows dirty-file status before removing a worktree from disk.
+- **Work Files tab** — browse, format (JSON/JSONL), and delete each project's `.work-files/` scratch space from the sidebar.
+- **Robustness** — single-instance lock (no PTY loss when double-launching), `SWITCHBOARD_DATA_DIR` env var to isolate a dev database from the daily driver, missing-project detection + remap UI, Wayland clipboard support (OSC 52).
+- **CI** — test coverage with a patch-coverage gate (80% on changed lines).
+
+`git log --oneline upstream/main..main` lists everything the fork carries.
+
 ### Key Features
 
 - **Session Browser** — All your Claude Code sessions, organized by project, searchable by content
@@ -74,12 +90,14 @@ Full user-facing documentation lives in [docs/](docs/README.md):
 - [Plans, Memory, and Work Files](docs/plans-memory-workfiles.md) — CodeMirror panels for plan files, CLAUDE.md, and `.work-files/`
 - [Activity Stats](docs/activity-stats.md) — coding activity heatmap
 - [Settings Reference](docs/settings.md) — every field in Global and Project Settings
+- [Automation](docs/automation.md) — scheduled Claude tasks (cron) and the file-based trigger API
+- [Customizing Colors](docs/customizing-colors.md) — community guide (in French) to theming via `app.asar`
 
 ## Download
 
 Grab the latest release for your platform:
 
-**[Download Switchboard](https://github.com/doctly/switchboard/releases/latest)**
+**[Download Switchboard](https://github.com/devsuitup/switchboard/releases/latest)**
 
 - **macOS**: `.dmg` (Apple Silicon & Intel)
 - **Windows**: `.exe` installer
@@ -101,7 +119,7 @@ Grab the latest release for your platform:
 ```bash
 task install       # npm install
 task dev           # launch Electron (--no-sandbox, required on Linux)
-task test          # node --test  (24 tests)
+task test          # node --test
 task lint          # eslint .
 task check         # test + lint  — pre-commit / pre-push gate
 task ci            # same as check but sequential, verbose
@@ -140,7 +158,7 @@ If your `~/Applications/Switchboard.AppImage` is open while you develop:
 
 - **Dev DB isolation** — `task dev` sets `SWITCHBOARD_DATA_DIR=~/.switchboard-dev` automatically so the dev electron uses its own SQLite database. The AppImage keeps using `~/.switchboard/switchboard.db`. They never collide.
 - **Single-instance lock** — if you double-click `Switchboard.AppImage` while it's already open, the second launch quits immediately and focuses the existing window instead of spawning a duplicate process. This was a real data-loss bug (PTYs orphaned) before the fix landed.
-- **Rebuilding is risky, replacing is safe** — `task build` invokes `electron-builder`, which rebuilds native modules (`better-sqlite3`, `node-pty`) by default. Those `.node` files are loaded by your running AppImage; replacing them mid-run can kill the process (witnessed 2026-05-31). **Quit Switchboard before running `task build`** unless you've confirmed `--config.npmRebuild=false` is in effect. **However**, replacing `~/Applications/Switchboard.AppImage` via `cp` AFTER the build is safe — the live process is fully extracted to `/tmp/.mount_*/` and doesn't need the on-disk file. The new code takes effect only on next launch.
+- **Rebuilding AND replacing are both risky while the app runs** — `task build` invokes `electron-builder`, which rebuilds native modules (`better-sqlite3`, `node-pty`) by default. Those `.node` files are loaded by your running AppImage; replacing them mid-run can kill the process (witnessed 2026-05-31). Building is safe only with `--config.npmRebuild=false`. Replacing `~/Applications/Switchboard.AppImage` via `cp` is **not reliably safe either**: the live process doesn't need the on-disk file (it runs from `/tmp/.mount_*/`), but `appimagelauncherd` watches `~/Applications/` and its desktop-integration re-run can cleanly terminate the running instance (witnessed 2026-06-04, non-deterministic). Do the `cp` only when you're ready to restart. The new code takes effect only on next launch.
 
 ### For AI agents
 
@@ -202,7 +220,8 @@ Set `GH_TOKEN` in your environment (a GitHub personal access token with `repo` s
 This fork's `main` is branch-protected and its `main` branch tracks `upstream/main`, both of which trip up the generic release flow above:
 
 - **A bare `git push` (no remote) targets `upstream` (`doctly/switchboard`), not `origin`** — it will fail with a permissions error. Always `git push origin ...` explicitly.
-- **Direct pushes to `main` are rejected** ("repository rule violations"). The version-bump commit must land via a PR (admin-merge is fine).
+- **Direct pushes to `main` are rejected** ("repository rule violations"). The version-bump commit must land via a PR. The ruleset requires 1 approving review from a different account plus green `test (20)` / `test (22)` checks; arm `gh pr merge --auto` and approve from the other account.
+- **The release workflow leaves the release as a draft on purpose** — after all assets are uploaded (19 expected), publish manually: `gh release edit v<X.Y.Z> --draft=false --latest --notes "..."`.
 - **Tag the merged commit on `main`, after the PR merges — never the local pre-merge bump commit.** Tagging first and then squash-merging creates a tag that isn't an ancestor of `main`; `git describe --tags` and release-notes generation then skip it. Correct order: PR-merge the bump → `git reset --hard origin/main` locally → tag → `git push origin <tag>`. If a build already started from a bad tag, cancel the run (`gh run cancel`) and delete + recreate the tag.
 - **Unsigned macOS builds need both `"mac": {"identity": null}` in `package.json` and `notarize: false`.** A `CSC_LINK` env that's set-but-empty (e.g. `${{ secrets.CSC_LINK || '' }}`) is read by electron-builder as a certificate *file path* — `stat('')` resolves to the CI working directory, and the mac job fails with `... not a file` only on tag-triggered (release) runs, never on PR builds. Gating `CSC_IDENTITY_AUTO_DISCOVERY` on whether the secret is set does **not** fix this; `identity: null` does.
 - **`gh release upload`/`create` can hit an intermittent 401 from `uploads.github.com` on a single asset** (often a `.blockmap`), aborting a batch upload and leaving a partial draft release. Upload assets one at a time with a retry loop (`for i in 1..5; do gh release upload "$TAG" "$f" --clobber && break; sleep 2; done`) instead of a single `gh release create ... dist/*` call.
@@ -228,11 +247,18 @@ The macOS build uses custom entitlements (`build/entitlements.mac.plist`) to all
 ## Project Structure
 
 ```
-main.js            Electron main process
-preload.js         Context bridge (IPC bindings)
-db.js              SQLite session cache & metadata
-public/            Renderer (HTML/CSS/JS)
-scripts/           Build & postinstall scripts
-build/             Icons, entitlements, builder resources
-.github/workflows/ CI/CD
+main.js             Electron main process (IPC, PTY sessions, watchers)
+preload.js          Context bridge (IPC bindings)
+db.js               SQLite session cache, metadata, FTS search
+session-cache.js    JSONL indexer + projects watcher
+schedule-runner.js  In-process cron for scheduled Claude tasks
+trigger-watcher.js  File-based command-injection API
+workers/            Worker threads (indexing, search queries)
+public/             Renderer (HTML/CSS/JS)
+test/               node:test suites (jsdom for renderer files)
+docs/               User-facing documentation
+.ai/                Agent guidelines + architecture context docs
+scripts/            Build & postinstall scripts
+build/              Icons, entitlements, builder resources
+.github/workflows/  CI/CD
 ```
