@@ -44,7 +44,7 @@ task dev   # Taskfile already sets SWITCHBOARD_DATA_DIR=~/.switchboard-dev by de
 
 The AppImage uses `~/.switchboard/switchboard.db`. The dev electron uses `~/.switchboard-dev/switchboard.db`. They cannot collide.
 
-### 2. Running `npm run build:linux` CAN kill the running instance — `cp` does not
+### 2. Running `npm run build:linux` CAN kill the running instance — and so can the `cp` to ~/Applications
 
 **Corrected 2026-05-31** — the previous version of this section claimed the build was safe. It isn't.
 
@@ -97,7 +97,7 @@ These exist on `devsuitup/switchboard` main but not on `doctly/switchboard` main
 - **Trigger watcher** — file-based command injection into open PTYs, single + chained (fork PR #24 and follow-ups); see [contexts/trigger-watcher.md](contexts/trigger-watcher.md)
 - **Schedule runner** — in-process cron spawning headless Claude tasks from `schedule-*.md` files; see [contexts/schedule-runner.md](contexts/schedule-runner.md)
 - **Session restore** — persist + restore the open working set across restarts (fork PR #80)
-- **Perf campaign v0.0.33–41** — 30fps terminal flush cap, WebGL virtualization, LRU xterm cap, targeted refreshes, idle-CPU fixes (fork PRs #55–#70)
+- **Perf campaign v0.0.33–41** — 30fps terminal flush cap, WebGL virtualization, LRU xterm cap, targeted refreshes, idle-CPU fixes (fork PRs #61–#83)
 - **Search off the main thread + bounded FTS query** — worker relay + 48-char cap (fork PR #97, v0.0.44)
 - **Resume/fork in real recorded cwd** for worktree sessions (fork PR #96, v0.0.44)
 

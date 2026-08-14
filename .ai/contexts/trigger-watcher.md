@@ -6,7 +6,7 @@
 
 | File | LOC | Role |
 |---|---|---|
-| `trigger-watcher.js` | ~175 | The entire module: directory setup, `fs.watch` listener, idle-wait logic, PTY write, result file. |
+| `trigger-watcher.js` | ~800 | The entire module: directory setup, `fs.watch` listener, idle-wait logic, single + chained trigger processing, submit-with-verify busy-rise/fall polling, input validation, PTY write, result file. |
 | `main.js` (wiring) | 15 | `require('./trigger-watcher').start(ctx)` in the `app.whenReady` block, right after `startScheduler`. |
 
 ## Public surface

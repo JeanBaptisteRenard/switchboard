@@ -8,7 +8,7 @@ Switchboard is a desktop app that gives you a unified view of all your Claude Co
 
 ## About this fork
 
-This repository is a fork of **[doctly/switchboard](https://github.com/doctly/switchboard)** — all credit for the original app goes to its author. The fork tracks upstream (features are ported in both directions when they fit) and is currently ~120 commits ahead. Highlights of what it adds:
+This repository is a fork of **[doctly/switchboard](https://github.com/doctly/switchboard)** — all credit for the original app goes to its author. The fork tracks upstream (features are ported in both directions when they fit) and is currently ~160 commits ahead. Highlights of what it adds:
 
 - **Subagent support & observability** — subagent transcripts are indexed and searchable, the sidebar shows the parent→child hierarchy with live spawn/completion indicators and status badges, and clicking a subagent opens a read-only transcript viewer instead of re-spawning Claude. See [docs/subagents.md](docs/subagents.md).
 - **Session restore** — reopen your whole working set (open sessions, order, active one) after a restart. See [docs/session-restore.md](docs/session-restore.md).

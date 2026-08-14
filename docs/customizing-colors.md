@@ -3,6 +3,8 @@
 > Guide pratique pour installer Switchboard, changer la couleur de fond, et appliquer un thème clair façon Claude / Cowork (fond crème, texte foncé, accent corail).
 >
 > Auteur : Jean-Luc PIETRI — 23/05/2026 — testé sur Switchboard v0.0.30 (Windows).
+>
+> *Note (2026-08) : guide écrit pour `doctly/switchboard` v0.0.30 ; ce dépôt est le fork `devsuitup/switchboard`, le lien d'installation ci-dessous pointe donc vers les releases du fork. Le contenu s'applique tel quel.*
 
 ---
 
