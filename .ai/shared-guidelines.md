@@ -16,6 +16,7 @@ Switchboard is an **Electron desktop app**: renderer + main-process, no Domain/A
 | Change Plans/Memory/.work-files panels (CodeMirror) | [contexts/viewer-panel.md](contexts/viewer-panel.md) |
 | Change the renderer (sidebar, terminal, app.js) | `public/*.js` — entry is `app.js` |
 | Write a test | `test/*.test.js` — node:test + jsdom for renderer files |
+| Working practices for AI agents (HANDOFF format, shell pitfalls, review loop) | [agent-practices.md](agent-practices.md) |
 
 For a guided tour of the codebase architecture, start at [contexts/README.md](contexts/README.md).
 
