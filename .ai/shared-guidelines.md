@@ -1,18 +1,8 @@
 # Switchboard — Notes for Claude (and other AI agents)
 
-@~/.skaleet-ai/conventions/rules.md
-
 This is JB's fork (`devsuitup/switchboard`, transferred from `JeanBaptisteRenard/switchboard` on 2026-08-11) of `doctly/switchboard`. The fork carries features not (yet) upstream — read this before editing anything.
 
-**Caveat on the universal rules import above**: Switchboard is an **Electron desktop app**, not a Skaleet backend service. The following sections from `rules.md` do NOT apply here:
-- DDD/CQRS architecture (no Domain/Application/Infrastructure layers — this is a renderer + main-process app)
-- `docker compose exec` runtime gating (we run npm / node directly on the host; only deps for the *target* repos are Dockerised)
-- `monitor-ci` skill (we use GitHub Actions, not GitLab CI; check status via `gh pr checks`)
-- `glab` rules (replaced by `gh` CLI for this fork)
-- `/pre-commit` skill (husky pre-commit runs `task check` automatically; the skill is for Skaleet PHP projects)
-- Conventional Commits — we use a looser style (`feat(scope): ...`, `fix(scope): ...`, but no strict footer rules)
-
-Everything else (HANDOFF protocol, agent dispatch rules, sub-agent model gate, worktree isolation requirement, no Co-Authored-By, shell-command pitfalls, memory hygiene) **does apply**.
+Switchboard is an **Electron desktop app**: renderer + main-process, no Domain/Application/Infrastructure layering. Runtimes (npm, node) run directly on the host — nothing here is Dockerised. CI is GitHub Actions (check status via `gh pr checks`); the `gh` CLI is used for PRs, not `glab`. The husky pre-commit hook runs `task check` automatically. Commit style is a loose `feat(scope): ...` / `fix(scope): ...`, with no strict footer rules.
 
 ## Quick orientation
 
@@ -67,7 +57,7 @@ After the agent completes, **remove the worktree manually** — `git worktree re
 
 ### 4. `.work-files/` is gitignored scratch space
 
-Skaleet workspace convention. Use it for session notes, proposals, plans, scratch JSONLs. It's enumerated by the Work Files sidebar tab — files appear there automatically.
+Gitignored scratch space. Use it for session notes, proposals, plans, scratch JSONLs. It's enumerated by the Work Files sidebar tab — files appear there automatically.
 
 ### 5. No `Co-Authored-By` trailers in commits
 
@@ -77,7 +67,7 @@ Workspace-level rule (`~/workspace/CLAUDE.md`). Applies to commits and MR/PR des
 
 If you're working autonomously (overnight, AFK mode) while the user's AppImage is live with an active session open, treat the app as **read-only from the outside** for the duration: no `npm run build:linux` / `task build` without the `--config.npmRebuild=false` flag (§2), no `cp` to `~/Applications/Switchboard.AppImage` (§2 — `appimagelauncherd` can silently kill the running instance), and no second `npx electron .` (§1 — it just quits and steals focus instead of giving you a usable dev process). None of these produce an obvious error at the time you run them; the damage shows up later as a dead session the user didn't ask to lose. If you need a live process to test against, use `SWITCHBOARD_DATA_DIR` isolation (§1) and only do the disruptive steps (uncontrolled rebuild, `cp` swap) once the user is ready to restart.
 
-> This is a Switchboard-specific writeup of a more general pattern — "don't touch shared mutable state a human is actively using" applies to any AI agent working unattended alongside a live app. Worth considering as a skaleet-ai convention someday; not proposed here.
+> This is a Switchboard-specific writeup of a more general pattern — "don't touch shared mutable state a human is actively using" applies to any AI agent working unattended alongside a live app.
 
 ## Fork-specific features (not in upstream)
 

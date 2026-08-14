@@ -98,7 +98,7 @@ test('replica: query containing a double-quote is escaped', () => {
 });
 
 test('replica: 60-char URL is truncated to ≤ FTS_QUERY_MAX_CHARS before quoting', () => {
-  const url = 'https://gitlab.com/skaleet/product/tagpay/-/merge_requests/25629';
+  const url = 'https://gitlab.example.com/product/example-project/-/merge_requests/25629';
   assert.ok(url.length > FTS_QUERY_MAX_CHARS, 'test URL must be longer than the cap');
   const expr = buildMatchExpression(url);
   // The phrase content (without surrounding quotes) must be ≤ cap
@@ -110,7 +110,7 @@ test('replica: 60-char URL is truncated to ≤ FTS_QUERY_MAX_CHARS before quotin
 });
 
 test('replica: trigram count for bounded URL is ≤ 46 (phrase-intersect safe for main thread)', () => {
-  const url = 'https://gitlab.com/skaleet/product/tagpay/-/merge_requests/25629';
+  const url = 'https://gitlab.example.com/product/example-project/-/merge_requests/25629';
   const expr = buildMatchExpression(url);
   const inner = expr.replace(/^"|"$/g, '');
   const ngrams = trigramCount(inner);

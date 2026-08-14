@@ -79,4 +79,3 @@ Trigger file is **deleted** after processing (success or failure).
 - If you rename `_cliBusy` on `session` in `main.js`, update `isSessionBusy` in the `start(ctx)` wiring block.
 - If you rename `activeSessions` or change the structure (`session.pty` → `session.ptyProcess`), update both `getPtyForSession` and `isSessionBusy` in the wiring block.
 - Tests live in `test/trigger-watcher.test.js`.  They use `SWITCHBOARD_TRIGGERS_DIR` env override — do not hardcode paths there.
-- The convention doc for harness script authors lives at `~/.skaleet-ai/conventions/how-to/switchboard-trigger.md`.
