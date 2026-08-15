@@ -45,6 +45,24 @@ const cleanPtyEnv = Object.fromEntries(
   )
 );
 
+// Windows: prefer node-pty's bundled ConPTY (conpty.dll + OpenConsole.exe)
+// over the OS inbox one. The inbox ConPTY re-renders TUI frames itself and is a
+// known source of ghost/duplicated lines and torn rows during Claude Code
+// redraws — artifacts that end up in the xterm buffer, so no renderer-side
+// repaint can remove them. VS Code ships the same flag for the same reason.
+// SWITCHBOARD_NO_CONPTY_DLL=1 reverts to the inbox ConPTY without a rebuild.
+function spawnPty(file, args, opts) {
+  if (process.platform === 'win32' && !process.env.SWITCHBOARD_NO_CONPTY_DLL) {
+    try {
+      return pty.spawn(file, args, { ...opts, useConptyDll: true });
+    } catch (err) {
+      // e.g. conpty.dll not found next to the binding — inbox ConPTY still works
+      log.warn(`[pty] useConptyDll spawn failed, falling back to inbox ConPTY: ${err.message}`);
+    }
+  }
+  return pty.spawn(file, args, opts);
+}
+
 // Shell profiles → shell-profiles.js
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgvForShell } = require('./shell-profiles');
 const { startScheduler } = require('./schedule-runner');
@@ -1687,7 +1705,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       // Plain terminal: interactive login shell, no claude command
       // Inject a shell function to override `claude` with a helpful message
       const claudeShim = 'claude() { echo "\\033[33mTo start a Claude session, use the + button in the sidebar.\\033[0m"; return 1; }; export -f claude 2>/dev/null;';
-      ptyProcess = pty.spawn(shell, shellArgs(shell, undefined, shellExtraArgs), {
+      ptyProcess = spawnPty(shell, shellArgs(shell, undefined, shellExtraArgs), {
         name: 'xterm-256color',
         cols: spawnCols,
         rows: spawnRows,
@@ -1784,7 +1802,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         ptyEnv.CLAUDE_CODE_SSE_PORT = String(mcpServer.port);
       }
 
-      ptyProcess = pty.spawn(shell, shellArgs(shell, claudeCmd, shellExtraArgs), {
+      ptyProcess = spawnPty(shell, shellArgs(shell, claudeCmd, shellExtraArgs), {
         name: 'xterm-256color',
         cols: spawnCols,
         rows: spawnRows,

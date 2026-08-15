@@ -64,6 +64,7 @@
   },
   "build": {
     "appId": "ai.doctly.switchboard",
+    "afterPack": "scripts/after-pack.js",
     "productName": "Switchboard",
     "files": [
       "*.js",
