@@ -61,6 +61,16 @@ function setupTerminalKeyBindings(terminal, container, getSessionId, { onFind } 
       return false;
     }
 
+    // F11 → window fullscreen toggle. Without this, xterm consumes the keydown
+    // (writes CSI 23~ to the PTY) and preventDefaults it, which suppresses the
+    // menu's togglefullscreen accelerator — so F11 only worked when the focus
+    // was outside the terminal, and there was no way out of fullscreen on
+    // Windows/Linux where the menu bar is hidden in that state.
+    if (e.key === 'F11' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
+      if (e.type === 'keydown') window.api.toggleFullScreen();
+      return false;
+    }
+
     // Toggle grid view (default Cmd/Ctrl+Shift+G)
     if (matchShortcut('gridToggle', e, isMac, appShortcuts)) {
       if (e.type === 'keydown') { e._handled = true; toggleGridView(); }

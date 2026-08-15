@@ -274,6 +274,18 @@ function createWindow() {
     if (key === 'r' && input.control && input.shift) event.preventDefault();
   });
 
+  // Renderer-driven fullscreen toggle (F11 lands in xterm, which consumes the
+  // keydown before the menu accelerator can fire — the terminal forwards it
+  // here instead). Notify the renderer on every change, whatever triggered it
+  // (menu click, IPC, OS shortcut), so it can refocus the active terminal —
+  // otherwise the focus is lost on the transition and typing goes nowhere.
+  const sendFullScreenChanged = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send('full-screen-changed', mainWindow.isFullScreen());
+  };
+  mainWindow.on('enter-full-screen', sendFullScreenChanged);
+  mainWindow.on('leave-full-screen', sendFullScreenChanged);
+
   // Save window bounds on move/resize (debounced)
   let boundsTimer = null;
   const saveBounds = () => {
@@ -657,6 +669,12 @@ ipcMain.handle('read-clipboard', () => clipboard.readText());
 // strings attached, so all terminal copies go through here.
 ipcMain.handle('clipboard-write-text', (_event, text) => {
   if (typeof text === 'string') clipboard.writeText(text);
+});
+
+ipcMain.handle('toggle-full-screen', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  mainWindow.setFullScreen(!mainWindow.isFullScreen());
+  return mainWindow.isFullScreen();
 });
 
 // --- IPC: does the clipboard hold an image? ---

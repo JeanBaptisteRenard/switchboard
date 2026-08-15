@@ -46,7 +46,7 @@ function makeTerminalStub(spies) {
     refresh() {}
     hasSelection() { return false; }
     getSelection() { return ''; }
-    attachCustomKeyEventHandler() {}
+    attachCustomKeyEventHandler(cb) { this._customKeyHandler = cb; }
     onData() {}
     onResize(cb) { this._onResize = cb; }
     onTitleChange() {}
