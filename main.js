@@ -1811,6 +1811,23 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         }
       }
 
+      // Anchor the working directory in the command itself. pty.spawn's `cwd`
+      // is set below, but it does not survive in practice: the login+interactive
+      // shell (`bash -l -i -c`) sources the user's profile first, and anything
+      // there that changes directory — or any environment that hands the PTY
+      // the app's own cwd — silently relocates claude. It then derives its
+      // project folder from the wrong directory and reports "No conversation
+      // found with session ID", and with Sandbox on it binds the wrong tree.
+      // `&&` so a failed cd aborts rather than running claude somewhere random.
+      if (!isWsl && spawnCwd) {
+        const base = path.basename(shell).toLowerCase();
+        const posixish = base.includes('bash') || base.includes('zsh')
+          || base === 'sh' || base === 'dash' || base === 'ksh';
+        if (posixish) {
+          claudeCmd = quoteArgvForShell(shell, ['cd', spawnCwd]) + ' && ' + claudeCmd;
+        }
+      }
+
       const ptyEnv = {
         ...cleanPtyEnv,
         TERM: 'xterm-256color', COLORTERM: 'truecolor',
