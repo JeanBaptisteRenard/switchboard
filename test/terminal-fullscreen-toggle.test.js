@@ -11,13 +11,15 @@ const assert = require('node:assert');
 const { setupTerminalDom } = require('./terminal-manager-harness');
 
 function f11Event(type, mods = {}) {
-  return {
+  const e = {
     type,
     key: 'F11',
     ctrlKey: false, altKey: false, metaKey: false, shiftKey: false,
+    defaultPrevented: false,
+    preventDefault() { e.defaultPrevented = true; },
     ...mods,
-    preventDefault() {},
   };
+  return e;
 }
 
 test('F11 in the terminal toggles window fullscreen and is blocked from xterm', () => {
@@ -29,7 +31,11 @@ test('F11 in the terminal toggles window fullscreen and is blocked from xterm', 
     const handler = entry.terminal._customKeyHandler;
     assert.strictEqual(typeof handler, 'function', 'custom key handler attached');
 
-    assert.strictEqual(handler(f11Event('keydown')), false, 'keydown blocked from xterm');
+    const down = f11Event('keydown');
+    assert.strictEqual(handler(down), false, 'keydown blocked from xterm');
+    // Without preventDefault the keydown also reaches the menu accelerator,
+    // which toggles fullscreen right back — F11 appears to do nothing.
+    assert.strictEqual(down.defaultPrevented, true, 'menu accelerator suppressed');
     assert.strictEqual(handler(f11Event('keyup')), false, 'keyup blocked from xterm');
     assert.strictEqual(toggles, 1, 'toggled exactly once (keydown only)');
   } finally {
