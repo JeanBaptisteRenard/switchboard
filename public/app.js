@@ -12,6 +12,10 @@ const terminalHeaderName = document.getElementById('terminal-header-name');
 const terminalHeaderId = document.getElementById('terminal-header-id');
 const terminalHeaderStatus = document.getElementById('terminal-header-status');
 const terminalHeaderShell = document.getElementById('terminal-header-shell');
+const terminalHeaderSandbox = document.getElementById('terminal-header-sandbox');
+// sessionId -> whether that session's claude runs inside the bwrap sandbox.
+const sandboxedSessions = new Map();
+function setSessionSandboxed(sessionId, on) { sandboxedSessions.set(sessionId, !!on); }
 const terminalStopBtn = document.getElementById('terminal-stop-btn');
 const runningToggle = document.getElementById('running-toggle');
 const todayToggle = document.getElementById('today-toggle');
@@ -990,6 +994,7 @@ async function launchNewSession(project, sessionOptions) {
   }
   syncPtySizeAfterOpen(entry);
   if (typeof setSessionMcpActive === 'function') setSessionMcpActive(sessionId, !!result.mcpActive);
+  setSessionSandboxed(sessionId, result.sandbox);
 
   showSession(sessionId);
   schedulePersistWorkingSet();
@@ -1005,6 +1010,7 @@ async function showTerminalHeader(session) {
   const displayName = cleanDisplayName(session.name || session.aiTitle || session.summary);
   terminalHeaderName.textContent = displayName;
   terminalHeaderId.textContent = session.sessionId;
+  terminalHeaderSandbox.style.display = sandboxedSessions.get(session.sessionId) ? '' : 'none';
   terminalHeader.style.display = '';
   updateTerminalHeader();
 
@@ -1059,6 +1065,7 @@ async function openSession(session, customOptions) {
   }
   syncPtySizeAfterOpen(entry);
   if (typeof setSessionMcpActive === 'function') setSessionMcpActive(sessionId, !!result.mcpActive);
+  setSessionSandboxed(sessionId, result.sandbox);
 
   showSession(sessionId);
   schedulePersistWorkingSet();

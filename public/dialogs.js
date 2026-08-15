@@ -17,6 +17,7 @@ async function resolveDefaultSessionOptions(project) {
     if (effective.worktreeName) options.worktreeName = effective.worktreeName;
   }
   if (effective.chrome) options.chrome = true;
+  if (effective.sandbox && window.api.platform === 'linux') options.sandbox = true;
   if (effective.preLaunchCmd) options.preLaunchCmd = effective.preLaunchCmd;
   if (effective.addDirs) options.addDirs = effective.addDirs;
   if (effective.mcpEmulation === false) options.mcpEmulation = false;
@@ -73,6 +74,7 @@ async function launchScheduleCreator(project) {
   }
   syncPtySizeAfterOpen(entry);
   if (typeof setSessionMcpActive === 'function') setSessionMcpActive(result.sessionId, !!openResult.mcpActive);
+  if (typeof setSessionSandboxed === 'function') setSessionSandboxed(result.sessionId, openResult.sandbox);
   showSession(result.sessionId);
   pollActiveSessions();
 }
@@ -218,6 +220,15 @@ async function showNewSessionDialog(project) {
         <label class="settings-toggle"><input type="checkbox" id="nsd-chrome" ${effective.chrome ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
       </div>
     </div>
+    ${window.api.platform === 'linux' ? `<div class="settings-field">
+      <div class="settings-field-info">
+        <span class="settings-label">Sandbox</span>
+        <div class="settings-description">Run claude in a bubblewrap sandbox — only the project and Claude's own dirs are visible</div>
+      </div>
+      <div class="settings-field-control">
+        <label class="settings-toggle"><input type="checkbox" id="nsd-sandbox" ${effective.sandbox ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
+      </div>
+    </div>` : ''}
     <div class="settings-field settings-field-wide">
       <div class="settings-field-info">
         <span class="settings-label">Pre-launch Command</span>
@@ -280,6 +291,10 @@ async function showNewSessionDialog(project) {
     if (dialog.querySelector('#nsd-chrome').checked) {
       options.chrome = true;
     }
+    const sandboxToggle = dialog.querySelector('#nsd-sandbox');
+    if (sandboxToggle && sandboxToggle.checked) {
+      options.sandbox = true;
+    }
     const preLaunch = dialog.querySelector('#nsd-pre-launch').value.trim();
     if (preLaunch) options.preLaunchCmd = preLaunch;
     options.addDirs = dialog.querySelector('#nsd-add-dirs').value.trim();
@@ -339,6 +354,15 @@ async function showResumeSessionDialog(session) {
         <label class="settings-toggle"><input type="checkbox" id="rsd-chrome" ${effective.chrome ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
       </div>
     </div>
+    ${window.api.platform === 'linux' ? `<div class="settings-field">
+      <div class="settings-field-info">
+        <span class="settings-label">Sandbox</span>
+        <div class="settings-description">Run claude in a bubblewrap sandbox — only the project and Claude's own dirs are visible</div>
+      </div>
+      <div class="settings-field-control">
+        <label class="settings-toggle"><input type="checkbox" id="rsd-sandbox" ${effective.sandbox ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
+      </div>
+    </div>` : ''}
     <div class="settings-field settings-field-wide">
       <div class="settings-field-info">
         <span class="settings-label">Pre-launch Command</span>
@@ -396,6 +420,10 @@ async function showResumeSessionDialog(session) {
     }
     if (dialog.querySelector('#rsd-chrome').checked) {
       options.chrome = true;
+    }
+    const sandboxToggle = dialog.querySelector('#rsd-sandbox');
+    if (sandboxToggle && sandboxToggle.checked) {
+      options.sandbox = true;
     }
     const preLaunch = dialog.querySelector('#rsd-pre-launch').value.trim();
     if (preLaunch) options.preLaunchCmd = preLaunch;

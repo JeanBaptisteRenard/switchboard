@@ -1373,6 +1373,7 @@ const SETTING_DEFAULTS = {
   worktree: false,
   worktreeName: '',
   chrome: false,
+  sandbox: false,
   preLaunchCmd: '',
   addDirs: '',
   visibleSessionCount: 5,
@@ -1596,6 +1597,44 @@ ipcMain.handle('archive-session', (_event, sessionId, archived) => {
   return { archived: val };
 });
 
+// --- Sandbox launch helpers (Linux / bubblewrap) ---
+// In the packaged app main.js lives inside app.asar, which bash cannot read
+// from — the script is asarUnpacked (see package.json build config). The
+// separator-anchored pattern rewrites only the real app.asar path segment,
+// not an install directory whose name merely contains "app.asar".
+function sandboxScriptPath() {
+  return path.join(__dirname, 'scripts', 'claude-sandbox.sh')
+    .replace(/app\.asar([\\/])/, 'app.asar.unpacked$1');
+}
+
+// "Additional Directories" is a comma-separated free-text field. Single parse
+// point so the claude `--add-dir` args and the sandbox bind list can never
+// disagree about what the user typed.
+function parseAddDirs(value) {
+  if (!value) return [];
+  return String(value).split(',').map(d => d.trim()).filter(Boolean);
+}
+
+// SWITCHBOARD_SANDBOX_BINDS is colon-separated (env vars cannot carry NUL), so
+// a path that itself contains ':' cannot be transported — the script would
+// split it into fragments and never bind the real directory. Newlines are
+// rejected for the same reason: they survive the env var but not every shell
+// splitter downstream. Drop such paths loudly instead of half-binding them.
+function sandboxBindEnv(dirs) {
+  const usable = dirs.filter(d => {
+    if (d.includes(':')) {
+      log.warn(`[sandbox] skipping extra bind — ':' in path is unsupported: ${JSON.stringify(d)}`);
+      return false;
+    }
+    if (/[\r\n]/.test(d)) {
+      log.warn(`[sandbox] skipping extra bind — newline in path is unsupported: ${JSON.stringify(d)}`);
+      return false;
+    }
+    return true;
+  });
+  return usable.length ? usable.join(':') : undefined;
+}
+
 // --- IPC: open-terminal ---
 ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, sessionOptions, initialSize) => {
   if (!mainWindow) return { ok: false, error: 'no window' };
@@ -1622,7 +1661,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       mainWindow.webContents.send('terminal-data', sessionId, '\x1b[?25l');
     }
 
-    return { ok: true, reattached: true, mcpActive: !!session.mcpServer };
+    return { ok: true, reattached: true, mcpActive: !!session.mcpServer, sandbox: !!session.sandbox };
   }
 
   // For a Claude resume, spawn in the session's real recorded cwd (e.g. its
@@ -1777,11 +1816,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         if (sessionOptions.chrome) {
           claudeArgs.push('--chrome');
         }
-        if (sessionOptions.addDirs) {
-          const dirs = String(sessionOptions.addDirs).split(',').map(d => d.trim()).filter(Boolean);
-          for (const dir of dirs) {
-            claudeArgs.push('--add-dir', dir);
-          }
+        for (const dir of parseAddDirs(sessionOptions.addDirs)) {
+          claudeArgs.push('--add-dir', dir);
         }
       }
 
@@ -1790,6 +1826,16 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       }
 
       let claudeCmd = 'claude ' + quoteArgvForShell(shell, claudeArgs);
+
+      // Sandbox: run claude inside a bubblewrap sandbox that only exposes the
+      // project directory and Claude's own config/state dirs. Linux only —
+      // bwrap has no macOS/Windows equivalent wired up here.
+      if (sessionOptions?.sandbox) {
+        if (process.platform !== 'linux') {
+          return { ok: false, error: 'Sandbox mode requires Linux (bubblewrap)' };
+        }
+        claudeCmd = quoteArgvForShell(shell, ['bash', sandboxScriptPath()]) + ' ' + quoteArgvForShell(shell, claudeArgs);
+      }
 
       // preLaunchCmd is raw shell by design (e.g. "aws-vault exec profile --") — block newlines only
       if (sessionOptions?.preLaunchCmd) {
@@ -1819,6 +1865,16 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       if (mcpServer) {
         ptyEnv.CLAUDE_CODE_SSE_PORT = String(mcpServer.port);
       }
+      if (sessionOptions?.sandbox) {
+        // Directories the sandboxed claude must still reach beyond the cwd:
+        // the project root when resuming inside a worktree (git metadata lives
+        // there), and any user-configured Additional Directories.
+        const extraBinds = [];
+        if (projectPath && projectPath !== spawnCwd) extraBinds.push(projectPath);
+        extraBinds.push(...parseAddDirs(sessionOptions.addDirs));
+        const bindEnv = sandboxBindEnv(extraBinds);
+        if (bindEnv) ptyEnv.SWITCHBOARD_SANDBOX_BINDS = bindEnv;
+      }
 
       ptyProcess = spawnPty(shell, shellArgs(shell, claudeCmd, shellExtraArgs), {
         name: 'xterm-256color',
@@ -1842,6 +1898,9 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     projectPath, firstResize: true,
     projectFolder, knownJsonlFiles, sessionSlug,
     isPlainTerminal, forkFrom: sessionOptions?.forkFrom || null,
+    // Recorded so a reattach can report it too — the renderer badges sandboxed
+    // sessions, and a reattached session is still inside the same sandbox.
+    sandbox: !!sessionOptions?.sandbox,
     mcpServer, _openedAt: Date.now(),
   };
   activeSessions.set(sessionId, session);
@@ -1958,7 +2017,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     log.info(`[fork-spawn] tempId=${sessionId} forkFrom=${sessionOptions.forkFrom} folder=${projectFolder} knownFiles=${knownJsonlFiles.size}`);
   }
 
-  return { ok: true, reattached: false, mcpActive: !!mcpServer };
+  return { ok: true, reattached: false, mcpActive: !!mcpServer, sandbox: !!sessionOptions?.sandbox };
 });
 
 // --- IPC: terminal-input (fire-and-forget) ---
@@ -2177,14 +2236,45 @@ if (!gotSingleInstanceLock) {
       const shell = profile.path;
       // Re-serialise the safe argv into a shell string so the user's login shell
       // can initialise its profile (PATH, version managers, etc.) before running claude.
-      const cmd = 'claude ' + quoteArgvForShell(shell, claudeArgv);
+      let cmd = 'claude ' + quoteArgvForShell(shell, claudeArgv);
+      const env = { ...cleanPtyEnv, FORCE_COLOR: '0' };
+
+      // Scheduled runs honor the effective sandbox setting like interactive
+      // sessions do — an unattended headless run is exactly where the
+      // isolation matters most. Same global → project override chain as
+      // get-effective-settings.
+      const projectSettings = getSetting('project:' + cwd) || {};
+      let sandbox = SETTING_DEFAULTS.sandbox;
+      if (globalSettings.sandbox !== undefined) sandbox = globalSettings.sandbox;
+      if (projectSettings.sandbox !== undefined) sandbox = projectSettings.sandbox;
+      if (sandbox && process.platform !== 'linux') {
+        // Fail closed, exactly like the interactive path: the whole point of
+        // asking for a sandbox is not running unconfined. Silently downgrading
+        // an unattended run to "no isolation" is the one outcome the user
+        // cannot notice, so skip the run and surface the error instead.
+        log.error(`[schedule] ${name}: skipped — sandbox is enabled but requires Linux (bubblewrap)`);
+        if (onDone) onDone();
+        return;
+      }
+      if (sandbox) {
+        cmd = quoteArgvForShell(shell, ['bash', sandboxScriptPath()]) + ' ' + quoteArgvForShell(shell, claudeArgv);
+        // A schedule's `cli: add-dirs:` paths surface in the argv as
+        // --add-dir pairs — bind them like interactive sessions bind
+        // Additional Directories.
+        const addDirs = [];
+        for (let i = 0; i < claudeArgv.length - 1; i++) {
+          if (claudeArgv[i] === '--add-dir') addDirs.push(claudeArgv[i + 1]);
+        }
+        const bindEnv = sandboxBindEnv(addDirs);
+        if (bindEnv) env.SWITCHBOARD_SANDBOX_BINDS = bindEnv;
+      }
       const args = shellArgs(shell, cmd, profile.args || []);
 
       log.info(`[schedule] Running: ${shell} ${args.join(' ')}`);
       const child = cpSpawn(shell, args, {
         cwd,
         stdio: ['ignore', 'ignore', 'pipe'],
-        env: { ...cleanPtyEnv, FORCE_COLOR: '0' },
+        env,
       });
 
       let stderr = '';

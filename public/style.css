@@ -1294,6 +1294,21 @@ body { display: flex; flex-direction: column; }
   flex-shrink: 0;
 }
 
+/* Sandboxed sessions carry a lock badge — the isolation is invisible otherwise,
+   and a user who cannot tell whether it is on cannot rely on it. Styled like
+   the shell badge but tinted, so it reads as a state rather than a label. */
+#terminal-header-sandbox {
+  font-size: 10px;
+  color: #7fd7a4;
+  background: rgba(127, 215, 164, 0.12);
+  border: 1px solid rgba(127, 215, 164, 0.25);
+  padding: 0 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: help;
+}
+
 #terminal-header-controls {
   display: flex;
   align-items: center;

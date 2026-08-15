@@ -16,7 +16,45 @@ Open settings via the gear icon in the toolbar. The title bar shows whether you 
 | **Worktree** | Toggle | Off | Enable worktree for new sessions. When on, Claude is started inside a git worktree. |
 | **Worktree Name** | Text | auto | Custom name for worktree branches. Leave blank to auto-generate. |
 | **Chrome** | Toggle | Off | Enable Chrome browser automation (`--chrome` flag). |
+| **Sandbox** | Toggle | Off | Linux only. Run `claude` inside a [bubblewrap](https://github.com/containers/bubblewrap) sandbox that hides the rest of `$HOME`. Requires `bwrap` to be installed. Takes effect for new sessions (interactive and scheduled). See [What the sandbox does and doesn't isolate](#what-the-sandbox-does-and-doesnt-isolate). |
 | **Additional Directories** | Text | — | Comma-separated list of extra directories to include in Claude sessions (passed as additional context paths). |
+
+#### What the sandbox does and doesn't isolate
+
+The sandbox is a **filesystem** boundary, built with `bwrap` by `scripts/claude-sandbox.sh` (shipped inside the app — only bubblewrap itself needs to be installed).
+
+Visible inside the sandbox:
+
+- **read-write** — the project directory, Additional Directories, the project root when resuming a worktree session, and Claude's own state: `~/.claude`, `~/.claude.json`, `~/.config/claude`, `~/.cache/claude`, `~/.local/share/claude`.
+- **read-only** — `/usr`, `/etc`, the resolved `claude` binary's directory, the resolved `node` interpreter's directory, `$NVM_DIR`, and the podman API socket when one is live.
+
+Everything else — the rest of `$HOME` in particular (`~/.ssh`, `~/.gitconfig`, other projects' source trees) — does not exist inside the sandbox.
+
+Deliberately **not** isolated — know these before relying on it:
+
+- **Environment variables are inherited.** No `--clearenv`: anything exported in your shell profile or injected by a Pre-launch Command (`AWS_*`, tokens, agent sockets) is visible inside the sandbox.
+- **The network is the host's** (`--share-net`). Claude needs the Anthropic API, and the Switchboard IDE bridge listens on localhost — but this also means other localhost services and the LAN are reachable.
+- **Claude's state is shared across projects.** `~/.claude` holds credentials and *every* project's transcripts and memory; a sandboxed session can read all of it. The boundary protects the rest of `$HOME`, not one project from another.
+- **The `claude` binary is not always read-only.** With the native installer the versioned binary lives under `~/.local/share/claude`, which has to be read-write for Claude's own updates — so on that layout the binary's directory is writable inside the sandbox. On npm/nvm layouts it is read-only. The wrapper detects which case applies and drops the misleading read-only bind rather than pretending it holds.
+
+A session running inside the sandbox shows a **🔒 Sandbox** badge in the terminal header, so you can tell at a glance whether the isolation is on; hovering it summarises what is and isn't confined.
+
+Prerequisites and known blockers:
+
+- **Ubuntu 23.10 and later (24.04 LTS included) block this out of the box.** Those releases default to `kernel.apparmor_restrict_unprivileged_userns=1` and the distro `bubblewrap` package ships no AppArmor profile of its own, so *every* unprivileged `bwrap` — not just a nested one — fails at `bwrap: setting up uid map: Permission denied`. The failure is safe (nothing launches) and the wrapper prints the remedies; pick one:
+  - relax the restriction: `echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-apparmor-userns.conf && sudo sysctl --system`
+  - or keep it on globally and grant `bwrap` an AppArmor profile containing `userns,`.
+- **Run `claude` once outside the sandbox first.** If `~/.claude` does not exist the wrapper refuses to launch, rather than pre-seed a config the CLI is about to initialise itself.
+
+Practical limitations:
+
+- `~/.gitconfig` is not visible, so `git commit` inside the sandbox has no user identity unless the repo sets one locally.
+- Claude Code's own Bash-tool sandboxing also uses namespaces, so it needs unprivileged user namespaces too. Where those are available to the outer sandbox they are generally available to the inner one as well, but if the Bash tool starts failing only under Sandbox mode, disable one of the two layers.
+- **Docker is not reachable.** Only podman's API socket is bound. Neither `/var/run/docker.sock` nor a rootless `$XDG_RUNTIME_DIR/docker.sock` exists inside the sandbox, so `docker` / `docker compose` commands will fail — relevant for projects whose test suite runs in Compose.
+- Extra bind paths containing `:` or a newline cannot be forwarded (the bind list is a colon-separated env var) — they are skipped with a warning in the main log.
+- Debugging: put `SWITCHBOARD_SANDBOX_DEBUG=1` in the session's Pre-launch Command to print every bind and the full `bwrap` invocation; a pre-flight reports bwrap setup errors before claude starts.
+
+Non-Linux platforms: the toggle is hidden, and a session or schedule that still carries `sandbox: true` (e.g. from a settings file synced from a Linux machine) is refused rather than run unconfined — including scheduled runs, where nobody is watching.
 
 ### Session Launch
 
@@ -65,6 +103,7 @@ The following fields are available per project:
 | **Worktree** | Enable or disable worktree for new sessions in this project. |
 | **Worktree Name** | Override the worktree branch name for this project. |
 | **Chrome** | Enable or disable Chrome browser automation for this project. |
+| **Sandbox** | Enable or disable the bubblewrap sandbox for this project (Linux only). |
 | **Additional Directories** | Extra directories specific to this project. |
 | **Pre-launch Command** | Override the pre-launch command for this project. |
 
