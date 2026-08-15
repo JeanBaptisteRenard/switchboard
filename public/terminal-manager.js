@@ -231,10 +231,24 @@ function fitAndScroll(entry) {
   const wasAtBottom = isAtBottom(entry.terminal);
   requestAnimationFrame(() => {
     safeFit(entry);
+    forceRepaint(entry);
     if (wasAtBottom) {
       entry.terminal.scrollToBottom();
     }
   });
+}
+
+// The WebGL renderer keeps a glyph texture atlas that survives display:none and
+// reparenting (single-view <-> grid). On reveal, safeFit only repaints when the
+// dimensions actually change, so a same-size terminal redraws from the stale
+// atlas and shows ghosted or vertically misplaced glyphs (a manual resize or a
+// select/deselect clears it). Clear the atlas and force a full row refresh
+// whenever a terminal is revealed.
+function forceRepaint(entry) {
+  if (entry.webglAddon) {
+    try { entry.webglAddon.clearTextureAtlas(); } catch { /* addon disposed mid-flight */ }
+  }
+  entry.terminal.refresh(0, entry.terminal.rows - 1);
 }
 
 // --- PTY size synchronisation ---
@@ -677,6 +691,14 @@ function loadTerminalWebgl(entry) {
       if (entry.webglAddon === webglAddon) entry.webglAddon = null;
     });
     entry.terminal.loadAddon(webglAddon);
+    // When the glyph texture atlas is rebuilt or extended (e.g. it overflows
+    // after Claude emits many distinct box-drawing/unicode glyphs), cells
+    // rendered earlier keep pointing at stale atlas slots and show ghosted or
+    // garbled glyphs. Repaint all visible rows so they re-resolve against the
+    // new atlas.
+    const repaintVisible = () => entry.terminal.refresh(0, entry.terminal.rows - 1);
+    webglAddon.onChangeTextureAtlas(repaintVisible);
+    webglAddon.onAddTextureAtlasCanvas(repaintVisible);
     entry.webglAddon = webglAddon;
   } catch (e) {
     console.warn('[terminal] WebGL addon failed, falling back to DOM renderer', e);

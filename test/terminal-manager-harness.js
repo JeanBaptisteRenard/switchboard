@@ -43,6 +43,7 @@ function makeTerminalStub(spies) {
     }
     scrollToBottom() {}
     scrollLines() {}
+    refresh() {}
     hasSelection() { return false; }
     getSelection() { return ''; }
     attachCustomKeyEventHandler() {}
@@ -113,7 +114,7 @@ function setupTerminalDom(opts = {}) {
     WebLinksAddon: { WebLinksAddon: noopClass },
     SearchAddon: { SearchAddon: class { clearDecorations() {} findNext() {} findPrevious() {} } },
     UnicodeGraphemesAddon: { UnicodeGraphemesAddon: noopClass },
-    WebglAddon: { WebglAddon: class { dispose() { spies.webglDispose++; } onContextLoss() {} } },
+    WebglAddon: { WebglAddon: class { dispose() { spies.webglDispose++; } onContextLoss() {} onChangeTextureAtlas() {} onAddTextureAtlasCanvas() {} clearTextureAtlas() {} } },
     ResizeObserver: makeResizeObserverStub(spies),
 
     TERMINAL_THEME: { background: '#000000' },

@@ -461,6 +461,7 @@ test('safeFit: clamps rows to content box when cell height is available via _cor
     resize(cols, rows) { resizeCalls.push({ cols, rows }); }
     scrollToBottom() {}
     scrollLines() {}
+    refresh() {}
     hasSelection() { return false; }
     getSelection() { return ''; }
     attachCustomKeyEventHandler() {}
@@ -482,7 +483,7 @@ test('safeFit: clamps rows to content box when cell height is available via _cor
     WebLinksAddon: { WebLinksAddon: noopClass },
     SearchAddon: { SearchAddon: class { clearDecorations() {} findNext() {} findPrevious() {} } },
     UnicodeGraphemesAddon: { UnicodeGraphemesAddon: noopClass },
-    WebglAddon: { WebglAddon: class { dispose() {} onContextLoss() {} } },
+    WebglAddon: { WebglAddon: class { dispose() {} onContextLoss() {} onChangeTextureAtlas() {} onAddTextureAtlasCanvas() {} clearTextureAtlas() {} } },
     TERMINAL_THEME: { background: '#000000' },
     terminalsEl: window.document.getElementById('terminals'),
     openSessions: new Map(),
