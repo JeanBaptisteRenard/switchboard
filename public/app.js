@@ -1361,6 +1361,16 @@ window.api.onStatusUpdate((text, type) => {
   }
 });
 
+// Refocus the active terminal after a fullscreen transition (F11, menu, IPC).
+// The transition reflows the window and drops keyboard focus on <body>, so
+// without this the user lands in fullscreen unable to type.
+window.api.onFullScreenChanged(() => {
+  requestAnimationFrame(() => {
+    const entry = activeSessionId && openSessions.get(activeSessionId);
+    if (entry && !entry.closed) entry.terminal.focus();
+  });
+});
+
 // --- Auto-update status + toast ---
 const statusBarUpdater = document.getElementById('status-bar-updater');
 let updaterStatusTimer = null;

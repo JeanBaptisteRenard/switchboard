@@ -51,6 +51,7 @@ contextBridge.exposeInMainWorld('api', {
   worktreeStatus: (worktreePath) => ipcRenderer.invoke('worktree-status', worktreePath),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
   openPath: (filePath) => ipcRenderer.invoke('open-path', filePath),
+  toggleFullScreen: () => ipcRenderer.invoke('toggle-full-screen'),
   writeClipboard: (text) => ipcRenderer.invoke('clipboard-write-text', text),
   readClipboard: () => ipcRenderer.invoke('read-clipboard'),
   clipboardHasImage: () => ipcRenderer.invoke('clipboard-has-image'),
@@ -87,6 +88,9 @@ contextBridge.exposeInMainWorld('api', {
   },
   onStatusUpdate: (callback) => {
     ipcRenderer.on('status-update', (_event, text, type) => callback(text, type));
+  },
+  onFullScreenChanged: (callback) => {
+    ipcRenderer.on('full-screen-changed', (_event, isFullScreen) => callback(isFullScreen));
   },
 
   // File drag-and-drop
