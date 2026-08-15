@@ -66,8 +66,15 @@ function setupTerminalKeyBindings(terminal, container, getSessionId, { onFind } 
     // menu's togglefullscreen accelerator — so F11 only worked when the focus
     // was outside the terminal, and there was no way out of fullscreen on
     // Windows/Linux where the menu bar is hidden in that state.
+    // preventDefault is REQUIRED here: without it the un-consumed keydown also
+    // reaches the menu accelerator, which toggles fullscreen right back —
+    // a double toggle that looks like F11 doing nothing (shipped broken in
+    // v0.0.47 exactly that way).
     if (e.key === 'F11' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
-      if (e.type === 'keydown') window.api.toggleFullScreen();
+      if (e.type === 'keydown') {
+        e.preventDefault();
+        window.api.toggleFullScreen();
+      }
       return false;
     }
 
