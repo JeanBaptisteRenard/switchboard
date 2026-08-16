@@ -180,6 +180,32 @@ function showTerminalContextMenu(event, ctx) {
 // from createTerminalEntry. getHoveredLinkUri returns the URI of the link the
 // cursor is currently over (tracked via the link hover/leave callbacks), or
 // null.
+// Middle-click paste (Linux). Without this, one middle-click pastes the
+// selection TWICE.
+//
+// xterm registers its own Linux-only `auxclick` listener that slides the hidden
+// textarea under the pointer so Chromium's native PRIMARY paste lands in it. The
+// text then reaches the PTY by two routes: xterm's `paste` listener sends it,
+// and — because xterm's handler calls stopPropagation() but NOT
+// preventDefault() — Chromium still performs the default insertion into the
+// textarea, whose `input` listener sends it again.
+//
+// Rather than depend on which of those two fires, take the event over entirely:
+// preventDefault in the capture phase (so xterm's listener on the descendant
+// never runs, and Chromium performs no native paste), then paste PRIMARY
+// ourselves exactly once.
+function setupTerminalMiddleClickPaste(container, terminal) {
+  if (window.api?.platform !== 'linux') return;
+  container.addEventListener('auxclick', (e) => {
+    if (e.button !== 1) return;
+    e.preventDefault();
+    e.stopPropagation();
+    window.api.readSelectionClipboard()
+      .then((text) => { if (text) terminal.paste(text); })
+      .catch(() => {});
+  }, { capture: true });
+}
+
 function setupTerminalContextMenu(container, terminal, getSessionId, getHoveredLinkUri) {
   container.addEventListener('contextmenu', (e) => {
     if (terminalRightClickMode === 'default') return; // let xterm handle it natively
@@ -212,6 +238,7 @@ if (typeof module !== 'undefined' && module.exports) {
     closeTerminalContextMenu,
     closeTerminalContextMenuForSession,
     setupTerminalContextMenu,
+    setupTerminalMiddleClickPaste,
     // Test seam: in the renderer the mode is a shared global set by app.js's
     // window._applyTerminalRightClick; under require() it's module-scoped.
     _setTerminalRightClickMode: (m) => { terminalRightClickMode = m; },

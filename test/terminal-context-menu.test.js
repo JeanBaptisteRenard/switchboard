@@ -279,3 +279,74 @@ test('setupTerminalContextMenu: menu mode shows the context menu with the hovere
     assert.ok(labels.includes('Copy path'));
   } finally { await h.destroy(); }
 });
+
+// ── Middle-click paste (Linux) ───────────────────────────────────────
+// Regression: one middle-click used to paste the selection twice. xterm's own
+// Linux auxclick listener moves the hidden textarea under the pointer so
+// Chromium's native PRIMARY paste lands there; its `paste` handler calls
+// stopPropagation() but not preventDefault(), so the text could reach the PTY
+// both from that handler and from the default insertion's `input` event.
+// setupTerminalMiddleClickPaste takes the event over so exactly one paste
+// happens, whichever of those routes the platform would have taken.
+
+function setupAuxClickDom(platform, selectionText) {
+  const dom = new JSDOM('<!DOCTYPE html><body><div id="c"></div></body>', { pretendToBeVisual: true });
+  const pasted = [];
+  dom.window.api = {
+    platform,
+    readSelectionClipboard: async () => selectionText,
+  };
+  const container = dom.window.document.getElementById('c');
+  const terminal = { paste: (t) => pasted.push(t) };
+  // The module reads the bare global `window` both when registering and inside
+  // the listener, so it must stay pointed at jsdom for the whole test — the
+  // caller restores it via cleanup().
+  const prevWindow = global.window;
+  global.window = dom.window;
+  menu.setupTerminalMiddleClickPaste(container, terminal);
+  return { dom, container, pasted, cleanup: () => { global.window = prevWindow; } };
+}
+
+function middleClick(dom, container) {
+  const ev = new dom.window.MouseEvent('auxclick', { button: 1, bubbles: true, cancelable: true });
+  container.dispatchEvent(ev);
+  return ev;
+}
+
+test('middle-click pastes the PRIMARY selection exactly once on linux', async () => {
+  const { dom, container, pasted, cleanup } = setupAuxClickDom('linux', 'hello');
+  const ev = middleClick(dom, container);
+  await new Promise(r => setTimeout(r, 0));
+  assert.strictEqual(pasted.length, 1, 'exactly one paste per middle-click');
+  assert.strictEqual(pasted[0], 'hello');
+  assert.strictEqual(ev.defaultPrevented, true,
+    'the native paste must be suppressed, otherwise it pastes a second time');
+  cleanup();
+});
+
+test('middle-click paste is not wired on non-linux platforms', async () => {
+  const { dom, container, pasted, cleanup } = setupAuxClickDom('darwin', 'hello');
+  const ev = middleClick(dom, container);
+  await new Promise(r => setTimeout(r, 0));
+  assert.strictEqual(pasted.length, 0, 'macOS/Windows have no PRIMARY selection');
+  assert.strictEqual(ev.defaultPrevented, false, 'native behaviour must be left alone');
+  cleanup();
+});
+
+test('middle-click with an empty selection pastes nothing', async () => {
+  const { dom, container, pasted, cleanup } = setupAuxClickDom('linux', '');
+  middleClick(dom, container);
+  await new Promise(r => setTimeout(r, 0));
+  assert.strictEqual(pasted.length, 0);
+  cleanup();
+});
+
+test('other mouse buttons are left entirely alone', async () => {
+  const { dom, container, pasted, cleanup } = setupAuxClickDom('linux', 'hello');
+  const ev = new dom.window.MouseEvent('auxclick', { button: 2, bubbles: true, cancelable: true });
+  container.dispatchEvent(ev);
+  await new Promise(r => setTimeout(r, 0));
+  assert.strictEqual(pasted.length, 0, 'right-click is the context menu’s business');
+  assert.strictEqual(ev.defaultPrevented, false);
+  cleanup();
+});

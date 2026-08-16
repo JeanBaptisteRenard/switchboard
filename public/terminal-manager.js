@@ -678,6 +678,7 @@ function createTerminalEntry(session, opts = {}) {
   });
   setupTerminalKeyBindings(terminal, container, () => entry.session.sessionId, { onFind: openSearchBar });
   setupTerminalContextMenu(container, terminal, () => entry.session.sessionId, () => hoveredLinkUri);
+  setupTerminalMiddleClickPaste(container, terminal);
   setupDragAndDrop(container, () => entry.session.sessionId);
   terminal.onResize(({ cols, rows }) => {
     // Only tell the PTY when the size really moved — see ptySizeChanged.

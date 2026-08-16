@@ -663,6 +663,16 @@ ipcMain.handle('open-path', (_event, filePath) => {
 // --- IPC: read clipboard (terminal right-click paste; see clipboard-write-text) ---
 ipcMain.handle('read-clipboard', () => clipboard.readText());
 
+// --- IPC: read the PRIMARY selection (Linux middle-click paste) ---
+// X11/Wayland keep the mouse-selection buffer separate from the Ctrl+C
+// clipboard; middle-click pastes PRIMARY. Electron exposes it as the
+// 'selection' type, which exists on Linux only — fall back to the regular
+// clipboard elsewhere so callers need no platform branch.
+ipcMain.handle('read-selection-clipboard', () => {
+  if (process.platform !== 'linux') return clipboard.readText();
+  return clipboard.readText('selection') || clipboard.readText();
+});
+
 // --- IPC: clipboard write ---
 // The renderer's navigator.clipboard.writeText is gated on focus/user-activation and
 // is flaky-to-dead on Linux/Wayland (Ozone). The main-process clipboard has no such
