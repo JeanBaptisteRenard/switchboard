@@ -23,6 +23,7 @@ contextBridge.exposeInMainWorld('api', {
   toggleStar: (id) => ipcRenderer.invoke('toggle-star', id),
   renameSession: (id, name) => ipcRenderer.invoke('rename-session', id, name),
   archiveSession: (id, archived) => ipcRenderer.invoke('archive-session', id, archived),
+  deleteSession: (id) => ipcRenderer.invoke('delete-session', id),
   // initialSize: { cols, rows } measured by the renderer before the spawn, so
   // the PTY never runs against a placeholder geometry. May be null.
   openTerminal: (id, projectPath, isNew, sessionOptions, initialSize) => ipcRenderer.invoke('open-terminal', id, projectPath, isNew, sessionOptions, initialSize),

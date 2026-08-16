@@ -34,6 +34,14 @@ The search bar at the top searches across session content — not just titles. S
 
 To scope a search to a specific content type, use the type selector next to the search bar (Sessions, Subagents, Plans, Memory, Work Files).
 
+## Delete a session
+
+The trash button on a session card **permanently removes that session's transcript from disk**, along with any subagent transcripts belonging to it. There is no trash to recover it from, so the action asks for confirmation naming the session first.
+
+Use **archive** instead if you only want the session out of the way — archiving hides it from the sidebar but keeps the file.
+
+A session that is still running is stopped first. If its transcript cannot be found, or something outside `~/.claude/projects` is somehow targeted, the deletion is refused and the reason is shown.
+
 ## Star and archive
 
 - **Star** — right-click a session and choose Star, or use the star icon in the session header. Starred sessions appear at the top of their project group.

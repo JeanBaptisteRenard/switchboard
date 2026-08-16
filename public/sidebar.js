@@ -895,6 +895,31 @@ function rebindSidebarEvents(projects) {
       };
     }
 
+    const deleteBtn = item.querySelector('.session-delete-btn');
+    if (deleteBtn) {
+      deleteBtn.onclick = async (e) => {
+        e.stopPropagation();
+        // Deleting a transcript is irreversible and there is no trash to
+        // recover it from, so name what is going and make the user confirm.
+        const label = cleanDisplayName(session.name || session.aiTitle || session.summary) || session.sessionId;
+        const ok = window.confirm(
+          `Delete "${label}"?\n\nThis permanently removes the session transcript ` +
+          `(and any subagent transcripts) from disk. It cannot be undone.`
+        );
+        if (!ok) return;
+        if (activePtyIds.has(session.sessionId)) {
+          await window.api.stopSession(session.sessionId);
+          pollActiveSessions();
+        }
+        const res = await window.api.deleteSession(session.sessionId);
+        if (!res || !res.ok) {
+          window.alert(`Could not delete session: ${(res && res.error) || 'unknown error'}`);
+          return;
+        }
+        loadProjects();
+      };
+    }
+
     const archiveBtn = item.querySelector('.session-archive-btn');
     if (archiveBtn) {
       archiveBtn.onclick = async (e) => {
@@ -1007,6 +1032,11 @@ function buildSessionItem(session) {
   jsonlBtn.title = 'View messages';
   jsonlBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z"/><path d="M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1"/></svg>';
 
+  const deleteBtn = document.createElement('button');
+  deleteBtn.className = 'session-delete-btn';
+  deleteBtn.title = 'Delete session (removes the transcript from disk)';
+  deleteBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>';
+
   const launchConfigBtn = document.createElement('button');
   launchConfigBtn.className = 'session-launch-config-btn';
   launchConfigBtn.title = 'Resume with config';
@@ -1018,6 +1048,7 @@ function buildSessionItem(session) {
     actions.appendChild(jsonlBtn);
     actions.appendChild(archiveBtn);
     actions.appendChild(launchConfigBtn);
+    actions.appendChild(deleteBtn);
   }
 
   row.appendChild(pin);

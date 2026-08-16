@@ -1614,6 +1614,71 @@ ipcMain.handle('stop-subagent-watch', (_event, watchId) => {
   return { ok: true };
 });
 
+// --- IPC: delete-session ---
+// Permanently removes a session's transcript from disk. This is the one action
+// in the app that destroys user history, so it is deliberately narrow:
+//
+//  - the id must look like a session id, and is used only as a filename
+//    component under PROJECTS_DIR — never joined with caller-supplied paths
+//  - the resolved file must still sit inside PROJECTS_DIR after realpath, so a
+//    symlinked transcript cannot be used to delete something elsewhere
+//  - a session with a live PTY is refused; killing the process and deleting its
+//    transcript underneath itself is not something to do implicitly
+//
+// Subagent transcripts live in a sibling <sessionId>/ directory and are part of
+// the same conversation, so they go too — leaving them orphans the tree.
+ipcMain.handle('delete-session', (_event, sessionId) => {
+  const id = String(sessionId || '');
+  if (!/^[A-Za-z0-9._-]+$/.test(id) || id === '.' || id === '..') {
+    return { ok: false, error: 'invalid session id' };
+  }
+  if (activeSessions.has(id) && !activeSessions.get(id).exited) {
+    return { ok: false, error: 'session is still running — close it first' };
+  }
+
+  const removed = [];
+  let folders;
+  try {
+    folders = fs.readdirSync(PROJECTS_DIR);
+  } catch (err) {
+    return { ok: false, error: `cannot read projects directory: ${err.message}` };
+  }
+
+  for (const folder of folders) {
+    const base = path.join(PROJECTS_DIR, folder);
+    for (const target of [path.join(base, id + '.jsonl'), path.join(base, id)]) {
+      if (!fs.existsSync(target)) continue;
+      // Resolve symlinks before deleting, and require the result to stay inside
+      // PROJECTS_DIR — otherwise a planted link turns this into arbitrary rm.
+      let real;
+      try {
+        real = fs.realpathSync(target);
+      } catch {
+        continue;
+      }
+      const root = fs.realpathSync(PROJECTS_DIR);
+      if (real !== root && !real.startsWith(root + path.sep)) {
+        log.warn(`[delete-session] refusing ${target} — resolves outside ${root}`);
+        continue;
+      }
+      try {
+        fs.rmSync(real, { recursive: true, force: true });
+        removed.push(real);
+      } catch (err) {
+        log.error(`[delete-session] failed to remove ${real}: ${err.message}`);
+        return { ok: false, error: `could not delete: ${err.message}` };
+      }
+    }
+  }
+
+  if (!removed.length) return { ok: false, error: 'no transcript found for that session' };
+
+  try { deleteCachedSession(id); } catch {}
+  try { deleteSearchSession(id); } catch {}
+  log.info(`[delete-session] ${id} removed ${removed.length} path(s)`);
+  return { ok: true, removed };
+});
+
 ipcMain.handle('archive-session', (_event, sessionId, archived) => {
   const val = archived ? 1 : 0;
   setArchived(sessionId, val);
