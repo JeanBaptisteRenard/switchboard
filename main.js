@@ -376,7 +376,7 @@ function buildMenu() {
 
 // --- Session cache helpers ---
 
-const { deriveProjectPath, resolveSessionRealCwd } = require('./derive-project-path');
+const { deriveProjectPath, resolveSessionRealCwd, sessionTranscriptExists, isGitRepo } = require('./derive-project-path');
 
 // Session cache → session-cache.js
 const sessionCache = require('./session-cache');
@@ -1797,9 +1797,21 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     } else {
       // Build claude command, using array to prevent accidental shell injection
       const claudeArgs = [];
+      // A sidebar card is not proof the session exists on disk: launchNewSession
+      // shows one before claude starts, so a launch that fails immediately (bad
+      // flag, missing directory) leaves a card whose transcript was never
+      // written. Resuming that id makes claude exit with "No conversation found
+      // with session ID", and the banner's advice — re-click to relaunch — could
+      // never work because every retry resumed the same missing id. Start it
+      // instead, reusing the id the sidebar already shows.
+      const startsFresh = isNew
+        || (!sessionOptions?.forkFrom && !sessionTranscriptExists(PROJECTS_DIR, sessionId));
+      if (!isNew && startsFresh && !sessionOptions?.forkFrom) {
+        log.info(`[open-terminal] ${sessionId} has no transcript — starting it instead of resuming`);
+      }
       if (sessionOptions?.forkFrom) {
         claudeArgs.push('--resume', String(sessionOptions.forkFrom), '--fork-session');
-      } else if (isNew) {
+      } else if (startsFresh) {
         claudeArgs.push('--session-id', String(sessionId));
       } else {
         claudeArgs.push('--resume', String(sessionId));
@@ -1817,7 +1829,14 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         // regardless of which call site supplied it (sidebar click, schedule
         // creator, fork, …). Otherwise a resume tries to spin up a new worktree
         // and fails to attach.
-        if (isNew && sessionOptions.worktree) {
+        if (startsFresh && sessionOptions.worktree && !isGitRepo(spawnCwd)) {
+          // Worktree is commonly enabled globally, but plenty of projects are
+          // not git repos. Passing --worktree there makes claude refuse to start
+          // at all ("Can only use --worktree in a git repository"), which turns
+          // one global convenience toggle into a broken project. Drop the flag
+          // and run unisolated rather than fail the launch.
+          log.warn(`[open-terminal] ${spawnCwd} is not a git repository — launching without --worktree`);
+        } else if (startsFresh && sessionOptions.worktree) {
           claudeArgs.push('--worktree');
           if (sessionOptions.worktreeName) {
             claudeArgs.push(String(sessionOptions.worktreeName));
