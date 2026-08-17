@@ -88,6 +88,50 @@ function deriveProjectPath(folderPath) {
 // `preferredFolder` (optional) is the encoded folder the caller expects the
 // transcript to live in — checked first so the common non-worktree resume
 // answers without scanning every project folder.
+/**
+ * True when `dir` is inside a git working tree.
+ *
+ * Walks up looking for `.git` (a directory in a normal clone, a file in a
+ * worktree or submodule) rather than shelling out to `git rev-parse`: this runs
+ * on the launch path, and a spawn per session start is both slower and one more
+ * thing that can fail when git is missing from PATH.
+ */
+function isGitRepo(dir) {
+  if (!dir) return false;
+  let current;
+  try {
+    current = path.resolve(dir);
+  } catch {
+    return false;
+  }
+  for (;;) {
+    if (fs.existsSync(path.join(current, '.git'))) return true;
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
+/**
+ * True when a transcript for `sessionId` exists in any project folder.
+ *
+ * A session Switchboard shows in the sidebar does not necessarily exist on
+ * disk: launchNewSession injects a placeholder card before claude starts, so a
+ * launch that fails immediately (bad flag, missing dir) leaves a card whose
+ * .jsonl was never written. Resuming that id makes claude report "No
+ * conversation found"; callers use this to relaunch it as a new session
+ * instead.
+ */
+function sessionTranscriptExists(projectsDir, sessionId) {
+  if (!sessionId) return false;
+  try {
+    for (const folder of fs.readdirSync(projectsDir)) {
+      if (fs.existsSync(path.join(projectsDir, folder, sessionId + '.jsonl'))) return true;
+    }
+  } catch {}
+  return false;
+}
+
 function resolveSessionRealCwd(projectsDir, sessionId, preferredFolder) {
   try {
     const folders = fs.readdirSync(projectsDir);
@@ -107,4 +151,4 @@ function resolveSessionRealCwd(projectsDir, sessionId, preferredFolder) {
   return null;
 }
 
-module.exports = { deriveProjectPath, resolveWorktreePath, extractCwdFromJsonl, resolveSessionRealCwd };
+module.exports = { deriveProjectPath, resolveWorktreePath, extractCwdFromJsonl, resolveSessionRealCwd, sessionTranscriptExists, isGitRepo };
