@@ -121,6 +121,12 @@ function wrapInGridCard(sessionId) {
   const session = sessionMap.get(sessionId) || (entry && entry.session);
   if (!session || !entry) return;
 
+  // The session may have been throttled to HIDDEN_FLUSH_INTERVAL_MS while it
+  // was hidden in single view (see scheduleFlush in terminal-manager.js) —
+  // flush any pending buffer now so the grid card never shows content staler
+  // than that window on the frame it's revealed.
+  flushTerminalBuffer(sessionId);
+
   const displayName = cleanDisplayName(session.name || session.aiTitle || session.summary) || sessionId;
   const shortProject = shortProjectPath(session.projectPath);
 
@@ -429,8 +435,16 @@ function hideGridView() {
   // about to be focused — background sessions keep producing output after the
   // grid closes and would otherwise stay silently capped at the thumbnail
   // budget until individually shown.
-  for (const entry of openSessions.values()) {
+  //
+  // Also suspend every session's WebGL context on the way out: grid mode may
+  // have restored several (every on-screen card — see gridCardObserver), but
+  // single view only ever shows one. toggleGridView calls showSession()
+  // synchronously right after this, which reloads the addon for whichever
+  // session it reveals — so this never leaves the user looking at a
+  // DOM-rendered terminal, and never leaves more than one GL context alive.
+  for (const [sid, entry] of openSessions) {
     if (!entry.closed) entry.terminal.options.scrollback = SCROLLBACK_SINGLE;
+    suspendTerminalWebgl(sid);
   }
   unwrapGridCards();
   terminalsEl.classList.remove('grid-layout');

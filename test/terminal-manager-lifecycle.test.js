@@ -240,6 +240,9 @@ test('30fps cap: scheduleFlush takes rAF path when interval has elapsed, timerId
   const { window, inCtx, destroy } = setupTerminalDom();
   try {
     window.createTerminalEntry({ sessionId: 's1' });
+    // Exercise the 30fps (active-session) cadence — the hidden-session ~1fps
+    // cadence is covered separately in terminal-hidden-rendering.test.js.
+    window.activeSessionId = 's1';
 
     // Case 1: no prior flush (lastFlushAt has no entry) → elapsed is infinite → rAF path.
     inCtx(`terminalWriteBuffers.set('s1', { chunks: ['a'], syncDepth: 0, rafId: 0, timerId: 0 })`);
