@@ -70,11 +70,13 @@
       "*.js",
       "workers/**/*",
       "public/**/*",
+      "scripts/claude-sandbox.sh",
       "node_modules/**/*"
     ],
     "asarUnpack": [
       "node_modules/better-sqlite3/**",
-      "node_modules/node-pty/**"
+      "node_modules/node-pty/**",
+      "scripts/claude-sandbox.sh"
     ],
     "publish": {
       "provider": "github",

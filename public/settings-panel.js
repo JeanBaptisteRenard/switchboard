@@ -67,6 +67,8 @@
     const worktreeValue = fieldValue('worktree', false);
     const worktreeNameValue = fieldValue('worktreeName', '');
     const chromeValue = fieldValue('chrome', false);
+    const sandboxValue = fieldValue('sandbox', false);
+    const isLinux = window.api.platform === 'linux';
     const preLaunchValue = fieldValue('preLaunchCmd', '');
     const addDirsValue = fieldValue('addDirs', '');
     const visCountValue = fieldValue('visibleSessionCount', 10);
@@ -146,6 +148,19 @@
             <label class="settings-toggle"><input type="checkbox" id="sv-chrome" ${chromeValue ? 'checked' : ''} ${fieldDisabled('chrome')}><span class="settings-toggle-slider"></span></label>
           </div>
         </div>
+
+        ${isLinux ? `<div class="settings-field">
+          <div class="settings-field-info">
+            <div class="settings-field-header">
+              <span class="settings-label">Sandbox</span>
+              ${useGlobalCheckbox('sandbox')}
+            </div>
+            <div class="settings-description">Run claude in a bubblewrap sandbox — only the project directory and Claude's own config are visible. Requires <code>bwrap</code> (bubblewrap). Takes effect for new sessions.</div>
+          </div>
+          <div class="settings-field-control">
+            <label class="settings-toggle"><input type="checkbox" id="sv-sandbox" ${sandboxValue ? 'checked' : ''} ${fieldDisabled('sandbox')}><span class="settings-toggle-slider"></span></label>
+          </div>
+        </div>` : ''}
 
         <div class="settings-field settings-field-wide">
           <div class="settings-field-info">
@@ -316,6 +331,7 @@
           worktree: 'sv-worktree',
           worktreeName: 'sv-worktree-name',
           chrome: 'sv-chrome',
+          sandbox: 'sv-sandbox',
           preLaunchCmd: 'sv-pre-launch',
           addDirs: 'sv-add-dirs',
         };
@@ -386,6 +402,7 @@
               worktree: () => settingsViewerBody.querySelector('#sv-worktree').checked,
               worktreeName: () => settingsViewerBody.querySelector('#sv-worktree-name').value.trim(),
               chrome: () => settingsViewerBody.querySelector('#sv-chrome').checked,
+              sandbox: () => settingsViewerBody.querySelector('#sv-sandbox').checked,
               preLaunchCmd: () => settingsViewerBody.querySelector('#sv-pre-launch').value.trim(),
               addDirs: () => settingsViewerBody.querySelector('#sv-add-dirs').value.trim(),
             };
@@ -397,6 +414,8 @@
         settings.worktree = settingsViewerBody.querySelector('#sv-worktree').checked;
         settings.worktreeName = settingsViewerBody.querySelector('#sv-worktree-name').value.trim();
         settings.chrome = settingsViewerBody.querySelector('#sv-chrome').checked;
+        const sandboxToggle = settingsViewerBody.querySelector('#sv-sandbox');
+        if (sandboxToggle) settings.sandbox = sandboxToggle.checked;
         settings.preLaunchCmd = settingsViewerBody.querySelector('#sv-pre-launch').value.trim();
         settings.addDirs = settingsViewerBody.querySelector('#sv-add-dirs').value.trim();
         settings.visibleSessionCount = parseInt(settingsViewerBody.querySelector('#sv-visible-count').value) || 10;

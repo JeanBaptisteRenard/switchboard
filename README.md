@@ -29,6 +29,7 @@ This repository is a fork of **[doctly/switchboard](https://github.com/doctly/sw
 - **Status Notifications** — In-app alerts when a session is waiting for permission approval or user input
 - **Fork & Resume** — Branch off from any point in a session's history
 - **Full-Text Search** — Find any session by what was discussed, not just when it happened
+- **Sandboxed Sessions** (Linux) — Optionally run Claude inside a [bubblewrap](https://github.com/containers/bubblewrap) sandbox where the rest of `$HOME` is hidden: only the project directory and Claude's own config/state are visible (filesystem isolation — network and environment are shared, see [docs](docs/settings.md#what-the-sandbox-does-and-doesnt-isolate)). Off by default; enable per session, per project, or globally. Needs unprivileged user namespaces, which Ubuntu 23.10+ restricts by default — the wrapper says so and how to fix it
 - **IDE Emulation** — Switchboard acts as an IDE for Claude CLI, showing file diffs and opens in a side panel where you can accept, reject, or edit changes before they're applied. Supports both inline and side-by-side diff views. Disable this in Global Settings if you prefer Claude to use your own editor (VS Code, Cursor, etc.)
 - **Plans & Memory** — Browse and edit your plan files and CLAUDE.md memory in one place
 - **Activity Stats** — Heatmap of your coding activity across all projects
