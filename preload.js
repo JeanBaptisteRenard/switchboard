@@ -54,7 +54,6 @@ contextBridge.exposeInMainWorld('api', {
   toggleFullScreen: () => ipcRenderer.invoke('toggle-full-screen'),
   writeClipboard: (text) => ipcRenderer.invoke('clipboard-write-text', text),
   readClipboard: () => ipcRenderer.invoke('read-clipboard'),
-  readSelectionClipboard: () => ipcRenderer.invoke('read-selection-clipboard'),
   clipboardHasImage: () => ipcRenderer.invoke('clipboard-has-image'),
 
   // Send (fire-and-forget)
