@@ -394,6 +394,18 @@ function isHiddenSingleViewSession(sessionId) {
   return !gridViewActive && sessionId !== activeSessionId;
 }
 
+// Whether sessionId has data buffered mid an unclosed synchronized-update
+// block (ESC_SYNC_START seen, ESC_SYNC_END not yet — buf.syncDepth > 0).
+// Guards the force-flush calls in showSession/wrapInGridCard: flushing here
+// would delete the buffer (losing syncDepth) and split one atomic TUI redraw
+// into two paints. The existing SYNC_BUFFER_TIMEOUT safety valve (see
+// handleTerminalData) still governs a block that never closes, exactly as it
+// does today for the already-active session.
+function isMidSyncBlock(sessionId) {
+  const buf = terminalWriteBuffers.get(sessionId);
+  return !!buf && buf.syncDepth > 0;
+}
+
 function flushTerminalBuffer(sessionId) {
   const buf = terminalWriteBuffers.get(sessionId);
   if (!buf) return;
@@ -843,8 +855,11 @@ function showSession(sessionId) {
     if (entry) {
       // The incoming session may have been throttled to
       // HIDDEN_FLUSH_INTERVAL_MS while it wasn't visible — flush any pending
-      // buffer now so it never shows content staler than that window.
-      flushTerminalBuffer(sessionId);
+      // buffer now so it never shows content staler than that window. Skip
+      // while mid an unclosed sync block (see isMidSyncBlock) so an in-flight
+      // atomic redraw still paints as one write once it closes or the
+      // SYNC_BUFFER_TIMEOUT valve fires.
+      if (!isMidSyncBlock(sessionId)) flushTerminalBuffer(sessionId);
       // Restore the full scrollback budget for the focused terminal (the grid
       // may have trimmed it — see showGridView). Growing the limit is lossless.
       entry.terminal.options.scrollback = SCROLLBACK_SINGLE;

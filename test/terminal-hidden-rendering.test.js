@@ -108,6 +108,66 @@ test('wrapInGridCard force-flushes a pending buffer before the card becomes visi
   }
 });
 
+// Regression: the force-flush added for the hidden-render fix must not break
+// sync-block atomicity. flushTerminalBuffer deletes the buffer (and its
+// syncDepth) unconditionally — calling it mid an unclosed ESC_SYNC_START/END
+// block would split one atomic TUI redraw into two paints and lose the sync
+// tracking for whatever arrives next.
+test('regression: showSession does not flush a session mid an unclosed sync block', () => {
+  const { window, spies, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.createTerminalEntry({ sessionId: 's1' });
+
+    // Sync block opens but has not closed — as if a TUI redraw is mid-flight.
+    window.handleTerminalData('s1', '\x1b[?2026hpart1');
+    let buf = inCtx(`terminalWriteBuffers.get('s1')`);
+    assert.strictEqual(buf.syncDepth, 1, 'inside an open sync block');
+    assert.ok(buf.timerId !== 0, 'sync safety timer armed');
+    assert.strictEqual(spies.write, 0, 'nothing painted yet');
+
+    // The user switches to this session — must NOT force-flush mid-block.
+    window.showSession('s1');
+
+    assert.strictEqual(spies.write, 0, 'showSession does not flush mid sync block');
+    buf = inCtx(`terminalWriteBuffers.get('s1')`);
+    assert.ok(buf, 'buffer preserved — not deleted by a premature flush');
+    assert.strictEqual(buf.syncDepth, 1, 'sync depth preserved');
+    assert.ok(buf.timerId !== 0, 'safety-timeout valve still armed after the switch');
+
+    // The block closes — the whole redraw (both chunks) paints atomically in
+    // a single write once it's actually flushed.
+    window.handleTerminalData('s1', 'part2\x1b[?2026l');
+    buf = inCtx(`terminalWriteBuffers.get('s1')`);
+    assert.strictEqual(buf.syncDepth, 0, 'sync depth unwound once the block closes');
+
+    window.flushTerminalBuffer('s1');
+    assert.strictEqual(spies.write, 1, 'single atomic write for the whole redraw — not split by the switch');
+  } finally {
+    destroy();
+  }
+});
+
+test('regression: wrapInGridCard does not flush a session mid an unclosed sync block', () => {
+  const { window, spies, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.sessionMap.set('s1', { sessionId: 's1', name: 's1', projectPath: '/p' });
+    window.gridViewActive = false;
+    window.createTerminalEntry({ sessionId: 's1' });
+
+    window.handleTerminalData('s1', '\x1b[?2026hpart1');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('s1').syncDepth`), 1);
+
+    window.wrapInGridCard('s1');
+
+    assert.strictEqual(spies.write, 0, 'wrapInGridCard does not flush mid sync block');
+    const buf = inCtx(`terminalWriteBuffers.get('s1')`);
+    assert.ok(buf, 'buffer preserved — not deleted by a premature flush');
+    assert.strictEqual(buf.syncDepth, 1, 'sync depth preserved');
+  } finally {
+    destroy();
+  }
+});
+
 test('sync block on a hidden session still arms the 500ms safety timer (sync-block handling unchanged)', () => {
   const { window, inCtx, destroy } = setupTerminalDom();
   try {

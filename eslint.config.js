@@ -209,6 +209,7 @@ const rendererCrossFileGlobals = {
   ptySizeChanged: 'readonly',
   observeContainerResize: 'readonly',
   flushTerminalBuffer: 'readonly',
+  isMidSyncBlock: 'readonly',
   scheduleFlush: 'readonly',
   handleTerminalData: 'readonly',
   createTerminalEntry: 'readonly',

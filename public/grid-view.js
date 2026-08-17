@@ -124,8 +124,10 @@ function wrapInGridCard(sessionId) {
   // The session may have been throttled to HIDDEN_FLUSH_INTERVAL_MS while it
   // was hidden in single view (see scheduleFlush in terminal-manager.js) —
   // flush any pending buffer now so the grid card never shows content staler
-  // than that window on the frame it's revealed.
-  flushTerminalBuffer(sessionId);
+  // than that window on the frame it's revealed. Skip while mid an unclosed
+  // sync block (see isMidSyncBlock in terminal-manager.js) so an in-flight
+  // atomic redraw still paints as one write once it closes or times out.
+  if (!isMidSyncBlock(sessionId)) flushTerminalBuffer(sessionId);
 
   const displayName = cleanDisplayName(session.name || session.aiTitle || session.summary) || sessionId;
   const shortProject = shortProjectPath(session.projectPath);
