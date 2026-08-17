@@ -81,13 +81,34 @@ test('delete button: rendered on session cards and confirms before deleting', ()
   assert.match(sidebar, /actions\.appendChild\(deleteBtn\)/, 'the button must actually be placed on the card');
 
   const start = sidebar.indexOf("item.querySelector('.session-delete-btn')");
-  const handler = sidebar.slice(start, start + 1400);
+  // Slice to the next handler rather than a fixed length — the block grew and a
+  // fixed window silently dropped the assertions off the end.
+  const handler = sidebar.slice(start, sidebar.indexOf('const archiveBtn', start));
   assert.match(handler, /window\.confirm\(/, 'an irreversible action must be confirmed');
   assert.match(handler, /cannot be undone/, 'the prompt must state that it is irreversible');
   assert.match(handler, /stopSession/, 'a running session must be stopped before deletion');
   assert.match(handler, /window\.api\.deleteSession/);
-  assert.match(handler, /window\.alert\(/, 'a refusal from the main process must surface, not fail silently');
+  assert.doesNotMatch(handler, /window\.alert\(/,
+    'alert() is modal and hard to dismiss — a failure must not block the renderer');
+  assert.match(handler, /flashButtonText\(deleteBtn, 'Failed'/, 'a refusal must still surface on the button');
+  assert.match(handler, /pendingSessions\.delete\(session\.sessionId\)/,
+    'the sidebar re-injects transcript-less sessions, so the pending entry must be forgotten too');
 
   const css = fs.readFileSync(path.join(ROOT, 'public', 'style.css'), 'utf8');
   assert.match(css, /\.session-delete-btn:hover \{/, 'delete should read as danger on hover');
+});
+
+test('delete-session: a session with no transcript is dismissed, not refused', () => {
+  const main = fs.readFileSync(path.join(ROOT, 'main.js'), 'utf8');
+  const start = main.indexOf("ipcMain.handle('delete-session'");
+  const body = main.slice(start, main.indexOf('\n});', start));
+
+  // Regression: launchNewSession shows a card before claude starts, so a failed
+  // launch leaves a session with nothing on disk. Refusing those made the very
+  // cards a user wants gone undeletable ("no transcript found for that session").
+  assert.match(body, /if \(!removed\.length\) \{/, 'the empty case must be handled explicitly');
+  const empty = body.slice(body.indexOf('if (!removed.length) {'));
+  assert.match(empty, /ok: true/, 'a placeholder must be reported as deleted, not as a failure');
+  assert.match(empty, /placeholder: true/, 'the caller should be able to tell the two apart');
+  assert.match(empty, /deleteCachedSession\(id\)/, 'caches must still be cleared');
 });

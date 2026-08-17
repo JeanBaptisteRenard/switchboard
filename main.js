@@ -1671,7 +1671,16 @@ ipcMain.handle('delete-session', (_event, sessionId) => {
     }
   }
 
-  if (!removed.length) return { ok: false, error: 'no transcript found for that session' };
+  // A session with no transcript on disk is not an error case: launchNewSession
+  // shows a card before claude starts, so a launch that died leaves one with
+  // nothing behind it — and those are precisely the cards a user wants gone.
+  // Clear the caches and report success so the row can be dismissed.
+  if (!removed.length) {
+    try { deleteCachedSession(id); } catch {}
+    try { deleteSearchSession(id); } catch {}
+    log.info(`[delete-session] ${id} had no transcript — cleared caches only`);
+    return { ok: true, removed: [], placeholder: true };
+  }
 
   try { deleteCachedSession(id); } catch {}
   try { deleteSearchSession(id); } catch {}

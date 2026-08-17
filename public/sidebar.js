@@ -913,9 +913,18 @@ function rebindSidebarEvents(projects) {
         }
         const res = await window.api.deleteSession(session.sessionId);
         if (!res || !res.ok) {
-          window.alert(`Could not delete session: ${(res && res.error) || 'unknown error'}`);
+          // Not a modal: an alert() here is hard to dismiss and blocks the
+          // renderer. Flash the button and log the reason instead.
+          console.error('[delete-session]', (res && res.error) || 'unknown error');
+          if (typeof window.flashButtonText === 'function') {
+            window.flashButtonText(deleteBtn, 'Failed', 1500);
+          }
           return;
         }
+        // The sidebar re-injects transcript-less sessions from pendingSessions on
+        // every load, so forget it here or a deleted placeholder card comes back.
+        if (typeof pendingSessions !== 'undefined') pendingSessions.delete(session.sessionId);
+        if (typeof sessionMap !== 'undefined') sessionMap.delete(session.sessionId);
         loadProjects();
       };
     }
