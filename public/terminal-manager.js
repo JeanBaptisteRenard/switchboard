@@ -710,6 +710,31 @@ function createTerminalEntry(session, opts = {}) {
   });
   setupTerminalKeyBindings(terminal, container, () => entry.session.sessionId, { onFind: openSearchBar });
   setupTerminalContextMenu(container, terminal, () => entry.session.sessionId, () => hoveredLinkUri);
+
+  // Middle-click pasted the selection twice. A devtools trace of a single
+  // middle-click shows BOTH `paste` and `input` firing on xterm's hidden
+  // textarea, neither prevented:
+  //
+  //   mousedown btn=1 CANVAS / mouseup btn=1 CANVAS / auxclick btn=1 CANVAS
+  //   paste TEXTAREA prevented=false
+  //   input TEXTAREA prevented=false
+  //
+  // xterm's paste listener delivers the text, and because its handler calls
+  // stopPropagation() but not preventDefault(), the browser still performs the
+  // default insertion into the textarea — whose input listener delivers it
+  // again.
+  //
+  // Ctrl+V does not double, which is what makes this safe to cancel outright:
+  // xterm's _inputEvent bails unless `!e.composed || !this._keyDownSeen`, so a
+  // keyboard paste (keydown seen, event composed) never reaches
+  // triggerDataEvent by that route. Only a mouse paste, which has no preceding
+  // keydown, escapes the guard.
+  //
+  // Cancelling in the capture phase runs before xterm's own textarea listener,
+  // which reads clipboardData directly and is unaffected — so the text is
+  // delivered exactly once. Scoped to the terminal container so the CodeMirror
+  // panels keep normal paste behaviour.
+  container.addEventListener('paste', (e) => { e.preventDefault(); }, { capture: true });
   setupDragAndDrop(container, () => entry.session.sessionId);
   terminal.onResize(({ cols, rows }) => {
     // Only tell the PTY when the size really moved — see ptySizeChanged.

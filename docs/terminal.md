@@ -7,6 +7,10 @@ Switchboard includes a full built-in terminal powered by xterm.js. You can launc
 - Click a session in the sidebar to open it in the terminal. If the session has an active process, you attach to its running PTY. If not, a new Claude CLI process is launched.
 - Click **New Session** (the `+` button next to a project) to start a fresh Claude Code session for that project.
 
+## Middle-click paste (Linux)
+
+Middle-click pastes the X11/Wayland PRIMARY selection — the text you last selected with the mouse, which is separate from the `Ctrl+C` clipboard. Switchboard cancels the browser's default insertion so the selection is delivered to the terminal exactly once; left alone, a mouse paste arrives twice.
+
 ## Right-click behavior
 
 Right-click behavior in the terminal is configurable. Open **Global Settings** and look for **Terminal Right-Click**:
