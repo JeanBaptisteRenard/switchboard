@@ -119,6 +119,7 @@ These exist on `devsuitup/switchboard` main but not on `doctly/switchboard` main
 2. Squash to clear commits. No `Co-Authored-By`. Imperative subject, brief why-body.
 3. `gh pr create` against `devsuitup/switchboard:main` (the fork's main, not upstream's). Title format: `(area): short imperative`.
 4. If the change is a port of an upstream PR, **credit the upstream author** in the body with a link. We want abasiri to see we're not stealing.
+5. **When the PR is ready to merge** (internal review loop converged to zero findings, or an external PR judged mergeable after review), **request the maintainer account `devsuitup` as reviewer**: `gh api -X POST repos/devsuitup/switchboard/pulls/<n>/requested_reviewers -f 'reviewers[]=devsuitup'`. The maintainer's review queue is the single list of what awaits approval — a ready PR that never requests review sits invisible.
 
 ## Upstreaming work
 
