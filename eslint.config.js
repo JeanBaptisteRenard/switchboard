@@ -224,6 +224,7 @@ const rendererCrossFileGlobals = {
   // Terminal right-click context menu (public/terminal-context-menu.js)
   terminalRightClickMode: 'writable',
   setupTerminalContextMenu: 'readonly',
+  setupTerminalMiddleClickPaste: 'readonly',
   showTerminalContextMenu: 'readonly',
   closeTerminalContextMenuForSession: 'readonly',
 
