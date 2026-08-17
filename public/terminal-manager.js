@@ -375,6 +375,37 @@ const terminalWriteBuffers = new Map(); // sessionId → { chunks, syncDepth, ra
 const MIN_FLUSH_INTERVAL_MS = 33; // ~30 fps
 const lastFlushAt = new Map(); // sessionId → performance.now() of last flush
 
+// A session that is neither the focused single-view terminal nor part of an
+// open grid still ran the full 30fps parse+paint pipeline on every PTY chunk
+// even though its container is display:none and nothing is composited —
+// measured: renderer ~44% of a core + GPU process ~50% with 4 streaming
+// sessions and only one visible. Throttling those sessions to ~1fps cuts both
+// the xterm parse cost and the paint/WebGL draw call ~30x; showSession() and
+// wrapInGridCard() force-flush the pending buffer immediately before a
+// session becomes visible (see flushTerminalBuffer calls below), so the
+// throttle never shows stale content once the session is actually shown.
+// Grid view is excluded — its own per-card WebGL virtualization
+// (suspendTerminalWebgl/restoreTerminalWebgl + gridCardObserver in
+// grid-view.js) already caps the dominant render cost there, and every open
+// grid session keeps the fast cadence so thumbnails stay live.
+const HIDDEN_FLUSH_INTERVAL_MS = 1000; // ~1 fps for a session nobody is looking at
+
+function isHiddenSingleViewSession(sessionId) {
+  return !gridViewActive && sessionId !== activeSessionId;
+}
+
+// Whether sessionId has data buffered mid an unclosed synchronized-update
+// block (ESC_SYNC_START seen, ESC_SYNC_END not yet — buf.syncDepth > 0).
+// Guards the force-flush calls in showSession/wrapInGridCard: flushing here
+// would delete the buffer (losing syncDepth) and split one atomic TUI redraw
+// into two paints. The existing SYNC_BUFFER_TIMEOUT safety valve (see
+// handleTerminalData) still governs a block that never closes, exactly as it
+// does today for the already-active session.
+function isMidSyncBlock(sessionId) {
+  const buf = terminalWriteBuffers.get(sessionId);
+  return !!buf && buf.syncDepth > 0;
+}
+
 function flushTerminalBuffer(sessionId) {
   const buf = terminalWriteBuffers.get(sessionId);
   if (!buf) return;
@@ -407,15 +438,16 @@ function scheduleFlush(sessionId, buf) {
   // If a timer or rAF is already pending, don't stack another.
   if (buf.timerId || buf.rafId) return;
 
+  const interval = isHiddenSingleViewSession(sessionId) ? HIDDEN_FLUSH_INTERVAL_MS : MIN_FLUSH_INTERVAL_MS;
   const last = lastFlushAt.get(sessionId);
   const elapsed = last === undefined ? Infinity : performance.now() - last;
-  if (elapsed >= MIN_FLUSH_INTERVAL_MS) {
+  if (elapsed >= interval) {
     // Enough time has passed — flush on the next animation frame (current behavior).
     buf.rafId = requestAnimationFrame(() => flushTerminalBuffer(sessionId));
   } else {
     // Too soon — schedule a timer for the remaining interval, then rAF from there.
     // Reuses buf.timerId so destroySession/flushTerminalBuffer teardown works unchanged.
-    const remaining = MIN_FLUSH_INTERVAL_MS - elapsed;
+    const remaining = interval - elapsed;
     buf.timerId = setTimeout(() => {
       buf.timerId = 0;
       buf.rafId = requestAnimationFrame(() => flushTerminalBuffer(sessionId));
@@ -779,6 +811,9 @@ function destroySession(sessionId) {
 function showSession(sessionId) {
   const entry = openSessions.get(sessionId);
   const session = sessionMap.get(sessionId) || (entry && entry.session);
+  // Captured before setActiveSession() below overwrites the global — this is
+  // the session single view is switching AWAY from.
+  const previousActiveSessionId = activeSessionId;
 
   // Update sidebar active state
   document.querySelectorAll('.session-item.active').forEach(el => el.classList.remove('active'));
@@ -809,7 +844,22 @@ function showSession(sessionId) {
     placeholder.style.display = 'none';
     hidePlanViewer();
     if (session) showTerminalHeader(session);
+    // Only one terminal is ever visible in single view — suspend the WebGL
+    // context of whatever we're switching away from. This is the single-view
+    // equivalent of the per-card suspend/restore grid-view.js already does
+    // via gridCardObserver; guarded so re-showing the already-active session
+    // doesn't tear down and immediately reload the context it keeps using.
+    if (previousActiveSessionId && previousActiveSessionId !== sessionId) {
+      suspendTerminalWebgl(previousActiveSessionId);
+    }
     if (entry) {
+      // The incoming session may have been throttled to
+      // HIDDEN_FLUSH_INTERVAL_MS while it wasn't visible — flush any pending
+      // buffer now so it never shows content staler than that window. Skip
+      // while mid an unclosed sync block (see isMidSyncBlock) so an in-flight
+      // atomic redraw still paints as one write once it closes or the
+      // SYNC_BUFFER_TIMEOUT valve fires.
+      if (!isMidSyncBlock(sessionId)) flushTerminalBuffer(sessionId);
       // Restore the full scrollback budget for the focused terminal (the grid
       // may have trimmed it — see showGridView). Growing the limit is lossless.
       entry.terminal.options.scrollback = SCROLLBACK_SINGLE;

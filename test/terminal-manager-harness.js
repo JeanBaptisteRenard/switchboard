@@ -142,6 +142,7 @@ function setupTerminalDom(opts = {}) {
     clearNotifications: () => {},
     hidePlanViewer: () => {},
     showTerminalHeader: () => {},
+    updateRunningIndicators: () => {},
     placeholder: window.document.createElement('div'),
     terminalHeader: window.document.createElement('div'),
     gridViewer: window.document.createElement('div'),
