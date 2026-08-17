@@ -87,6 +87,12 @@ See [Keyboard Shortcuts](keyboard-shortcuts.md) for the defaults and full instru
 | **Version** | Shows the current installed version and update status. |
 | **Check for Updates** | Manually triggers an update check against GitHub Releases. |
 
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| **Automatic Updates** | Toggle | On | Download updates in the background and install them when Switchboard quits. Turn off to keep the installed binary exactly as it is — **Check for Updates** still works on demand. Read at launch, so a change takes effect next time you start Switchboard. |
+
+With **Automatic Updates** off, Switchboard never fetches or replaces its own binary unless you ask it to. This matters if you run a locally built or patched build: with it on, the next upstream release is downloaded and swapped in on quit, silently replacing your build with the official one of the same or higher version.
+
 Switchboard checks for updates automatically on launch and every 4 hours (packaged builds only). When an update is ready, a toast notification appears. You can restart immediately or dismiss — the update installs on the next quit.
 
 ---

@@ -1404,6 +1404,10 @@ const SETTING_DEFAULTS = {
   sidebarWidth: 340,
   terminalTheme: 'switchboard',
   mcpEmulation: false,
+  // Automatic update download + install-on-quit. On by default so behaviour is
+  // unchanged; off means the app never fetches or swaps its own binary without
+  // being asked. The manual "Check for Updates" button still works either way.
+  autoUpdate: true,
   shellProfile: 'auto',
 };
 
@@ -2467,9 +2471,20 @@ if (!gotSingleInstanceLock) {
 
     // Check for updates after launch
     if (autoUpdater) {
-      setTimeout(() => autoUpdater.checkForUpdates().catch(e => log.error('[updater] check failed:', e?.message || String(e))), 5000);
-      // Re-check every 4 hours for long-running sessions
-      setInterval(() => autoUpdater.checkForUpdates().catch(e => log.error('[updater] check failed:', e?.message || String(e))), 4 * 60 * 60 * 1000);
+      // Read the setting here rather than at the updater's construction: that
+      // block runs before db.js is required, so getSetting isn't available yet.
+      // Nothing checks for updates before this point, so overriding the flags
+      // now is early enough.
+      const autoUpdate = (getSetting('global') || {}).autoUpdate !== false;
+      autoUpdater.autoDownload = autoUpdate;
+      autoUpdater.autoInstallOnAppQuit = autoUpdate;
+      if (!autoUpdate) {
+        log.info('[updater] automatic updates disabled by setting — not checking');
+      } else {
+        setTimeout(() => autoUpdater.checkForUpdates().catch(e => log.error('[updater] check failed:', e?.message || String(e))), 5000);
+        // Re-check every 4 hours for long-running sessions
+        setInterval(() => autoUpdater.checkForUpdates().catch(e => log.error('[updater] check failed:', e?.message || String(e))), 4 * 60 * 60 * 1000);
+      }
     }
 
     app.on('activate', () => {
