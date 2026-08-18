@@ -456,18 +456,24 @@ function scheduleFlush(sessionId, buf) {
 // is replayed in exactly one write() call, atomically, before the container
 // becomes visible.
 //
-// Sync-block tracking (ESC_SYNC_START/END, isMidSyncBlock in the previous
-// version of this file) does not apply here and is deliberately not
-// reintroduced: it existed to decide when the *live* write-buffering path
-// above should call terminal.write(), so a redraw split across two PTY
-// chunks wouldn't split across two writes either. A hidden accumulator never
-// calls write() until reveal, so there is exactly one write no matter how
-// many sync blocks the accumulated text contains — xterm's own DEC 2026
-// handling (CoreService.decPrivateModes.synchronizedOutput, gating
-// RenderService until the matching end sequence or its own 1000ms timeout —
-// see RenderService.ts) interprets whatever sync-mode transitions are
-// embedded in the replayed text exactly as it would for a single huge PTY
-// chunk, which its parser must already handle correctly.
+// Sync-block tracking (ESC_SYNC_START/END) does not apply to text already
+// sitting in the accumulator: it existed to decide when the *live*
+// write-buffering path above should call terminal.write(), so a redraw split
+// across two PTY chunks wouldn't split across two writes either. A hidden
+// accumulator never calls write() until reveal, so there is exactly one
+// write no matter how many sync blocks the accumulated text contains —
+// xterm's own DEC 2026 handling (CoreService.decPrivateModes
+// .synchronizedOutput, gating RenderService until the matching end sequence
+// or its own 1000ms timeout — see RenderService.ts) interprets whatever
+// sync-mode transitions are embedded in the replayed text exactly as it
+// would for a single huge PTY chunk, which its parser must already handle
+// correctly.
+//
+// It DOES still apply to a live terminalWriteBuffers entry at the moment of
+// a reveal: replayHiddenBuffer's drain would write that buffer's first half
+// of an open sync block now and leave its remainder to a later, genuinely
+// time-separated write — see isMidSyncBlock below and the guard in
+// replayHiddenBuffer.
 const hiddenAccumulators = new Map(); // sessionId → { raw, reset }
 
 // Deliberately a flat cap rather than a precise scrollback→bytes conversion
@@ -627,7 +633,12 @@ function trimHiddenBuffer(raw, maxLen) {
 // sync-mode transition once the whole accumulator is written in one shot on
 // reveal (see the "Hidden-session full suspend" comment above) — there is
 // nothing left to track once the drained bytes are just more accumulated
-// text.
+// text. That reasoning only holds when the drained bytes ARE eventually
+// written as part of a single replay — the reveal path therefore checks
+// isMidSyncBlock before calling this (see replayHiddenBuffer); this call
+// site (hidden branch) must stay unguarded, or the leftover's own timer
+// would fire independently of the accumulator again (the F1 inversion this
+// drain exists to prevent).
 function drainLiveBufferIntoHiddenAccumulator(sessionId) {
   const buf = terminalWriteBuffers.get(sessionId);
   if (!buf) return;
@@ -657,6 +668,17 @@ function appendToHiddenAccumulator(sessionId, data) {
   }
 }
 
+// Whether sessionId has live data buffered mid an unclosed synchronized-
+// update block (ESC_SYNC_START seen, ESC_SYNC_END not yet — buf.syncDepth
+// > 0). Guards the reveal-path drain in replayHiddenBuffer below; the
+// SYNC_BUFFER_TIMEOUT safety valve (armed in handleTerminalData for as long
+// as syncDepth > 0) bounds how long the guard can defer, exactly as it
+// bounds a block that never closes for the already-active session.
+function isMidSyncBlock(sessionId) {
+  const buf = terminalWriteBuffers.get(sessionId);
+  return !!buf && buf.syncDepth > 0;
+}
+
 // Replay a hidden session's accumulated buffer in exactly one write() call,
 // resetting the terminal first if a hard (non-safe-marker) cut happened
 // somewhere in its history. Called from showSession/wrapInGridCard BEFORE
@@ -676,8 +698,25 @@ function appendToHiddenAccumulator(sessionId, data) {
 // handleTerminalData — whichever runs first drains and deletes the entry,
 // so the other is a cheap no-op — and prepends in the same order (leftover
 // predates anything already accumulated).
+//
+// EXCEPT when that live buffer is mid an open sync block (isMidSyncBlock):
+// draining it here would write the block's first half immediately and its
+// remainder in a later, time-separated write once the rest of the block
+// arrives on the live path — splitting one atomic TUI redraw into two
+// paints. Concrete trigger: showGridView() wraps the ACTIVE session into a
+// grid card too (gridViewActive is already true, so the session was never
+// hidden and its live buffer is still tracking syncDepth). Deferring is
+// bounded, never indefinite: handleTerminalData keeps SYNC_BUFFER_TIMEOUT
+// (500ms) armed for the whole time syncDepth > 0, so the buffer flushes
+// either when the block closes (syncDepth back to 0 → scheduleFlush) or at
+// that safety timeout if the closing ESC_SYNC_END never arrives — the same
+// two exits it has for a session that stays active. The accumulator replay
+// below still runs in the deferred case; it is necessarily empty then (a
+// live buffer only exists while the session is visible, and every reveal
+// clears the accumulator before the session becomes visible), so order
+// cannot invert.
 function replayHiddenBuffer(sessionId) {
-  drainLiveBufferIntoHiddenAccumulator(sessionId);
+  if (!isMidSyncBlock(sessionId)) drainLiveBufferIntoHiddenAccumulator(sessionId);
   const acc = hiddenAccumulators.get(sessionId);
   hiddenAccumulators.delete(sessionId);
   if (!acc || !acc.raw) return;
