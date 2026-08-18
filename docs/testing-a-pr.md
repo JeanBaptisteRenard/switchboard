@@ -23,10 +23,10 @@ from source with `SWITCHBOARD_DATA_DIR` set gives the dev instance its own
 next to the AppImage (`main.js` even defaults unpackaged runs to
 `~/.switchboard-dev` when the var isn't set).
 
-## The three isolation concerns
+## The four isolation concerns
 
-`task test-pr` handles the first two automatically. The third needs you to check
-manually before launching.
+`task test-pr` handles the first two automatically. The third and fourth need you
+to check manually, before launching and while using the test instance.
 
 ### 1. Database (`SWITCHBOARD_DATA_DIR`)
 
@@ -61,6 +61,17 @@ grep -l 'enabled: true' */.claude/commands/schedule-*.md 2>/dev/null
 
 If anything is enabled and due to fire during your test window, either disable it
 first (`enabled: false`) or accept the duplicate run.
+
+### 4. Sessions — never resume a session that's live elsewhere
+
+**Both instances read the same `~/.claude/projects/*.jsonl` transcripts from
+disk** — `SWITCHBOARD_DATA_DIR` isolates the SQLite index, not the session files
+themselves. Clicking a session in the test instance that is **currently open and
+live in the AppImage spawns a second `claude --resume` of that same session
+id, duplicating it** (witnessed: a live orchestrator session was duplicated this
+way, then killed, when someone clicked into it from the test instance). **Only
+interact with terminal sessions you started fresh in the test instance, or with
+sessions that are dead/closed everywhere else.**
 
 ## Running it
 
@@ -100,6 +111,67 @@ ci` refuses to run into an existing symlink).
 the PR changes `codemirror-setup.js` (or anything the bundle is built from), run
 `npm run bundle:codemirror` inside the worktree before launching, otherwise the
 test instance runs against a stale bundle.
+
+## Pitfalls witnessed live
+
+These were all hit during real sessions of running this exact procedure. None of
+them are hypothetical.
+
+### Never pipe the launch command's output
+
+Don't pipe `task test-pr`'s output into anything that can close its end early
+(`| head`, `| grep -m1`, a `tee` inside a script that exits, etc.). When the
+reader closes, `electron-log`'s console transport throws an **uncaught EPIPE in
+the Electron main process** — not a harmless broken-pipe warning: it surfaces as
+a crash dialog and frozen terminals in the instance you were testing. Redirect to
+a file instead if you need to capture output:
+
+```bash
+task test-pr PR=122 > pr122.log 2>&1 &
+```
+
+### Cold start on a fresh dev DB can take minutes — seed it instead
+
+First launch indexes all of `~/.claude/projects` from scratch into the new,
+empty SQLite file. On a large history (1GB+) this can take several minutes, and
+the window may report "not responding" while it works — that's expected, **don't
+force-quit**.
+
+To skip re-indexing, seed the test DB from the AppImage's own DB instead of
+starting blank (the source stays open read-only, `VACUUM INTO` never writes to it):
+
+```bash
+sqlite3 ~/.switchboard/switchboard.db "VACUUM INTO '$HOME/.switchboard-dev-pr122/switchboard.db'"
+```
+
+Then **purge the working-set restore settings before first launch** — the seeded
+row carries the live app's `openWorkingSet`/`restoreOnStartup` state, which would
+resurrect your real, currently-open sessions as duplicates inside the test
+instance otherwise:
+
+```bash
+sqlite3 "$HOME/.switchboard-dev-pr122/switchboard.db" \
+  "UPDATE settings SET value = json_set(json_remove(value,'\$.openWorkingSet'),'\$.restoreOnStartup',json('false')) WHERE key='global'"
+```
+
+This isn't wired into `task test-pr` as a flag (yet) — run both statements by
+hand, in that order, before your first `task test-pr PR=<n>` for that PR.
+
+### Transcripts are off if launched from inside a Claude session
+
+If you run `task test-pr` from a shell inside an active Claude Code session, the
+launched Electron instance inherits `CLAUDE_CODE_CHILD_SESSION` from the
+environment — any Claude session you start *inside* the test instance will have
+transcript-saving disabled. Launch from a plain terminal instead if you need a
+transcript of the test session itself.
+
+### Never resume a session that's live in the other instance
+
+Covered above under [isolation concern 4](#4-sessions--never-resume-a-session-thats-live-elsewhere)
+— repeating here because it's the highest-impact pitfall of the four: **clicking
+a session in the test instance that's currently open in the AppImage (or vice
+versa) spawns a duplicate `claude --resume` of it**, and the duplicate then
+competes with the real one for the same session id.
 
 ## Comparing the two instances
 

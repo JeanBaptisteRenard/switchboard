@@ -109,38 +109,50 @@ tasks:
     silent: true
     cmds:
       - |
-        if [ -z "{{.PR}}" ]; then
-          echo "Usage: task test-pr PR=<number>" >&2
-          exit 1
-        fi
+        # {{.PR}} is Go-template-substituted into this script as raw text before the
+        # shell ever sees it — quoting alone does NOT stop a crafted value from breaking
+        # out (shell injection) or path-traversing (`../`) any string it's spliced into
+        # below. A numeric-only guard, checked first, is the only safe fix.
+        case "{{.PR}}" in
+          ''|*[!0-9]*)
+            echo "Usage: task test-pr PR=<number> (numeric only)" >&2
+            exit 1
+            ;;
+        esac
         set -e
         WORKTREE=".worktrees/pr-{{.PR}}-test"
         git fetch origin "pull/{{.PR}}/head"
+        PR_SHA="$(git rev-parse FETCH_HEAD)"
         if [ -d "$WORKTREE" ]; then
-          git -C "$WORKTREE" checkout --detach FETCH_HEAD
+          git -C "$WORKTREE" checkout --detach "$PR_SHA"
         else
-          git worktree add --detach "$WORKTREE" FETCH_HEAD
+          git worktree add --detach "$WORKTREE" "$PR_SHA"
         fi
         # Symlink node_modules instead of `npm install` in the worktree: fast, and the
         # native modules (better-sqlite3, node-pty) stay the electron-ABI ones already
         # rebuilt in the primary checkout. INVALID if the PR bumped package-lock.json
         # or the electron version — run `npm ci` in the worktree instead when it did.
-        if [ -n "$(git diff --stat main...FETCH_HEAD -- package-lock.json)" ]; then
+        git fetch origin main
+        if [ -n "$(git diff --stat origin/main..."$PR_SHA" -- package-lock.json)" ]; then
           echo "WARNING: package-lock.json differs on this PR — the node_modules symlink is invalid." >&2
           echo "Run 'npm ci' inside $WORKTREE before launching." >&2
         fi
         ln -sfn "$(pwd)/node_modules" "$WORKTREE/node_modules"
         echo "Launching PR #{{.PR}} from $WORKTREE (isolated DB + triggers)..."
+        echo "Do not pipe this command's output (| head, tee-in-a-script-that-exits, ...) — see docs/testing-a-pr.md." >&2
         cd "$WORKTREE" && SWITCHBOARD_DATA_DIR="$HOME/.switchboard-dev-pr{{.PR}}" SWITCHBOARD_TRIGGERS_DIR="$HOME/.switchboard-dev-pr{{.PR}}/triggers" npx electron . --no-sandbox
 
   "test-pr:clean":
     desc: "Remove the test-pr worktree and its isolated data dir — requires PR=<number>"
+    silent: true
     cmds:
       - |
-        if [ -z "{{.PR}}" ]; then
-          echo "Usage: task test-pr:clean PR=<number>" >&2
-          exit 1
-        fi
+        case "{{.PR}}" in
+          ''|*[!0-9]*)
+            echo "Usage: task test-pr:clean PR=<number> (numeric only)" >&2
+            exit 1
+            ;;
+        esac
       - git worktree remove --force ".worktrees/pr-{{.PR}}-test"
       - rm -rf "{{.HOME}}/.switchboard-dev-pr{{.PR}}"
       - echo "Cleaned up worktree and data dir for PR #{{.PR}}"
