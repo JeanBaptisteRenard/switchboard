@@ -438,10 +438,13 @@ test('regression (F4): showSession drains a leftover live buffer immediately on 
     window.activeSessionId = 'a';
     window.gridViewActive = false;
 
-    // 'a' is active and opens a sync block — lands in terminalWriteBuffers,
-    // with its SYNC_BUFFER_TIMEOUT safety timer armed.
-    window.handleTerminalData('a', '\x1b[?2026hC1_OLD');
-    assert.ok(inCtx(`terminalWriteBuffers.get('a').timerId`) !== 0, 'sync safety timer armed while still active');
+    // 'a' is active with an ordinary <=33ms pending flush in
+    // terminalWriteBuffers (its rAF is armed but has not fired). A mid-sync
+    // leftover is deliberately NOT used as the vehicle here anymore: since
+    // the grid-open sync guard, a leftover with syncDepth > 0 defers on
+    // reveal instead of draining (covered by its own tests below).
+    window.handleTerminalData('a', 'C1_OLD');
+    assert.ok(inCtx(`terminalWriteBuffers.get('a').rafId`) !== 0, 'ordinary flush pending while still active');
 
     // Switch away and immediately back — 'a' becomes hidden and is shown
     // again with NO handleTerminalData call for it in between, so the
@@ -451,8 +454,8 @@ test('regression (F4): showSession drains a leftover live buffer immediately on 
     window.showSession('a');
     window.activeSessionId = 'a';
 
-    assert.strictEqual(spies.write, 1, 'the leftover buffer is painted immediately on reveal, not left for its own timer');
-    assert.strictEqual(spies.writes[0], '\x1b[?2026hC1_OLD');
+    assert.strictEqual(spies.write, 1, 'the leftover buffer is painted immediately on reveal, not left for its own rAF/timer');
+    assert.strictEqual(spies.writes[0], 'C1_OLD');
     assert.strictEqual(inCtx(`terminalWriteBuffers.has('a')`), false, 'leftover buffer drained and removed on reveal');
   } finally {
     destroy();
@@ -581,6 +584,134 @@ test('a grid session (open grid, not hidden) also bypasses the hidden accumulato
 
     assert.strictEqual(inCtx(`hiddenAccumulators.has('other')`), false);
     assert.ok(inCtx(`terminalWriteBuffers.has('other')`), 'grid sessions keep the normal write-buffer path');
+  } finally {
+    destroy();
+  }
+});
+
+// --- Grid-open sync guard (follow-up to PR #122's approval review) ---
+//
+// showGridView() sets gridViewActive = true and then wraps EVERY open
+// session into a grid card — including the currently ACTIVE one, whose live
+// terminalWriteBuffers entry may be mid an open DEC 2026 sync block
+// (ESC[?2026h seen, ESC[?2026l not yet). Draining that buffer on the spot
+// (as replayHiddenBuffer's reveal drain did unguarded) writes the block's
+// first half immediately and its remainder in a later, genuinely
+// time-separated write — splitting one atomic TUI redraw into two paints.
+// The guard restores pre-#122 behavior: leave the mid-sync live buffer in
+// place, bounded by its own already-armed SYNC_BUFFER_TIMEOUT (500ms), and
+// flush the WHOLE block in one write when it closes (or at the timeout).
+
+// Installs the app.js globals the real showGridView() reads but the shared
+// harness does not stub (it was built for terminal-manager.js-only tests).
+function installGridViewGlobals(window, sessionIds) {
+  const doc = window.document;
+  // jsdom does not implement scrollIntoView; showGridView's deferred
+  // focusGridCard rAF callback calls it on the focused card.
+  window.HTMLElement.prototype.scrollIntoView = () => {};
+  for (const name of ['planViewer', 'statsViewer', 'memoryViewer', 'settingsViewer', 'jsonlViewer', 'terminalArea']) {
+    if (!window[name]) window[name] = doc.createElement('div');
+  }
+  const sidebarContent = doc.createElement('div');
+  for (const sid of sessionIds) {
+    const item = doc.createElement('div');
+    item.className = 'session-item';
+    item.dataset.sessionId = sid;
+    sidebarContent.appendChild(item);
+  }
+  window.sidebarContent = sidebarContent;
+  window.cachedProjects = [];
+  window.sortedOrder = [];
+}
+
+test('grid-open sync guard: showGridView() with the active session mid-sync-block does not split the block — the whole redraw lands in one write', () => {
+  const { window, spies, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.sessionMap.set('a', { sessionId: 'a', name: 'a', projectPath: '/p' });
+    window.sessionMap.set('b', { sessionId: 'b', name: 'b', projectPath: '/p' });
+    window.createTerminalEntry({ sessionId: 'a' });
+    window.createTerminalEntry({ sessionId: 'b' });
+    window.activeSessionId = 'a';
+    window.gridViewActive = false;
+    installGridViewGlobals(window, ['a', 'b']);
+
+    // The ACTIVE session is mid an open sync block: h seen, l not yet.
+    window.handleTerminalData('a', '\x1b[?2026hFIRST_HALF');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('a').syncDepth`), 1);
+    assert.ok(inCtx(`terminalWriteBuffers.get('a').timerId`) !== 0, 'sanity: SYNC_BUFFER_TIMEOUT armed');
+
+    // Open the grid — wraps every open session, active one included.
+    window.showGridView();
+
+    assert.strictEqual(spies.write, 0, 'the open block\'s first half is NOT written on grid open');
+    assert.ok(inCtx(`terminalWriteBuffers.has('a')`), 'mid-sync live buffer left in place, not drained');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('a').syncDepth`), 1, 'syncDepth tracking survives the grid open');
+    assert.ok(inCtx(`terminalWriteBuffers.get('a').timerId`) !== 0, 'deferral stays bounded — safety timer still armed');
+    assert.strictEqual(inCtx(`hiddenAccumulators.has('a')`), false, 'nothing was moved to the hidden accumulator');
+
+    // The rest of the block arrives on the live path (grid = fast cadence).
+    window.handleTerminalData('a', 'SECOND_HALF\x1b[?2026l');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('a').syncDepth`), 0, 'block closed');
+    assert.ok(inCtx(`terminalWriteBuffers.get('a').rafId`) !== 0, 'flush scheduled now that the block closed');
+
+    // Fire the scheduled flush (tests run before jsdom's rAF ticks).
+    window.flushTerminalBuffer('a');
+    assert.strictEqual(spies.write, 1, 'exactly one write for the whole redraw');
+    assert.strictEqual(spies.writes[0], '\x1b[?2026hFIRST_HALFSECOND_HALF\x1b[?2026l',
+      'the sync block replays intact — never split across two time-separated writes');
+  } finally {
+    destroy();
+  }
+});
+
+test('grid-open sync guard: the deferral is bounded — SYNC_BUFFER_TIMEOUT flushes a block whose ESC[?2026l never arrives', async () => {
+  const { window, spies, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.sessionMap.set('a', { sessionId: 'a', name: 'a', projectPath: '/p' });
+    window.createTerminalEntry({ sessionId: 'a' });
+    window.activeSessionId = 'a';
+    window.gridViewActive = false;
+    installGridViewGlobals(window, ['a']);
+
+    window.handleTerminalData('a', '\x1b[?2026hSTUCK_HALF'); // no closing l, ever
+    window.showGridView();
+    assert.strictEqual(spies.write, 0, 'deferred at grid open');
+    assert.ok(inCtx(`terminalWriteBuffers.get('a').timerId`) !== 0, 'safety timer armed');
+
+    // Real timers in the harness — wait past SYNC_BUFFER_TIMEOUT (500ms).
+    await new Promise((resolve) => setTimeout(resolve, 650));
+
+    assert.strictEqual(spies.write, 1, 'the safety timeout flushed the stuck block — the guard never waits forever');
+    assert.strictEqual(spies.writes[0], '\x1b[?2026hSTUCK_HALF');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.has('a')`), false, 'buffer removed after the timeout flush');
+  } finally {
+    destroy();
+  }
+});
+
+test('grid-open sync guard: same deferral on a plain showSession reveal of a session hidden with a mid-sync leftover and no new data', () => {
+  const { window, spies, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.createTerminalEntry({ sessionId: 'a' });
+    window.createTerminalEntry({ sessionId: 'b' });
+    window.activeSessionId = 'a';
+    window.gridViewActive = false;
+
+    window.handleTerminalData('a', '\x1b[?2026hHALF'); // mid-sync while active
+    window.showSession('b');
+    window.activeSessionId = 'b';
+    // No data for 'a' while hidden — the leftover was never drained.
+    window.showSession('a');
+    window.activeSessionId = 'a';
+
+    assert.strictEqual(spies.write, 0, 'reveal does not paint the half-open block');
+    assert.ok(inCtx(`terminalWriteBuffers.has('a')`), 'leftover kept, safety timer still bounding it');
+
+    // Block closes after the reveal — one write, whole block.
+    window.handleTerminalData('a', 'REST\x1b[?2026l');
+    window.flushTerminalBuffer('a');
+    assert.strictEqual(spies.write, 1);
+    assert.strictEqual(spies.writes[0], '\x1b[?2026hHALFREST\x1b[?2026l');
   } finally {
     destroy();
   }
