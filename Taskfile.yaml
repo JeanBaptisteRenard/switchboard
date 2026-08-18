@@ -103,3 +103,44 @@ tasks:
     cmds:
       - rm -f "{{.SWITCHBOARD_DB}}"
       - echo "Removed {{.SWITCHBOARD_DB}}"
+
+  test-pr:
+    desc: "Run a PR live, isolated, alongside the running AppImage — requires PR=<number>. See docs/testing-a-pr.md"
+    silent: true
+    cmds:
+      - |
+        if [ -z "{{.PR}}" ]; then
+          echo "Usage: task test-pr PR=<number>" >&2
+          exit 1
+        fi
+        set -e
+        WORKTREE=".worktrees/pr-{{.PR}}-test"
+        git fetch origin "pull/{{.PR}}/head"
+        if [ -d "$WORKTREE" ]; then
+          git -C "$WORKTREE" checkout --detach FETCH_HEAD
+        else
+          git worktree add --detach "$WORKTREE" FETCH_HEAD
+        fi
+        # Symlink node_modules instead of `npm install` in the worktree: fast, and the
+        # native modules (better-sqlite3, node-pty) stay the electron-ABI ones already
+        # rebuilt in the primary checkout. INVALID if the PR bumped package-lock.json
+        # or the electron version — run `npm ci` in the worktree instead when it did.
+        if [ -n "$(git diff --stat main...FETCH_HEAD -- package-lock.json)" ]; then
+          echo "WARNING: package-lock.json differs on this PR — the node_modules symlink is invalid." >&2
+          echo "Run 'npm ci' inside $WORKTREE before launching." >&2
+        fi
+        ln -sfn "$(pwd)/node_modules" "$WORKTREE/node_modules"
+        echo "Launching PR #{{.PR}} from $WORKTREE (isolated DB + triggers)..."
+        cd "$WORKTREE" && SWITCHBOARD_DATA_DIR="$HOME/.switchboard-dev-pr{{.PR}}" SWITCHBOARD_TRIGGERS_DIR="$HOME/.switchboard-dev-pr{{.PR}}/triggers" npx electron . --no-sandbox
+
+  "test-pr:clean":
+    desc: "Remove the test-pr worktree and its isolated data dir — requires PR=<number>"
+    cmds:
+      - |
+        if [ -z "{{.PR}}" ]; then
+          echo "Usage: task test-pr:clean PR=<number>" >&2
+          exit 1
+        fi
+      - git worktree remove --force ".worktrees/pr-{{.PR}}-test"
+      - rm -rf "{{.HOME}}/.switchboard-dev-pr{{.PR}}"
+      - echo "Cleaned up worktree and data dir for PR #{{.PR}}"
