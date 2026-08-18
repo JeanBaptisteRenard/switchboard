@@ -201,6 +201,32 @@ const migrations = [
   // ALTER into the schema-reconciliation pass below. Our array is
   // index-addressed with v4-v6 already shipped, so v7 stays as the fast path
   // for fork installs; the reconciliation block covers foreign-version DBs.
+  // v8: backfill the initial-scan completeness marker (settings key
+  // 'initial_scan_complete'). The scan worker now streams one DB write per
+  // folder, so an interrupted first scan leaves session_cache PARTIALLY
+  // populated — indistinguishable, by row count alone, from a finished scan.
+  // session-cache.js therefore writes this marker only when the worker's
+  // final done message arrives, and get-projects treats "cache populated but
+  // marker absent" as an interrupted first scan: it resumes the background
+  // worker instead of running the synchronous reconcile sweep (which would
+  // re-parse every still-missing folder on the main thread — the multi-minute
+  // freeze the marker exists to prevent).
+  //
+  // Existing installs predate the marker but were populated by builds that
+  // wrote the whole scan in a single final-message batch: a populated cache
+  // here can only mean a completed scan, never a partial one (partial states
+  // only became possible with the per-folder streaming that ships alongside
+  // this migration). Blessing them is therefore safe — and necessary, or
+  // every existing user would be thrown back into a full cold-start scan.
+  (db) => {
+    try {
+      const row = db.prepare('SELECT COUNT(*) AS cnt FROM session_cache').get();
+      if (row.cnt > 0) {
+        // JSON.stringify(true) to match setSetting's encoding.
+        db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('initial_scan_complete', 'true')").run();
+      }
+    } catch {}
+  },
 ];
 
 const currentDbVersion = (() => {
@@ -267,6 +293,12 @@ if (migrations.length > currentDbVersion) {
   if (mustReindex) {
     db.exec('DELETE FROM session_cache');
     db.exec('DELETE FROM cache_meta');
+    // The cache is empty again, so the coming rescan is a fresh initial scan:
+    // drop the completeness marker so an interruption of THAT scan is detected
+    // (cache partially repopulated + marker absent → get-projects resumes the
+    // background worker instead of reconciling synchronously), and so
+    // buildProjectsFromCache stays on its zero-I/O fallback while it runs.
+    db.exec("DELETE FROM settings WHERE key = 'initial_scan_complete'");
   }
 }
 
@@ -656,6 +688,23 @@ function deleteSetting(key) {
   stmts.settingsDelete.run(key);
 }
 
+// --- Initial-scan completeness marker ---
+// The scan worker streams per-folder DB writes, so "session_cache has rows"
+// no longer implies "the initial scan finished" — an interrupted first scan
+// leaves a partial cache. This marker is the authoritative signal: written by
+// session-cache.js only on the worker's final successful done message,
+// backfilled once for pre-marker installs by migration v8, cleared whenever
+// the schema-reconciliation pass wipes the cache for a re-index.
+const INITIAL_SCAN_COMPLETE_KEY = 'initial_scan_complete';
+
+function isInitialScanComplete() {
+  return getSetting(INITIAL_SCAN_COMPLETE_KEY) === true;
+}
+
+function setInitialScanComplete() {
+  setSetting(INITIAL_SCAN_COMPLETE_KEY, true);
+}
+
 // --- Daily activity aggregate (for stats heatmap) ---
 
 // Returns [{date: 'YYYY-MM-DD', messageCount, sessionCount}, ...] sorted ASC.
@@ -785,6 +834,7 @@ module.exports = {
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
   searchByType, isSearchIndexPopulated, searchFtsRecreated,
   getSetting, setSetting, deleteSetting,
+  isInitialScanComplete, setInitialScanComplete,
   getDailyActivity,
   getDailyMetrics, getDailyModelTokens, getModelUsage, getTotalCounts,
   closeDb,

@@ -43,12 +43,14 @@ function extractGetProjectsHandlerBody() {
 function makeHandler(mocks) {
   const body = extractGetProjectsHandlerBody();
   const fn = new Function(
-    'isCachePopulated', 'isSearchIndexPopulated', 'populateCacheViaWorker',
+    'isCachePopulated', 'isSearchIndexPopulated', 'isInitialScanComplete',
+    'populateCacheViaWorker',
     'reconcileCacheFromFilesystem', 'buildProjectsFromCache', 'showArchived',
     body
   );
   return () => fn(
-    mocks.isCachePopulated, mocks.isSearchIndexPopulated, mocks.populateCacheViaWorker,
+    mocks.isCachePopulated, mocks.isSearchIndexPopulated,
+    mocks.isInitialScanComplete, mocks.populateCacheViaWorker,
     mocks.reconcileCacheFromFilesystem, mocks.buildProjectsFromCache, false
   );
 }
@@ -58,6 +60,7 @@ test('get-projects on a cold cache never runs reconcileCacheFromFilesystem synch
   const handler = makeHandler({
     isCachePopulated: () => false, // cold cache: needsPopulate branch
     isSearchIndexPopulated: () => false,
+    isInitialScanComplete: () => false,
     populateCacheViaWorker: () => { calls.push('populate'); },
     reconcileCacheFromFilesystem: () => { calls.push('reconcile'); },
     buildProjectsFromCache: () => { calls.push('build'); return []; },
@@ -78,6 +81,7 @@ test('get-projects on a warm cache still reconciles (stat-gated, cheap when noth
   const handler = makeHandler({
     isCachePopulated: () => true, // warm cache: else branch
     isSearchIndexPopulated: () => true,
+    isInitialScanComplete: () => true, // marker present: the scan really finished
     populateCacheViaWorker: () => { calls.push('populate'); },
     reconcileCacheFromFilesystem: () => { calls.push('reconcile'); },
     buildProjectsFromCache: () => { calls.push('build'); return []; },
@@ -87,4 +91,34 @@ test('get-projects on a warm cache still reconciles (stat-gated, cheap when noth
 
   assert.ok(!calls.includes('populate'), 'a warm start must not kick off a fresh worker scan');
   assert.deepEqual(calls, ['reconcile', 'build']);
+});
+
+// The scenario the row-count check cannot see: the worker streams one DB
+// write per folder, so killing the app mid-first-scan leaves session_cache
+// (and search_map) NON-empty. On relaunch isCachePopulated() and
+// isSearchIndexPopulated() are both true — only the absent completeness
+// marker reveals the scan never finished. The handler must classify this as
+// cold (resume the background worker), NOT warm: the warm branch's
+// synchronous reconcileCacheFromFilesystem() would find every still-missing
+// folder stat-dirty and re-parse them all on the main thread before
+// get-projects could return — the original multi-minute freeze, reached by
+// simply relaunching after an interrupted first scan.
+test('get-projects on a partial cache (interrupted first scan: rows present, marker absent) resumes the scan instead of reconciling synchronously', () => {
+  const calls = [];
+  const handler = makeHandler({
+    isCachePopulated: () => true, // partial cache looks populated by row count
+    isSearchIndexPopulated: () => true,
+    isInitialScanComplete: () => false, // ...but the scan never reached done
+    populateCacheViaWorker: () => { calls.push('populate'); },
+    reconcileCacheFromFilesystem: () => { calls.push('reconcile'); },
+    buildProjectsFromCache: () => { calls.push('build'); return []; },
+  });
+
+  handler();
+
+  assert.ok(!calls.includes('reconcile'),
+    'a partially-populated cache without the completeness marker must take the cold branch -- ' +
+    'reconcileCacheFromFilesystem on it re-parses every unindexed folder synchronously');
+  assert.deepEqual(calls, ['populate', 'build'],
+    'the interrupted scan must be resumed fire-and-forget, then serve whatever is cached');
 });

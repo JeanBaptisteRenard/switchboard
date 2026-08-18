@@ -11,4 +11,18 @@ function encodeProjectPath(projectPath) {
   return sanitized.slice(0, 200) + '-' + Math.abs(h).toString(36);
 }
 
-module.exports = { encodeProjectPath };
+// Best-effort inverse of encodeProjectPath, for DISPLAY ONLY while the
+// initial scan is still running and cache_meta has no real projectPath for a
+// folder yet. The encoding is lossy (every non-alphanumeric became '-'), so
+// this cannot distinguish a path separator from a dash, dot or underscore in
+// the original path — '-home-jb-my-repo' decodes to '/home/jb/my/repo' even
+// if the project was really /home/jb/my-repo. That approximation is
+// acceptable: the sidebar entry is corrected as soon as the scan worker
+// indexes the folder (per-folder projects-changed refresh). Callers must
+// NEVER persist this guess (e.g. into cache_meta) — it would shadow the real
+// derived path.
+function decodeProjectFolderBestEffort(folder) {
+  return folder.replace(/-/g, '/');
+}
+
+module.exports = { encodeProjectPath, decodeProjectFolderBestEffort };

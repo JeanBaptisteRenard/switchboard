@@ -106,6 +106,7 @@ const {
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
   searchByType, isSearchIndexPopulated, searchFtsRecreated,
   getSetting, setSetting, deleteSetting,
+  isInitialScanComplete, setInitialScanComplete,
   getDailyMetrics, getDailyModelTokens, getModelUsage, getTotalCounts,
   closeDb,
   DB_PATH,
@@ -388,7 +389,8 @@ sessionCache.init({
   db: {
     deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession, replaceSessionMetrics, touchCachedModified,
     deleteSearchFolder, deleteSearchSession, upsertSearchEntries,
-    setFolderMeta, getFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName, isCachePopulated,
+    setFolderMeta, getFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName,
+    isInitialScanComplete, setInitialScanComplete,
   },
 });
 const { readSessionFile, readFolderFromFilesystem, refreshFolder, reconcileCacheFromFilesystem,
@@ -771,7 +773,16 @@ ipcMain.handle('rebuild-cache', async () => {
 
 ipcMain.handle('get-projects', async (_event, showArchived) => {
   try {
-    const needsPopulate = !isCachePopulated() || !isSearchIndexPopulated();
+    // "Cache has rows" is NOT enough to call the start warm: the scan worker
+    // streams one DB write per folder, so killing the app mid-scan leaves
+    // session_cache partially populated. Only the completeness marker —
+    // written when the worker's final done message arrives — proves the
+    // initial scan actually finished. Without it, a partial cache must take
+    // the cold branch below: the warm branch's reconcileCacheFromFilesystem()
+    // would find every still-missing folder stat-dirty and re-parse them all
+    // synchronously on the main thread — the original multi-minute freeze,
+    // reachable by simply relaunching after an interrupted first scan.
+    const needsPopulate = !isCachePopulated() || !isSearchIndexPopulated() || !isInitialScanComplete();
 
     if (needsPopulate) {
       // First call after a migration that clears session_cache (e.g. v4), or a

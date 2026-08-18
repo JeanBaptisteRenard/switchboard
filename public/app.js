@@ -1385,6 +1385,16 @@ let indexingBannerDismissed = false;
 function updateIndexingBanner(payload) {
   if (!payload || !payload.coldStart) return;
   if (payload.done) {
+    if (payload.error) {
+      // A failed scan used to just hide the banner, leaving the tiny status
+      // text as the only trace of the failure. Show it where the user was
+      // already looking — even past a dismiss, since "your history didn't
+      // finish indexing" is new information, not more of the same progress.
+      indexingBannerText.textContent = formatIndexingBannerText(payload);
+      indexingBanner.style.display = '';
+      indexingBannerDismissed = false;
+      return;
+    }
     indexingBanner.style.display = 'none';
     indexingBannerDismissed = false; // a future cold-start run gets its own banner
     return;

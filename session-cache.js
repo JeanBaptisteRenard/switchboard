@@ -4,7 +4,7 @@ const { Worker } = require('worker_threads');
 const { getFolderIndexMtimeMs } = require('./folder-index-state');
 const { deriveProjectPath } = require('./derive-project-path');
 const { readSessionFile, readSessionDisplayHeader, enumerateSessionFiles, resolveJsonlPath } = require('./read-session-file');
-const { encodeProjectPath } = require('./encode-project-path');
+const { encodeProjectPath, decodeProjectFolderBestEffort } = require('./encode-project-path');
 
 /**
  * Session cache module.
@@ -13,7 +13,8 @@ const { encodeProjectPath } = require('./encode-project-path');
 let PROJECTS_DIR, activeSessions, getMainWindow, log;
 let deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession, touchCachedModified, replaceSessionMetrics;
 let deleteSearchFolder, deleteSearchSession, upsertSearchEntries;
-let setFolderMeta, getFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName, isCachePopulated;
+let setFolderMeta, getFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName;
+let isInitialScanComplete, setInitialScanComplete;
 
 function init(ctx) {
   PROJECTS_DIR = ctx.PROJECTS_DIR;
@@ -38,7 +39,8 @@ function init(ctx) {
   getSetting = ctx.db.getSetting;
   getMeta = ctx.db.getMeta;
   setName = ctx.db.setName;
-  isCachePopulated = ctx.db.isCachePopulated;
+  isInitialScanComplete = ctx.db.isInitialScanComplete;
+  setInitialScanComplete = ctx.db.setInitialScanComplete;
 }
 
 // readSessionFile is imported from read-session-file.js (shared with worker)
@@ -386,24 +388,45 @@ function buildProjectsFromCache(showArchived) {
   // disk for every directory on every render. Fall back to deriveProjectPath only
   // for folders the indexer hasn't seen yet, and backfill cache_meta so subsequent
   // renders are pure DB reads.
+  //
+  // While the INITIAL scan is still incomplete (completeness marker absent),
+  // that fallback is forbidden: cache_meta is mostly/entirely empty, so
+  // deriveProjectPath (readdir + up to 256 KB JSONL read) would run for every
+  // folder under PROJECTS_DIR — twice per sidebar paint (the renderer's
+  // showArchived false/true Promise.all) — synchronously on the main process,
+  // undermining the "return whatever's cached, zero per-folder I/O" contract
+  // of the non-blocking first launch. Use a best-effort decode of the folder
+  // name instead (display-only, corrected per folder as the scan worker fills
+  // cache_meta and fires projects-changed) and skip the fs.existsSync missing
+  // probe for the same zero-I/O reason. Nothing is written to cache_meta on
+  // this path — a lossy guess must never shadow the real derived path.
   try {
+    const scanComplete = isInitialScanComplete ? isInitialScanComplete() : true;
     const folderMeta = getAllFolderMeta();
     const dirs = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })
       .filter(d => d.isDirectory() && d.name !== '.git');
     for (const d of dirs) {
       let projectPath = folderMeta.get(d.name)?.projectPath;
+      let placeholder = false;
       if (!projectPath) {
-        projectPath = deriveProjectPath(path.join(PROJECTS_DIR, d.name), d.name);
-        if (projectPath) setFolderMeta(d.name, projectPath, 0);
+        if (scanComplete) {
+          projectPath = deriveProjectPath(path.join(PROJECTS_DIR, d.name), d.name);
+          if (projectPath) setFolderMeta(d.name, projectPath, 0);
+        } else {
+          projectPath = decodeProjectFolderBestEffort(d.name);
+          placeholder = true;
+        }
       }
       if (!projectPath) continue;
       if (hiddenProjects.has(projectPath)) continue;
       if (!projectMap.has(projectPath)) {
         projectMap.set(projectPath, {
-          folder: encodeProjectPath(projectPath),
+          // For a placeholder the on-disk name IS the ground truth — re-encoding
+          // the lossy decode could diverge from it (>200-char hashed names).
+          folder: placeholder ? d.name : encodeProjectPath(projectPath),
           projectPath,
           sessions: [],
-          missing: !fs.existsSync(projectPath),
+          missing: placeholder ? false : !fs.existsSync(projectPath),
         });
       }
     }
@@ -513,11 +536,14 @@ let populatePromise = null;
 function populateCacheViaWorker() {
   if (populatePromise) return populatePromise;
 
-  // Captured once, before any folder has been written -- session_cache flips
-  // non-empty after the FIRST folder message, so this must be read up front,
-  // not inside the message handler, or the banner would only ever see its
-  // own first event before the "cold" flag disappeared.
-  const coldStart = !isCachePopulated();
+  // Captured once, up front. Keyed on the persistent completeness marker, not
+  // on isCachePopulated(): the worker streams per-folder writes, so a scan
+  // interrupted mid-run leaves session_cache non-empty — a row-count check
+  // would classify the resumed scan as warm and silently drop its banner.
+  // Marker absent covers both a genuine first launch AND the resume after an
+  // interruption; it flips true only via setInitialScanComplete() on the
+  // worker's final successful done message below.
+  const coldStart = !isInitialScanComplete();
   sendStatus('Scanning projects…', 'active');
 
   let scannedFolders = 0;
@@ -525,8 +551,18 @@ function populateCacheViaWorker() {
   let sessionCount = 0;
   let indexedProjects = 0;
 
+  // ~4 events/s: one IPC message per folder is wasteful on a large tree (the
+  // comparable notifyRendererProjectsChanged is throttled too). The FIRST
+  // event (lastProgressAt still 0) and every done event always pass, so the
+  // banner appears immediately and never misses the terminal state.
+  const PROGRESS_THROTTLE_MS = 250;
+  let lastProgressAt = 0;
+
   const reportProgress = (done, error) => {
     if (!coldStart) return;
+    const now = Date.now();
+    if (!done && lastProgressAt !== 0 && now - lastProgressAt < PROGRESS_THROTTLE_MS) return;
+    lastProgressAt = now;
     sendIndexingProgress({
       coldStart: true,
       current: scannedFolders,
@@ -602,6 +638,16 @@ function populateCacheViaWorker() {
         return;
       }
 
+      // The scan reached its final message with every folder written: persist
+      // the completeness marker. This is the ONLY place it is set (besides the
+      // one-time migration backfill for pre-marker installs) — error/exit
+      // paths must not set it, so an interrupted or failed scan leaves it
+      // absent and the next get-projects resumes the background worker
+      // instead of running the synchronous reconcile sweep on a partial
+      // cache. Resuming is safe: each folder message above is a
+      // delete-then-insert (deleteCachedFolder/deleteSearchFolder before the
+      // upserts), so re-scanning already-written folders never duplicates rows.
+      if (setInitialScanComplete) setInitialScanComplete();
       sendStatus(`Indexed ${sessionCount} sessions across ${indexedProjects} projects`, 'done');
       // Clear status after a few seconds
       setTimeout(() => sendStatus(''), 5000);

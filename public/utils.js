@@ -74,9 +74,16 @@ function formatDate(date) {
  * Cold-start indexing banner text. Shown once on a genuine first launch while
  * session-cache.js's worker-based scan is still running (see app.js's
  * updateIndexingBanner, driven by the main process's indexing-progress
- * events); hidden as soon as one of those events reports done:true.
+ * events); hidden as soon as one of those events reports done:true — unless
+ * that final event carries an error, in which case the failure is spelled out
+ * in the banner (the tiny status indicator used to be the only trace of it).
+ * The scan resumes on the next launch: main.js re-runs populateCacheViaWorker
+ * on every startup, and the completeness marker is only written on success.
  */
-function formatIndexingBannerText({ current, total, sessionsSoFar }) {
+function formatIndexingBannerText({ current, total, sessionsSoFar, error }) {
+  if (error) {
+    return `Indexing failed: ${error} — it will resume on the next launch.`;
+  }
   return `Indexing your Claude Code history — one-time, ${current}/${total} projects, ${sessionsSoFar} sessions so far`;
 }
 

@@ -83,11 +83,11 @@ test('foreign higher-version database is reconciled, not crashed', () => {
     assert.ok(state.cols.includes('fileMtime'), 'fileMtime column added');
     assert.equal(state.cacheCount, 0, 'stale cache cleared for re-index');
     assert.equal(state.metaCount, 0, 'folder index gate cleared for re-index');
-    // Fork divergence from upstream: our migrations array has 7 entries (vs 4
-    // upstream), so a version-5 DB legitimately runs v6-v7 (both idempotent
-    // try/catch) and gets bumped to 7. The invariant that matters is "never
+    // Fork divergence from upstream: our migrations array has 8 entries (vs 4
+    // upstream), so a version-5 DB legitimately runs v6-v8 (all idempotent
+    // try/catch) and gets bumped to 8. The invariant that matters is "never
     // downgraded"; a DB claiming a version above ours stays untouched.
-    assert.equal(state.version, '7', 'foreign db_version upgraded to ours, never downgraded');
+    assert.equal(state.version, '8', 'foreign db_version upgraded to ours, never downgraded');
     for (const col of ['parentSessionId', 'agentId', 'runtime', 'sessionFile']) {
       assert.ok(state.cols.includes(col), `foreign column ${col} preserved`);
     }

@@ -19,6 +19,9 @@
 //   6. Once dismissed, further non-done progress events don't re-show the banner.
 //   7. A done:true event resets the dismissed flag so a future cold-start run
 //      (e.g. after a cache-clearing migration) can show its own banner again.
+//   8. A done:true event carrying an error shows the failure in the banner
+//      (even past a dismiss) instead of silently hiding it -- the tiny status
+//      indicator used to be the only trace of a failed scan.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -48,15 +51,27 @@ function makeHarness() {
   let dismissed = false;
 
   // Reproduce the logic from app.js's updateIndexingBanner + dismiss handler.
+  // (formatIndexingBannerText itself is the real function, tested above; the
+  // harness inlines its two output shapes.)
+  function formatText(payload) {
+    if (payload.error) return `Indexing failed: ${payload.error} — it will resume on the next launch.`;
+    return `Indexing your Claude Code history — one-time, ${payload.current}/${payload.total} projects, ${payload.sessionsSoFar} sessions so far`;
+  }
   function updateIndexingBanner(payload) {
     if (!payload || !payload.coldStart) return;
     if (payload.done) {
+      if (payload.error) {
+        bannerText.textContent = formatText(payload);
+        banner.style.display = '';
+        dismissed = false;
+        return;
+      }
       banner.style.display = 'none';
       dismissed = false; // a future cold-start run gets its own banner
       return;
     }
     if (dismissed) return;
-    bannerText.textContent = `Indexing your Claude Code history — one-time, ${payload.current}/${payload.total} projects, ${payload.sessionsSoFar} sessions so far`;
+    bannerText.textContent = formatText(payload);
     banner.style.display = '';
   }
 
@@ -113,6 +128,38 @@ test('dismissIndexingBanner: once dismissed, further non-done progress events do
   updateIndexingBanner({ coldStart: true, current: 3, total: 16, sessionsSoFar: 20, done: false });
 
   assert.equal(banner.style.display, 'none', 'a dismissed banner must stay hidden until the run completes');
+});
+
+test('formatIndexingBannerText: a payload with an error renders the failure message', () => {
+  const { window, destroy } = setupSidebarDom();
+  try {
+    const text = window.formatIndexingBannerText({ current: 3, total: 16, sessionsSoFar: 128, error: 'ENOSPC: no space left on device' });
+    assert.equal(text, 'Indexing failed: ENOSPC: no space left on device — it will resume on the next launch.');
+  } finally {
+    destroy();
+  }
+});
+
+test('updateIndexingBanner: done:true with an error shows the failure instead of hiding the banner', () => {
+  const { banner, bannerText, updateIndexingBanner } = makeHarness();
+  updateIndexingBanner({ coldStart: true, current: 2, total: 16, sessionsSoFar: 10, done: false });
+
+  updateIndexingBanner({ coldStart: true, current: 5, total: 16, sessionsSoFar: 40, done: true, error: 'worker exited unexpectedly' });
+
+  assert.equal(banner.style.display, '', 'a failed scan must stay visible, not silently disappear');
+  assert.match(bannerText.textContent, /Indexing failed: worker exited unexpectedly/);
+});
+
+test('updateIndexingBanner: a failure surfaces even after the user dismissed the progress banner', () => {
+  const { banner, bannerText, updateIndexingBanner, dismissIndexingBanner } = makeHarness();
+  updateIndexingBanner({ coldStart: true, current: 2, total: 16, sessionsSoFar: 10, done: false });
+  dismissIndexingBanner();
+
+  updateIndexingBanner({ coldStart: true, current: 5, total: 16, sessionsSoFar: 40, done: true, error: 'boom' });
+
+  assert.equal(banner.style.display, '',
+    '"your history did not finish indexing" is new information, not more of the dismissed progress stream');
+  assert.match(bannerText.textContent, /Indexing failed: boom/);
 });
 
 test('a done:true event resets the dismissed flag for a future cold-start run', () => {
