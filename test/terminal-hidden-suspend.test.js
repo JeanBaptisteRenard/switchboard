@@ -422,6 +422,70 @@ test('regression (F1): a leftover pending live-buffer flush is drained into the 
   }
 });
 
+// Regression (review finding F4, WARNING) — the no-new-data variant of F1:
+// drainLiveBufferIntoHiddenAccumulator only ran from handleTerminalData's
+// hidden branch, so a session hidden with a pending leftover live buffer
+// that receives NO further data before being shown again got a reveal that
+// painted nothing until the leftover's own timer/rAF eventually fired —
+// possibly after the container was already visible. Fixed by also draining
+// from replayHiddenBuffer itself, the single choke point both showSession
+// and wrapInGridCard go through.
+test('regression (F4): showSession drains a leftover live buffer immediately on reveal, even with no new data while hidden (plain switch)', () => {
+  const { window, spies, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.createTerminalEntry({ sessionId: 'a' });
+    window.createTerminalEntry({ sessionId: 'b' });
+    window.activeSessionId = 'a';
+    window.gridViewActive = false;
+
+    // 'a' is active and opens a sync block — lands in terminalWriteBuffers,
+    // with its SYNC_BUFFER_TIMEOUT safety timer armed.
+    window.handleTerminalData('a', '\x1b[?2026hC1_OLD');
+    assert.ok(inCtx(`terminalWriteBuffers.get('a').timerId`) !== 0, 'sync safety timer armed while still active');
+
+    // Switch away and immediately back — 'a' becomes hidden and is shown
+    // again with NO handleTerminalData call for it in between, so the
+    // hidden branch's drain never ran.
+    window.showSession('b');
+    window.activeSessionId = 'b';
+    window.showSession('a');
+    window.activeSessionId = 'a';
+
+    assert.strictEqual(spies.write, 1, 'the leftover buffer is painted immediately on reveal, not left for its own timer');
+    assert.strictEqual(spies.writes[0], '\x1b[?2026hC1_OLD');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.has('a')`), false, 'leftover buffer drained and removed on reveal');
+  } finally {
+    destroy();
+  }
+});
+
+test('regression (F4): hideGridView -> showSession drains the revealed session\'s leftover live buffer (grid close, no new data)', () => {
+  const { window, spies, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.createTerminalEntry({ sessionId: 'a' });
+    window.createTerminalEntry({ sessionId: 'b' });
+    window.activeSessionId = 'a';
+    window.gridViewActive = true;
+
+    // Both sessions accumulate an ordinary pending flush while the grid is
+    // open (fast cadence — terminalWriteBuffers, never the hidden
+    // accumulator, since no session is "hidden" while gridViewActive).
+    window.handleTerminalData('a', 'A_PENDING');
+    window.handleTerminalData('b', 'B_PENDING');
+    assert.ok(inCtx(`terminalWriteBuffers.has('a')`));
+    assert.ok(inCtx(`terminalWriteBuffers.has('b')`));
+
+    window.hideGridView();
+    window.showSession('a'); // 'a' becomes the single-view active session; 'b' stays hidden
+
+    assert.strictEqual(spies.write, 1, 'a\'s leftover buffer is painted immediately on reveal');
+    assert.strictEqual(spies.writes[0], 'A_PENDING');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.has('a')`), false, 'a\'s leftover drained and removed on reveal');
+  } finally {
+    destroy();
+  }
+});
+
 test('destroySession with a pending hidden buffer is a safe no-op (no write to a disposed terminal, no leak)', () => {
   const { window, spies, inCtx, destroy } = setupTerminalDom();
   try {

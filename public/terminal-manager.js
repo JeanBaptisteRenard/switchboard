@@ -663,7 +663,21 @@ function appendToHiddenAccumulator(sessionId, data) {
 // the container becomes visible, so the reveal never shows stale content.
 // A session with nothing accumulated (never received data while hidden, or
 // was never hidden at all) is a cheap no-op.
+//
+// Also drains any leftover terminalWriteBuffers entry first — the no-new-
+// data variant of the drain race fixed above: a session can go hidden with
+// a pending live-buffer flush (an ordinary <=33ms flush, or a still-armed
+// SYNC_BUFFER_TIMEOUT) and receive nothing further before being shown again,
+// in which case handleTerminalData's hidden branch never runs and never
+// gets a chance to drain it. Without this, the reveal here would paint
+// nothing while that leftover buffer's own timer/rAF is still armed to fire
+// independently, possibly after the container is already visible. Calling
+// drainLiveBufferIntoHiddenAccumulator here is idempotent with the call in
+// handleTerminalData — whichever runs first drains and deletes the entry,
+// so the other is a cheap no-op — and prepends in the same order (leftover
+// predates anything already accumulated).
 function replayHiddenBuffer(sessionId) {
+  drainLiveBufferIntoHiddenAccumulator(sessionId);
   const acc = hiddenAccumulators.get(sessionId);
   hiddenAccumulators.delete(sessionId);
   if (!acc || !acc.raw) return;
