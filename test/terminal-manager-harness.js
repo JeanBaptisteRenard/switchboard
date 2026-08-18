@@ -31,7 +31,8 @@ function makeTerminalStub(spies) {
     loadAddon() {}
     open() {}
     dispose() { spies.dispose++; }
-    write(_d, cb) { spies.write++; if (cb) cb(); }
+    write(d, cb) { spies.write++; spies.writes.push(d); if (cb) cb(); }
+    reset() { spies.reset++; }
     focus() {}
     // Mirrors xterm: resizing to the current size is a no-op and fires nothing.
     resize(cols, rows) {
@@ -83,6 +84,8 @@ function setupTerminalDom(opts = {}) {
   const spies = {
     dispose: 0,
     write: 0,
+    writes: [],
+    reset: 0,
     closeTerminal: 0,
     resize: [],
     resizeTerminal: [],
