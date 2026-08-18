@@ -107,21 +107,26 @@ tasks:
   test-pr:
     desc: "Run a PR live, isolated, alongside the running AppImage — requires PR=<number>. See docs/testing-a-pr.md"
     silent: true
+    env:
+      # PR reaches the script as an environment variable, NOT as a {{.PR}}
+      # template splice. Splicing would paste the raw value into the script
+      # before the shell parses it, so a crafted value like `$(cmd)` executes
+      # during parsing — before any guard can reject it, and regardless of
+      # quoting. An environment variable's value is never re-parsed as shell
+      # syntax; the numeric guard below then handles everything else
+      # (path traversal, option-looking strings).
+      PR: "{{.PR}}"
     cmds:
       - |
-        # {{.PR}} is Go-template-substituted into this script as raw text before the
-        # shell ever sees it — quoting alone does NOT stop a crafted value from breaking
-        # out (shell injection) or path-traversing (`../`) any string it's spliced into
-        # below. A numeric-only guard, checked first, is the only safe fix.
-        case "{{.PR}}" in
+        case "$PR" in
           ''|*[!0-9]*)
             echo "Usage: task test-pr PR=<number> (numeric only)" >&2
             exit 1
             ;;
         esac
         set -e
-        WORKTREE=".worktrees/pr-{{.PR}}-test"
-        git fetch origin "pull/{{.PR}}/head"
+        WORKTREE=".worktrees/pr-$PR-test"
+        git fetch origin "pull/$PR/head"
         PR_SHA="$(git rev-parse FETCH_HEAD)"
         if [ -d "$WORKTREE" ]; then
           git -C "$WORKTREE" checkout --detach "$PR_SHA"
@@ -138,21 +143,25 @@ tasks:
           echo "Run 'npm ci' inside $WORKTREE before launching." >&2
         fi
         ln -sfn "$(pwd)/node_modules" "$WORKTREE/node_modules"
-        echo "Launching PR #{{.PR}} from $WORKTREE (isolated DB + triggers)..."
+        echo "Launching PR #$PR from $WORKTREE (isolated DB + triggers)..."
         echo "Do not pipe this command's output (| head, tee-in-a-script-that-exits, ...) — see docs/testing-a-pr.md." >&2
-        cd "$WORKTREE" && SWITCHBOARD_DATA_DIR="$HOME/.switchboard-dev-pr{{.PR}}" SWITCHBOARD_TRIGGERS_DIR="$HOME/.switchboard-dev-pr{{.PR}}/triggers" npx electron . --no-sandbox
+        cd "$WORKTREE" && SWITCHBOARD_DATA_DIR="$HOME/.switchboard-dev-pr$PR" SWITCHBOARD_TRIGGERS_DIR="$HOME/.switchboard-dev-pr$PR/triggers" npx electron . --no-sandbox
 
   "test-pr:clean":
     desc: "Remove the test-pr worktree and its isolated data dir — requires PR=<number>"
     silent: true
+    env:
+      # Same rationale as in test-pr: env, never a {{.PR}} template splice.
+      PR: "{{.PR}}"
     cmds:
       - |
-        case "{{.PR}}" in
+        case "$PR" in
           ''|*[!0-9]*)
             echo "Usage: task test-pr:clean PR=<number> (numeric only)" >&2
             exit 1
             ;;
         esac
-      - git worktree remove --force ".worktrees/pr-{{.PR}}-test"
-      - rm -rf "{{.HOME}}/.switchboard-dev-pr{{.PR}}"
-      - 'echo "Cleaned up worktree and data dir for PR #{{.PR}}"'
+        set -e
+        git worktree remove --force ".worktrees/pr-$PR-test"
+        rm -rf "$HOME/.switchboard-dev-pr$PR"
+        echo "Cleaned up worktree and data dir for PR #$PR"

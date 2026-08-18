@@ -23,6 +23,18 @@ from source with `SWITCHBOARD_DATA_DIR` set gives the dev instance its own
 next to the AppImage (`main.js` even defaults unpackaged runs to
 `~/.switchboard-dev` when the var isn't set).
 
+## Isolation is cooperation, not a sandbox
+
+Everything below (DB, triggers, schedules) is **app-level cooperation**: the
+isolation holds because Switchboard's own code chooses to honour
+`SWITCHBOARD_DATA_DIR` and `SWITCHBOARD_TRIGGERS_DIR`. The PR's code runs via
+`npx electron .` as a plain process with your full user privileges — a malicious
+PR can simply ignore those variables and read or write anything you can,
+including the real `~/.switchboard/switchboard.db` the AppImage is using.
+`task test-pr` protects a well-behaved PR from *accidentally* colliding with
+the live instance; it does not make running unread code safe. Read the diff
+before you launch it.
+
 ## The four isolation concerns
 
 `task test-pr` handles the first two automatically. The third and fourth need you
@@ -104,6 +116,10 @@ If you see that warning, `Ctrl-C` out, `cd .worktrees/pr-122-test && npm ci`, th
 re-run `task test-pr PR=122` (it will reuse the worktree and just symlink over
 your fresh `npm ci` install — remove the symlinked `node_modules` first if `npm
 ci` refuses to run into an existing symlink).
+
+Be aware that `npm ci` in the worktree executes the contributor's arbitrary
+`postinstall`/`prepare` scripts on your machine — only run it after reading the
+PR's `package.json` and `package-lock.json` diff.
 
 ### If the PR touches CodeMirror
 
@@ -198,7 +214,9 @@ task test-pr:clean PR=122
 
 Removes the `.worktrees/pr-122-test` worktree and `~/.switchboard-dev-pr122`
 (database + triggers dir). Run this once you're done testing — leftover worktrees
-and data dirs accumulate otherwise.
+and data dirs accumulate otherwise. If you deleted a `.worktrees/pr-N-test`
+directory by hand instead, run `git worktree prune` to clear the orphaned git
+metadata it leaves behind.
 
 ## See also
 
