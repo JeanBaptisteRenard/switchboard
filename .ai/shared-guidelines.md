@@ -35,6 +35,8 @@ task dev   # Taskfile already sets SWITCHBOARD_DATA_DIR=~/.switchboard-dev by de
 
 The AppImage uses `~/.switchboard/switchboard.db`. The dev electron uses `~/.switchboard-dev/switchboard.db`. They cannot collide.
 
+To test a specific PR live, alongside the running AppImage, use `task test-pr PR=<number>` — it isolates the DB, the automation triggers dir, and warns about the schedule-runner duplicate-fire risk. See [docs/testing-a-pr.md](docs/testing-a-pr.md) for the full procedure; do not improvise the isolation env vars by hand.
+
 ### 2. Running `npm run build:linux` CAN kill the running instance — and so can the `cp` to ~/Applications
 
 **Corrected 2026-05-31** — the previous version of this section claimed the build was safe. It isn't.

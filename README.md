@@ -125,6 +125,7 @@ task lint          # eslint .
 task check         # test + lint  — pre-commit / pre-push gate
 task ci            # same as check but sequential, verbose
 task build         # npm run build:linux
+task test-pr PR=N  # run PR #N from source, isolated, alongside a running AppImage
 task clean         # wipe dist/, codemirror bundle, local DB (asks for confirmation)
 task db:reset      # wipe ~/.switchboard/switchboard.db only
 ```
@@ -160,6 +161,7 @@ If your `~/Applications/Switchboard.AppImage` is open while you develop:
 - **Dev DB isolation** — `task dev` sets `SWITCHBOARD_DATA_DIR=~/.switchboard-dev` automatically so the dev electron uses its own SQLite database. The AppImage keeps using `~/.switchboard/switchboard.db`. They never collide.
 - **Single-instance lock** — if you double-click `Switchboard.AppImage` while it's already open, the second launch quits immediately and focuses the existing window instead of spawning a duplicate process. This was a real data-loss bug (PTYs orphaned) before the fix landed.
 - **Rebuilding AND replacing are both risky while the app runs** — `task build` invokes `electron-builder`, which rebuilds native modules (`better-sqlite3`, `node-pty`) by default. Those `.node` files are loaded by your running AppImage; replacing them mid-run can kill the process (witnessed 2026-05-31). Building is safe only with `--config.npmRebuild=false`. Replacing `~/Applications/Switchboard.AppImage` via `cp` is **not reliably safe either**: the live process doesn't need the on-disk file (it runs from `/tmp/.mount_*/`), but `appimagelauncherd` watches `~/Applications/` and its desktop-integration re-run can cleanly terminate the running instance (witnessed 2026-06-04, non-deterministic). Do the `cp` only when you're ready to restart. The new code takes effect only on next launch.
+- **Testing a PR before merging** — `task test-pr PR=<number>` runs a PR's code from source in its own isolated instance next to the AppImage, no build required. See [docs/testing-a-pr.md](docs/testing-a-pr.md).
 
 ### For AI agents
 
