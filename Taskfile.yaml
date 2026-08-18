@@ -155,4 +155,4 @@ tasks:
         esac
       - git worktree remove --force ".worktrees/pr-{{.PR}}-test"
       - rm -rf "{{.HOME}}/.switchboard-dev-pr{{.PR}}"
-      - echo "Cleaned up worktree and data dir for PR #{{.PR}}"
+      - 'echo "Cleaned up worktree and data dir for PR #{{.PR}}"'
