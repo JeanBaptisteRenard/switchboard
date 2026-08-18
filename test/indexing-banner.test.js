@@ -13,6 +13,12 @@
 //   2. A cold-start progress event (coldStart:true, done:false) shows the banner.
 //   3. done:true hides the banner immediately.
 //   4. An event without coldStart (shouldn't happen, but defends the gate) is ignored.
+//   5. Clicking the dismiss button hides the banner immediately, before done:true
+//      (PR #124 review finding F2: the banner was documented as "dismissible" but
+//      had no actual close control, only an auto-hide-on-done path).
+//   6. Once dismissed, further non-done progress events don't re-show the banner.
+//   7. A done:true event resets the dismissed flag so a future cold-start run
+//      (e.g. after a cache-clearing migration) can show its own banner again.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -37,27 +43,36 @@ test('formatIndexingBannerText: renders the one-time first-run message with coun
 // ---------------------------------------------------------------------------
 
 function makeHarness() {
-  const banner = { textContent: '', style: { display: 'none' } };
+  const banner = { style: { display: 'none' } };
+  const bannerText = { textContent: '' };
+  let dismissed = false;
 
-  // Reproduce the logic from app.js's updateIndexingBanner.
+  // Reproduce the logic from app.js's updateIndexingBanner + dismiss handler.
   function updateIndexingBanner(payload) {
     if (!payload || !payload.coldStart) return;
     if (payload.done) {
       banner.style.display = 'none';
+      dismissed = false; // a future cold-start run gets its own banner
       return;
     }
-    banner.textContent = `Indexing your Claude Code history — one-time, ${payload.current}/${payload.total} projects, ${payload.sessionsSoFar} sessions so far`;
+    if (dismissed) return;
+    bannerText.textContent = `Indexing your Claude Code history — one-time, ${payload.current}/${payload.total} projects, ${payload.sessionsSoFar} sessions so far`;
     banner.style.display = '';
   }
 
-  return { banner, updateIndexingBanner };
+  function dismissIndexingBanner() {
+    banner.style.display = 'none';
+    dismissed = true;
+  }
+
+  return { banner, bannerText, updateIndexingBanner, dismissIndexingBanner, isDismissed: () => dismissed };
 }
 
 test('updateIndexingBanner: shows the banner with progress text on a cold-start event', () => {
-  const { banner, updateIndexingBanner } = makeHarness();
+  const { banner, bannerText, updateIndexingBanner } = makeHarness();
   updateIndexingBanner({ coldStart: true, current: 1, total: 16, sessionsSoFar: 4, done: false });
   assert.equal(banner.style.display, '');
-  assert.match(banner.textContent, /1\/16 projects, 4 sessions so far/);
+  assert.match(bannerText.textContent, /1\/16 projects, 4 sessions so far/);
 });
 
 test('updateIndexingBanner: hides the banner immediately on done:true', () => {
@@ -78,4 +93,35 @@ test('updateIndexingBanner: ignores a null/undefined payload without throwing', 
   const { banner, updateIndexingBanner } = makeHarness();
   assert.doesNotThrow(() => updateIndexingBanner(null));
   assert.equal(banner.style.display, 'none');
+});
+
+test('dismissIndexingBanner: hides the banner immediately, before done:true', () => {
+  const { banner, updateIndexingBanner, dismissIndexingBanner } = makeHarness();
+  updateIndexingBanner({ coldStart: true, current: 2, total: 16, sessionsSoFar: 10, done: false });
+  assert.equal(banner.style.display, '', 'sanity: banner is showing before dismiss');
+
+  dismissIndexingBanner();
+
+  assert.equal(banner.style.display, 'none', 'dismiss must hide the banner without waiting for done:true');
+});
+
+test('dismissIndexingBanner: once dismissed, further non-done progress events do not re-show the banner', () => {
+  const { banner, updateIndexingBanner, dismissIndexingBanner } = makeHarness();
+  updateIndexingBanner({ coldStart: true, current: 2, total: 16, sessionsSoFar: 10, done: false });
+  dismissIndexingBanner();
+
+  updateIndexingBanner({ coldStart: true, current: 3, total: 16, sessionsSoFar: 20, done: false });
+
+  assert.equal(banner.style.display, 'none', 'a dismissed banner must stay hidden until the run completes');
+});
+
+test('a done:true event resets the dismissed flag for a future cold-start run', () => {
+  const { updateIndexingBanner, dismissIndexingBanner, isDismissed } = makeHarness();
+  updateIndexingBanner({ coldStart: true, current: 2, total: 16, sessionsSoFar: 10, done: false });
+  dismissIndexingBanner();
+  assert.equal(isDismissed(), true);
+
+  updateIndexingBanner({ coldStart: true, current: 16, total: 16, sessionsSoFar: 200, done: true });
+
+  assert.equal(isDismissed(), false, 'done:true must clear the dismissed flag so a later run gets its own banner');
 });

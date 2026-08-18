@@ -793,15 +793,19 @@ ipcMain.handle('get-projects', async (_event, showArchived) => {
       // Cache already populated: pick up folders changed while the app was
       // closed, or never indexed by an older build, so sessions/worktrees don't
       // silently go missing. Stat-gated, so it's cheap when nothing has changed.
-      // Synchronous (readdir/stat sweep) — completes before buildProjectsFromCache
-      // below; no await needed despite the await in the cold-start branch above.
+      //
+      // Deliberately NOT called in the needsPopulate branch above: on a truly
+      // cold cache, cache_meta is still empty at this point (the background
+      // worker hasn't written a single folder yet), so this stat-gate would be
+      // true for every folder and reconcileCacheFromFilesystem would run a full
+      // synchronous refreshFolder() sweep -- a full JSONL parse of the entire
+      // tree, on the main thread, before this handler could return. That
+      // reintroduces the exact multi-minute blocking hang the fire-and-forget
+      // populateCacheViaWorker() call above exists to avoid (PR #124 review
+      // finding F1 -- see test/get-projects-cold-start-reconcile.test.js).
       reconcileCacheFromFilesystem();
     }
 
-    // Pick up folders changed while the app was closed, or never indexed by an
-    // older build, so sessions/worktrees don't silently go missing. Stat-gated,
-    // so it's cheap when nothing has changed.
-    reconcileCacheFromFilesystem();
     return buildProjectsFromCache(showArchived);
   } catch (err) {
     console.error('Error listing projects:', err);
