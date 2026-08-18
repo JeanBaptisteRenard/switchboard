@@ -21,6 +21,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const {
   findLastSafeRedrawMarker, findEscapeSequenceEnd, advanceToAnsiSafeBoundary, trimHiddenBuffer,
+  skipLoneLowSurrogate,
 } = require('../public/terminal-manager');
 const { setupTerminalDom } = require('./terminal-manager-harness');
 
@@ -81,6 +82,33 @@ test('findEscapeSequenceEnd: bare ESC as the last character returns -1', () => {
   assert.strictEqual(findEscapeSequenceEnd('abc\x1b', 3), -1);
 });
 
+// Regression (review finding F2): DCS/APC/PM are string-type sequences with
+// an arbitrary-length payload, just like OSC — sixel image data arrives as a
+// DCS payload. The old fallback treated ESC P as a generic 2-byte escape,
+// ending 2 chars in even though the real terminator (ST) was far later.
+test('findEscapeSequenceEnd: DCS (ESC P) with a long sixel-shaped payload is terminated by ST, not treated as a 2-byte escape', () => {
+  const payload = 'q#0;2;0;0;0'.repeat(50);
+  const str = '\x1bP' + payload + '\x1b\\TAIL_AFTER_DCS';
+  const st = str.indexOf('\x1b\\');
+  assert.strictEqual(findEscapeSequenceEnd(str, 0), st + 2,
+    'scans all the way to the real ST terminator, not 2 chars in');
+});
+
+test('findEscapeSequenceEnd: APC (ESC _) and PM (ESC ^) are also ST-terminated, and do NOT accept a bare BEL (unlike OSC)', () => {
+  const apc = '\x1b_apc payload with a stray \x07 BEL inside\x1b\\rest';
+  const apcSt = apc.indexOf('\x1b\\');
+  assert.strictEqual(findEscapeSequenceEnd(apc, 0), apcSt + 2, 'BEL inside an APC payload is not a terminator');
+
+  const pm = '\x1b^pm payload\x1b\\rest';
+  const pmSt = pm.indexOf('\x1b\\');
+  assert.strictEqual(findEscapeSequenceEnd(pm, 0), pmSt + 2);
+});
+
+test('findEscapeSequenceEnd: unterminated DCS returns -1', () => {
+  const str = '\x1bP' + 'q#0;2;0;0;0'.repeat(50); // no ST anywhere
+  assert.strictEqual(findEscapeSequenceEnd(str, 0), -1);
+});
+
 test('advanceToAnsiSafeBoundary: index already at a clean boundary is returned unchanged', () => {
   const str = 'plain text \x1b[2Jmore';
   assert.strictEqual(advanceToAnsiSafeBoundary(str, 5), 5);
@@ -101,6 +129,40 @@ test('advanceToAnsiSafeBoundary: index inside an OSC sequence advances past it',
 test('advanceToAnsiSafeBoundary: clamps out-of-range indices', () => {
   assert.strictEqual(advanceToAnsiSafeBoundary('abc', -5), 0);
   assert.strictEqual(advanceToAnsiSafeBoundary('abc', 999), 3);
+});
+
+// Regression (review finding F2): a naive cut landing inside a DCS/sixel
+// payload used to be returned unchanged (mis-scoped as a 2-byte escape).
+test('advanceToAnsiSafeBoundary: index inside a DCS (sixel-shaped) payload advances past its real ST terminator', () => {
+  const payload = 'q#0;2;0;0;0'.repeat(50);
+  const str = '\x1bP' + payload + '\x1b\\TAIL';
+  const dcsEnd = str.indexOf('\x1b\\') + 2;
+  const cutInsidePayload = 30; // well inside the repeated payload, far before the real ST
+  assert.ok(cutInsidePayload > str.indexOf('\x1b') && cutInsidePayload < dcsEnd,
+    'sanity: the chosen index really does land inside the DCS payload');
+  assert.strictEqual(advanceToAnsiSafeBoundary(str, cutInsidePayload), dcsEnd);
+});
+
+// Regression (review finding F3): a naive cut landing between a high and low
+// UTF-16 surrogate used to be returned unchanged, producing a tail starting
+// with an unpaired low surrogate.
+test('skipLoneLowSurrogate: advances past a lone low surrogate, leaves everything else unchanged', () => {
+  const emoji = '\u{1F600}'; // high surrogate 0xD83D, low surrogate 0xDE00
+  const highIdx = 3;
+  const lowIdx = highIdx + 1;
+  const str = 'abc' + emoji + 'def';
+  assert.strictEqual(str.charCodeAt(lowIdx) >= 0xdc00 && str.charCodeAt(lowIdx) <= 0xdfff, true, 'sanity: lowIdx is really a low surrogate');
+  assert.strictEqual(skipLoneLowSurrogate(str, lowIdx), lowIdx + 1, 'steps past the lone low surrogate');
+  assert.strictEqual(skipLoneLowSurrogate(str, highIdx), highIdx, 'a high surrogate is left alone — it is not a lone low surrogate');
+  assert.strictEqual(skipLoneLowSurrogate(str, 0), 0, 'plain ASCII is unaffected');
+  assert.strictEqual(skipLoneLowSurrogate(str, str.length), str.length, 'end-of-string index is left as-is');
+});
+
+test('advanceToAnsiSafeBoundary: never returns an index that starts with a lone low surrogate', () => {
+  const emoji = '\u{1F600}';
+  const str = 'AA' + emoji + 'BB'; // no escape sequences at all — pure surrogate-safety path
+  const lowSurrogateIdx = str.indexOf(emoji) + 1;
+  assert.strictEqual(advanceToAnsiSafeBoundary(str, lowSurrogateIdx), lowSurrogateIdx + 1);
 });
 
 test('trimHiddenBuffer: no-op when already under budget', () => {
@@ -136,6 +198,38 @@ test('trimHiddenBuffer: falls back to reset+tail when the last marker still does
   assert.strictEqual(result.reset, true);
   assert.strictEqual(result.data.length, 20);
   assert.ok(result.data.endsWith('y'), 'kept the newest bytes');
+});
+
+// Regression (review finding F2): with no safe redraw marker present, a long
+// DCS/sixel payload used to let the naive cut land mid-payload because the
+// boundary scanner mis-scoped ESC P as a 2-byte escape.
+test('trimHiddenBuffer: never cuts inside a DCS (sixel-shaped) payload in the no-marker fallback', () => {
+  const payload = 'q#0;2;0;0;0'.repeat(50);
+  const raw = 'z'.repeat(30) + '\x1bP' + payload + '\x1b\\TAIL';
+  const dcsEnd = raw.indexOf('\x1b\\') + 2;
+  const maxLen = raw.length - 40; // naive cut lands inside the DCS payload
+  const naiveStart = raw.length - maxLen;
+  assert.ok(naiveStart > raw.indexOf('\x1bP') && naiveStart < dcsEnd,
+    'sanity: the naive cut really does land inside the DCS payload');
+  const result = trimHiddenBuffer(raw, maxLen);
+  assert.strictEqual(result.reset, true);
+  assert.ok(result.data === 'TAIL' || result.data.startsWith('\x1bP'),
+    'kept tail starts either right after the DCS sequence, or at its untouched start — never mid-payload');
+});
+
+// Regression (review finding F3): the no-marker fallback used to be able to
+// split a UTF-16 surrogate pair (e.g. an emoji) straddling the cut point.
+test('trimHiddenBuffer: never splits a surrogate pair (emoji) in the no-marker fallback', () => {
+  const emoji = '\u{1F600}';
+  const raw = 'z'.repeat(30) + emoji + 'TAIL_AFTER_EMOJI';
+  const maxLen = raw.length - 31; // naive cut lands exactly between the emoji's two surrogates
+  const naiveStart = raw.length - maxLen;
+  assert.strictEqual(naiveStart, raw.indexOf(emoji) + 1, 'sanity: the naive cut lands between the two surrogate halves');
+  const result = trimHiddenBuffer(raw, maxLen);
+  assert.strictEqual(result.reset, true);
+  const firstCode = result.data.charCodeAt(0);
+  assert.ok(firstCode < 0xdc00 || firstCode > 0xdfff, 'kept tail never starts with a lone low surrogate');
+  assert.strictEqual(result.data, 'TAIL_AFTER_EMOJI', 'the whole (unpaired) emoji is dropped, tail starts clean');
 });
 
 // --- Accumulate-while-hidden / replay-on-show integration ---
@@ -269,6 +363,60 @@ test('rapid hide/show/hide/show (A -> B -> A) replays each accumulation independ
     window.activeSessionId = 'a';
     window.showSession('a');
     assert.strictEqual(spies.write, 1, 'no duplicate replay on a redundant show');
+  } finally {
+    destroy();
+  }
+});
+
+// Regression (review finding F1, CRITICAL): a session that becomes hidden
+// while it still has a pending terminalWriteBuffers entry (an ordinary
+// <=33ms flush, or — as here — a sync block whose 500ms SYNC_BUFFER_TIMEOUT
+// safety timer is still armed) used to leave that leftover buffer as a
+// second, independently-scheduled queue. Switching back before the old
+// timer fired made replayHiddenBuffer paint the NEWER accumulated content
+// first, then the leftover flush painted OLDER content after it —
+// inverting visible order. Fixed by draining the leftover buffer into the
+// hidden accumulator (order preserved) the moment new data needs to reach
+// it while hidden.
+test('regression (F1): a leftover pending live-buffer flush is drained into the hidden accumulator, preserving chronological order', () => {
+  const { window, spies, inCtx, destroy } = setupTerminalDom();
+  try {
+    window.createTerminalEntry({ sessionId: 'a' });
+    window.createTerminalEntry({ sessionId: 'b' });
+    window.activeSessionId = 'a';
+    window.gridViewActive = false;
+
+    // 'a' is active and opens a sync block — lands in terminalWriteBuffers,
+    // with its SYNC_BUFFER_TIMEOUT safety timer armed (syncDepth stays > 0).
+    window.handleTerminalData('a', '\x1b[?2026hC1_OLD');
+    assert.strictEqual(inCtx(`terminalWriteBuffers.get('a').syncDepth`), 1);
+    assert.ok(inCtx(`terminalWriteBuffers.get('a').timerId`) !== 0, 'sync safety timer armed while still active');
+
+    // The user switches away — 'a' becomes hidden. setActiveSession is
+    // stubbed as a no-op in this harness, so activeSessionId is flipped by
+    // hand to mirror what production's real setActiveSession would do.
+    window.showSession('b');
+    window.activeSessionId = 'b';
+
+    window.handleTerminalData('a', 'C2_NEW'); // newer data, arrives while hidden
+
+    assert.strictEqual(inCtx(`terminalWriteBuffers.has('a')`), false,
+      'leftover buffer drained and removed — no independent queue left armed');
+    assert.strictEqual(spies.write, 0, 'nothing painted yet — still accumulating');
+
+    // Switch back to 'a' well before the old 500ms timer would ever fire.
+    window.showSession('a');
+    window.activeSessionId = 'a';
+
+    assert.strictEqual(spies.write, 1, 'exactly one replay write');
+    assert.strictEqual(spies.writes[0], '\x1b[?2026hC1_OLDC2_NEW',
+      'older content replays BEFORE newer content — chronological order preserved');
+
+    // Had the old timer survived, it would call this directly — confirm
+    // it's a safe no-op now (already drained), not a second, out-of-order
+    // write landing after the reveal.
+    assert.doesNotThrow(() => window.flushTerminalBuffer('a'));
+    assert.strictEqual(spies.write, 1, 'no additional out-of-order write from the old timer');
   } finally {
     destroy();
   }

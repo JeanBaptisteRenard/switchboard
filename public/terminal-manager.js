@@ -511,10 +511,10 @@ function findLastSafeRedrawMarker(str) {
 
 // Given str[escIndex] === ESC, return the index right after the escape
 // sequence that starts there, or -1 if it is not terminated before the end
-// of the string. Intentionally narrow (CSI, OSC, and generic 2-byte
-// escapes) — this only needs to be complete enough that a cut index it
-// reports as "after" this sequence is never inside it; xterm's own parser
-// does the real semantic parsing once the replayed text reaches it.
+// of the string. Intentionally narrow (CSI, string-type OSC/DCS/APC/PM, and
+// generic 2-byte escapes) — this only needs to be complete enough that a cut
+// index it reports as "after" this sequence is never inside it; xterm's own
+// parser does the real semantic parsing once the replayed text reaches it.
 function findEscapeSequenceEnd(str, escIndex) {
   const next = str[escIndex + 1];
   if (next === undefined) return -1; // ESC is the last character — incomplete
@@ -528,11 +528,16 @@ function findEscapeSequenceEnd(str, escIndex) {
     }
     return -1;
   }
-  if (next === ']') {
-    // OSC: ESC ] ... terminated by BEL (0x07) or ST (ESC \)
+  if (next === ']' || next === 'P' || next === '_' || next === '^') {
+    // String-type sequences that can carry an arbitrary-length payload:
+    // OSC (]), DCS (P — this is the shape sixel image data arrives as),
+    // APC (_), PM (^). All are terminated by ST (ESC \). OSC additionally
+    // tolerates a bare BEL terminator — a long-standing xterm convention for
+    // window-title OSCs — that DCS/APC/PM have no equivalent for, so BEL
+    // only closes the sequence when next === ']'.
     let i = escIndex + 2;
     while (i < str.length) {
-      if (str.charCodeAt(i) === 0x07) return i + 1;
+      if (next === ']' && str.charCodeAt(i) === 0x07) return i + 1;
       if (str[i] === '\x1b' && str[i + 1] === '\\') return i + 2;
       i++;
     }
@@ -542,24 +547,35 @@ function findEscapeSequenceEnd(str, escIndex) {
   return escIndex + 2;
 }
 
+// A lone low surrogate (0xDC00-0xDFFF) is never a valid start of text on its
+// own — it only means something paired right after a high surrogate (e.g.
+// one half of an emoji). A cut that lands exactly between the two halves
+// would hand xterm a malformed lead character; step past it if found.
+function skipLoneLowSurrogate(str, index) {
+  if (index >= str.length) return index;
+  const code = str.charCodeAt(index);
+  return (code >= 0xdc00 && code <= 0xdfff) ? index + 1 : index;
+}
+
 // Smallest index >= index that does not fall strictly inside an escape
-// sequence — used to move a naive byte-budget cut point forward so it never
-// splits one. An escape sequence left unterminated at the end of the string
-// is treated as extending to the end of the string (nothing after it is a
-// safe place to start either).
+// sequence, and does not start with a lone low surrogate — used to move a
+// naive byte-budget cut point forward so it never splits one of either. An
+// escape sequence left unterminated at the end of the string is treated as
+// extending to the end of the string (nothing after it is a safe place to
+// start either).
 function advanceToAnsiSafeBoundary(str, index) {
   if (index <= 0) return 0;
   if (index >= str.length) return str.length;
   let pos = 0;
   while (pos < str.length) {
-    if (pos >= index) return index; // reached the target at a clean boundary
+    if (pos >= index) return skipLoneLowSurrogate(str, index); // reached the target at a clean boundary
     if (str[pos] !== '\x1b') { pos++; continue; }
     const end = findEscapeSequenceEnd(str, pos);
     const seqEnd = end === -1 ? str.length : end;
-    if (index > pos && index < seqEnd) return seqEnd; // target lands inside — skip past it
+    if (index > pos && index < seqEnd) return skipLoneLowSurrogate(str, seqEnd); // target lands inside — skip past it
     pos = seqEnd;
   }
-  return index;
+  return skipLoneLowSurrogate(str, index);
 }
 
 // Bounds a hidden session's accumulated buffer, dropping the OLDEST bytes on
@@ -584,6 +600,47 @@ function trimHiddenBuffer(raw, maxLen) {
   const naiveStart = Math.max(0, raw.length - maxLen);
   const safeStart = advanceToAnsiSafeBoundary(raw, naiveStart);
   return { data: raw.slice(safeStart), reset: true };
+}
+
+// A session can still have a pending terminalWriteBuffers entry at the
+// moment it becomes hidden — an ordinary <=33ms flush, or a sync block whose
+// SYNC_BUFFER_TIMEOUT (500ms) safety timer is still armed. Left alone, that
+// leftover buffer and the hidden accumulator would become two independently
+// scheduled queues for the same session: if the session is shown again
+// before the leftover's own timer/rAF fires, replayHiddenBuffer paints the
+// newer accumulator content, and the leftover then fires on its own
+// schedule — possibly after the reveal — painting older content AFTER
+// newer content already appeared, inverting visible order.
+//
+// Called from handleTerminalData's hidden branch, unconditionally and on
+// every chunk: the first call after a session becomes hidden migrates
+// whatever's left (cancelling its rafId/timerId so it can never fire
+// flushTerminalBuffer independently), and every call after that is a cheap
+// no-op (terminalWriteBuffers.get returns undefined once drained). This
+// makes the exact transition moment irrelevant — it doesn't matter whether a
+// session became hidden via a single-view switch or a grid close, only that
+// no new data can reach the accumulator without the leftover being folded in
+// first.
+//
+// buf.syncDepth is intentionally dropped, not carried over: an unterminated
+// sync block in the drained text replays exactly like any other embedded
+// sync-mode transition once the whole accumulator is written in one shot on
+// reveal (see the "Hidden-session full suspend" comment above) — there is
+// nothing left to track once the drained bytes are just more accumulated
+// text.
+function drainLiveBufferIntoHiddenAccumulator(sessionId) {
+  const buf = terminalWriteBuffers.get(sessionId);
+  if (!buf) return;
+  cancelAnimationFrame(buf.rafId);
+  clearTimeout(buf.timerId);
+  terminalWriteBuffers.delete(sessionId);
+  if (buf.chunks.length === 0) return;
+  let acc = hiddenAccumulators.get(sessionId);
+  if (!acc) {
+    acc = { raw: '', reset: false };
+    hiddenAccumulators.set(sessionId, acc);
+  }
+  acc.raw = buf.chunks.join('') + acc.raw; // leftover is older — goes first
 }
 
 function appendToHiddenAccumulator(sessionId, data) {
@@ -624,11 +681,11 @@ function handleTerminalData(sessionId, data) {
   const entry = openSessions.get(sessionId);
   if (entry) {
     if (isHiddenSingleViewSession(sessionId)) {
-      // Fully suspended — accumulate only, never touch terminalWriteBuffers/
-      // xterm at all. A flush already scheduled from data received WHILE the
-      // session was still visible (rAF/timer armed within the last 33ms)
-      // still fires normally here — a bounded, one-time leftover, not a
-      // recurring cost — rather than being intercepted mid-flight.
+      // Fully suspended — accumulate only, never call terminal.write().
+      // drainLiveBufferIntoHiddenAccumulator folds in whatever was left
+      // pending from before this session became hidden (see its own
+      // comment) so there is only ever one queue per session, in order.
+      drainLiveBufferIntoHiddenAccumulator(sessionId);
       appendToHiddenAccumulator(sessionId, data);
       trackActivity(sessionId, data);
       return;
@@ -1075,5 +1132,6 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     isImeComposing, shouldSendSpaceDirectly, decodeOsc52Payload,
     findLastSafeRedrawMarker, findEscapeSequenceEnd, advanceToAnsiSafeBoundary, trimHiddenBuffer,
+    skipLoneLowSurrogate,
   };
 }
