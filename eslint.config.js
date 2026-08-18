@@ -111,6 +111,7 @@ const rendererCrossFileGlobals = {
   // no ESLint config, so new cross-file renderer symbols have to be declared
   // here when syncing or no-undef fires across five consumers.
   shortProjectPath: 'readonly',
+  formatIndexingBannerText: 'readonly',
   PERMISSION_MODES: 'readonly',
   showSession: 'readonly',
   confirmAndStopSession: 'readonly',

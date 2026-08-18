@@ -1,5 +1,6 @@
 const statusBarInfo = document.getElementById('status-bar-info');
 const statusBarActivity = document.getElementById('status-bar-activity');
+const indexingBanner = document.getElementById('indexing-banner');
 const terminalsEl = document.getElementById('terminals');
 const sidebarContent = document.getElementById('sidebar-content');
 const plansContent = document.getElementById('plans-content');
@@ -1367,6 +1368,27 @@ window.api.onStatusUpdate((text, type) => {
     }, type === 'done' ? 3000 : 0);
   }
 });
+
+// --- First-run cold-start indexing banner ---
+// A large ~/.claude/projects/ (1GB+, witnessed live) can take many minutes to
+// fully index on first launch. Without this, the sidebar showed nothing but a
+// bare "Loading…" the whole time — the user force-quit twice believing the
+// app had hung. main.js/session-cache.js now stream `indexing-progress`
+// events (only emitted when the scan started with an empty cache — see
+// populateCacheViaWorker's coldStart capture), which this banner turns into
+// an explanatory, self-dismissing message. Warm-start rebuilds (including the
+// full re-index that already runs on every startup) never emit these, so the
+// banner never flashes outside a genuine first run.
+function updateIndexingBanner(payload) {
+  if (!payload || !payload.coldStart) return;
+  if (payload.done) {
+    indexingBanner.style.display = 'none';
+    return;
+  }
+  indexingBanner.textContent = formatIndexingBannerText(payload);
+  indexingBanner.style.display = '';
+}
+window.api.onIndexingProgress(updateIndexingBanner);
 
 // Refocus the active terminal after a fullscreen transition (F11, menu, IPC).
 // The transition reflows the window and drops keyboard focus on <body>, so

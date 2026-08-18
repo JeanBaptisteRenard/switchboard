@@ -388,7 +388,7 @@ sessionCache.init({
   db: {
     deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession, replaceSessionMetrics, touchCachedModified,
     deleteSearchFolder, deleteSearchSession, upsertSearchEntries,
-    setFolderMeta, getFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName,
+    setFolderMeta, getFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName, isCachePopulated,
   },
 });
 const { readSessionFile, readFolderFromFilesystem, refreshFolder, reconcileCacheFromFilesystem,
@@ -774,13 +774,21 @@ ipcMain.handle('get-projects', async (_event, showArchived) => {
     const needsPopulate = !isCachePopulated() || !isSearchIndexPopulated();
 
     if (needsPopulate) {
-      // First call after a migration that clears session_cache (e.g. v4) finds
-      // an empty cache. Returning [] immediately makes the renderer paint an
-      // empty list and rely on `notifyRendererProjectsChanged` firing later —
-      // which only triggers a reload if the user is on the Sessions tab. To
-      // avoid that race, await the scan here so the response carries the
-      // freshly-populated cache. Concurrent callers share the same Promise.
-      await populateCacheViaWorker();
+      // First call after a migration that clears session_cache (e.g. v4), or a
+      // genuine first launch, finds an empty cache. Used to `await` the full
+      // scan here so the response carried the freshly-populated cache — but on
+      // a large ~/.claude/projects/ (1GB+, witnessed live) that scan takes many
+      // minutes, and awaiting it left the renderer's very first get-projects
+      // call — and therefore the whole sidebar — blocked the entire time with
+      // nothing but a "Loading…" label (the user force-quit believing the app
+      // had hung). Kick the scan off in the background instead: it now writes
+      // each folder to the DB and pushes `projects-changed` as it completes
+      // (see populateCacheViaWorker in session-cache.js), and emits
+      // `indexing-progress` events the renderer turns into a one-time banner.
+      // This immediate response returns whatever's cached right now (empty
+      // session rows on a true first run, but buildProjectsFromCache still
+      // lists every on-disk project directory synchronously below).
+      populateCacheViaWorker();
     } else {
       // Cache already populated: pick up folders changed while the app was
       // closed, or never indexed by an older build, so sessions/worktrees don't

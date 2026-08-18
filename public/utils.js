@@ -70,6 +70,16 @@ function formatDate(date) {
   return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
+/**
+ * Cold-start indexing banner text. Shown once on a genuine first launch while
+ * session-cache.js's worker-based scan is still running (see app.js's
+ * updateIndexingBanner, driven by the main process's indexing-progress
+ * events); hidden as soon as one of those events reports done:true.
+ */
+function formatIndexingBannerText({ current, total, sessionsSoFar }) {
+  return `Indexing your Claude Code history — one-time, ${current}/${total} projects, ${sessionsSoFar} sessions so far`;
+}
+
 function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
