@@ -310,6 +310,9 @@ test('sync block arriving while a rAF is pending does not permanently block futu
   const { window, inCtx, destroy } = setupTerminalDom();
   try {
     window.createTerminalEntry({ sessionId: 's1' });
+    // Exercise the normal write-buffer path — a hidden session never reaches
+    // terminalWriteBuffers at all (see terminal-hidden-suspend.test.js).
+    window.activeSessionId = 's1';
 
     // 1. Plain chunk on an idle session → rAF armed.
     window.handleTerminalData('s1', 'plain');
@@ -336,6 +339,7 @@ test('handleTerminalData on an idle session schedules a flush (keystroke echo pa
   const { window, inCtx, destroy } = setupTerminalDom();
   try {
     window.createTerminalEntry({ sessionId: 's1' });
+    window.activeSessionId = 's1';
 
     // A fully-wrapped sync redraw in one chunk (as ink emits) on an idle
     // session — syncDepth nets to 0, must end with a flush scheduled.

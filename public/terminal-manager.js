@@ -376,34 +376,24 @@ const MIN_FLUSH_INTERVAL_MS = 33; // ~30 fps
 const lastFlushAt = new Map(); // sessionId → performance.now() of last flush
 
 // A session that is neither the focused single-view terminal nor part of an
-// open grid still ran the full 30fps parse+paint pipeline on every PTY chunk
-// even though its container is display:none and nothing is composited —
-// measured: renderer ~44% of a core + GPU process ~50% with 4 streaming
-// sessions and only one visible. Throttling those sessions to ~1fps cuts both
-// the xterm parse cost and the paint/WebGL draw call ~30x; showSession() and
-// wrapInGridCard() force-flush the pending buffer immediately before a
-// session becomes visible (see flushTerminalBuffer calls below), so the
-// throttle never shows stale content once the session is actually shown.
+// open grid gets none of its PTY output written to xterm at all — see
+// appendToHiddenAccumulator/replayHiddenBuffer below. A prior version of this
+// throttled hidden sessions to ~1fps instead of suspending them outright;
+// that still ran a parse on every flush (measured: renderer JS main thread
+// ~17% of a core with 4 hidden sessions). Not calling write() removes that
+// parse cost entirely, on top of the paint/WebGL draw call cost already
+// avoided (xterm's own RenderService pauses rendering via an
+// IntersectionObserver on the screen element once its display:none ancestor
+// makes it non-intersecting — see node_modules/@xterm/xterm
+// src/browser/services/RenderService.ts _registerIntersectionObserver/
+// _handleIntersectionChange — so paint was already near-zero before this
+// change; this closes the remaining parse-cost gap).
 // Grid view is excluded — its own per-card WebGL virtualization
 // (suspendTerminalWebgl/restoreTerminalWebgl + gridCardObserver in
 // grid-view.js) already caps the dominant render cost there, and every open
 // grid session keeps the fast cadence so thumbnails stay live.
-const HIDDEN_FLUSH_INTERVAL_MS = 1000; // ~1 fps for a session nobody is looking at
-
 function isHiddenSingleViewSession(sessionId) {
   return !gridViewActive && sessionId !== activeSessionId;
-}
-
-// Whether sessionId has data buffered mid an unclosed synchronized-update
-// block (ESC_SYNC_START seen, ESC_SYNC_END not yet — buf.syncDepth > 0).
-// Guards the force-flush calls in showSession/wrapInGridCard: flushing here
-// would delete the buffer (losing syncDepth) and split one atomic TUI redraw
-// into two paints. The existing SYNC_BUFFER_TIMEOUT safety valve (see
-// handleTerminalData) still governs a block that never closes, exactly as it
-// does today for the already-active session.
-function isMidSyncBlock(sessionId) {
-  const buf = terminalWriteBuffers.get(sessionId);
-  return !!buf && buf.syncDepth > 0;
 }
 
 function flushTerminalBuffer(sessionId) {
@@ -434,25 +424,196 @@ function flushTerminalBuffer(sessionId) {
   });
 }
 
+// Only ever called for a session that is active or part of an open grid (see
+// handleTerminalData below) — a hidden single-view session never reaches
+// this function at all, so there is no hidden-cadence branch here anymore.
 function scheduleFlush(sessionId, buf) {
   // If a timer or rAF is already pending, don't stack another.
   if (buf.timerId || buf.rafId) return;
 
-  const interval = isHiddenSingleViewSession(sessionId) ? HIDDEN_FLUSH_INTERVAL_MS : MIN_FLUSH_INTERVAL_MS;
   const last = lastFlushAt.get(sessionId);
   const elapsed = last === undefined ? Infinity : performance.now() - last;
-  if (elapsed >= interval) {
+  if (elapsed >= MIN_FLUSH_INTERVAL_MS) {
     // Enough time has passed — flush on the next animation frame (current behavior).
     buf.rafId = requestAnimationFrame(() => flushTerminalBuffer(sessionId));
   } else {
     // Too soon — schedule a timer for the remaining interval, then rAF from there.
     // Reuses buf.timerId so destroySession/flushTerminalBuffer teardown works unchanged.
-    const remaining = interval - elapsed;
+    const remaining = MIN_FLUSH_INTERVAL_MS - elapsed;
     buf.timerId = setTimeout(() => {
       buf.timerId = 0;
       buf.rafId = requestAnimationFrame(() => flushTerminalBuffer(sessionId));
     }, remaining);
   }
+}
+
+// --- Hidden-session full suspend: accumulate-while-hidden, replay-on-show ---
+//
+// A hidden single-view session's raw PTY chunks are appended to a plain
+// string buffer and NEVER handed to terminal.write() — no parse, no dirty
+// marking, no render call of any kind — until the session is revealed again
+// (showSession/wrapInGridCard), at which point the whole accumulated buffer
+// is replayed in exactly one write() call, atomically, before the container
+// becomes visible.
+//
+// Sync-block tracking (ESC_SYNC_START/END, isMidSyncBlock in the previous
+// version of this file) does not apply here and is deliberately not
+// reintroduced: it existed to decide when the *live* write-buffering path
+// above should call terminal.write(), so a redraw split across two PTY
+// chunks wouldn't split across two writes either. A hidden accumulator never
+// calls write() until reveal, so there is exactly one write no matter how
+// many sync blocks the accumulated text contains — xterm's own DEC 2026
+// handling (CoreService.decPrivateModes.synchronizedOutput, gating
+// RenderService until the matching end sequence or its own 1000ms timeout —
+// see RenderService.ts) interprets whatever sync-mode transitions are
+// embedded in the replayed text exactly as it would for a single huge PTY
+// chunk, which its parser must already handle correctly.
+const hiddenAccumulators = new Map(); // sessionId → { raw, reset }
+
+// Deliberately a flat cap rather than a precise scrollback→bytes conversion
+// — row byte length varies wildly with ANSI overhead and there is no fixed
+// avg-bytes-per-row to derive from SCROLLBACK_SINGLE. 2 MB is generous
+// relative to a typical full-screen TUI redraw (order of a few KB to a few
+// tens of KB), so the safe-marker cut below is expected to handle the
+// overwhelming majority of overflow events — trimHiddenBuffer's reset+tail
+// fallback exists for the rare non-TUI full-throughput dump.
+const HIDDEN_BUFFER_MAX_LEN = 2 * 1024 * 1024; // ~2 MB per hidden session
+
+// Full-redraw markers: once one of these has been written, everything
+// visible afterward is rebuilt from scratch, so cutting the buffer to start
+// exactly here loses no visual state (scrollback fidelity for content that
+// was NEVER shown is an accepted trade for the memory bound). ESC can never
+// appear as a parameter/intermediate byte of an unrelated CSI sequence (its
+// 0x1b code point falls outside every CSI byte range), so a literal
+// substring match cannot be produced by an unrelated, longer CSI sequence.
+// The one acknowledged gap: an OSC payload (e.g. a hyperlink title) can carry
+// arbitrary bytes and could in principle contain one of these sequences
+// verbatim — accepted as vanishingly unlikely for real shell/TUI output
+// rather than implemented against, matching this function's "not a full VT
+// parser" scope (see findEscapeSequenceEnd below).
+const SAFE_REDRAW_MARKERS = [
+  '\x1b[?1049h', // enter alt screen
+  '\x1b[?1049l', // leave alt screen
+  '\x1b[2J',     // erase entire screen
+  '\x1b[3J',     // erase entire screen + scrollback
+];
+
+// Index of the START of the LAST occurrence of any safe redraw marker in
+// str, or -1 if none is present.
+function findLastSafeRedrawMarker(str) {
+  let best = -1;
+  for (const marker of SAFE_REDRAW_MARKERS) {
+    const idx = str.lastIndexOf(marker);
+    if (idx > best) best = idx;
+  }
+  return best;
+}
+
+// Given str[escIndex] === ESC, return the index right after the escape
+// sequence that starts there, or -1 if it is not terminated before the end
+// of the string. Intentionally narrow (CSI, OSC, and generic 2-byte
+// escapes) — this only needs to be complete enough that a cut index it
+// reports as "after" this sequence is never inside it; xterm's own parser
+// does the real semantic parsing once the replayed text reaches it.
+function findEscapeSequenceEnd(str, escIndex) {
+  const next = str[escIndex + 1];
+  if (next === undefined) return -1; // ESC is the last character — incomplete
+  if (next === '[') {
+    // CSI: ESC [ params(0x30-0x3f)* intermediates(0x20-0x2f)* final(0x40-0x7e)
+    let i = escIndex + 2;
+    while (i < str.length) {
+      const code = str.charCodeAt(i);
+      if (code >= 0x40 && code <= 0x7e) return i + 1;
+      i++;
+    }
+    return -1;
+  }
+  if (next === ']') {
+    // OSC: ESC ] ... terminated by BEL (0x07) or ST (ESC \)
+    let i = escIndex + 2;
+    while (i < str.length) {
+      if (str.charCodeAt(i) === 0x07) return i + 1;
+      if (str[i] === '\x1b' && str[i + 1] === '\\') return i + 2;
+      i++;
+    }
+    return -1;
+  }
+  // Any other single-character escape (ESC c, ESC 7, ESC =, ESC >, ...)
+  return escIndex + 2;
+}
+
+// Smallest index >= index that does not fall strictly inside an escape
+// sequence — used to move a naive byte-budget cut point forward so it never
+// splits one. An escape sequence left unterminated at the end of the string
+// is treated as extending to the end of the string (nothing after it is a
+// safe place to start either).
+function advanceToAnsiSafeBoundary(str, index) {
+  if (index <= 0) return 0;
+  if (index >= str.length) return str.length;
+  let pos = 0;
+  while (pos < str.length) {
+    if (pos >= index) return index; // reached the target at a clean boundary
+    if (str[pos] !== '\x1b') { pos++; continue; }
+    const end = findEscapeSequenceEnd(str, pos);
+    const seqEnd = end === -1 ? str.length : end;
+    if (index > pos && index < seqEnd) return seqEnd; // target lands inside — skip past it
+    pos = seqEnd;
+  }
+  return index;
+}
+
+// Bounds a hidden session's accumulated buffer, dropping the OLDEST bytes on
+// overflow but only at a point cheap to resume visually from. Preferred: the
+// last safe redraw marker in the buffer (see findLastSafeRedrawMarker) — the
+// kept tail is then self-contained. Fallback (no marker, or the marker still
+// doesn't fit maxLen): keep the newest maxLen characters, advanced to the
+// nearest ANSI-safe boundary, and flag reset:true so the caller resets the
+// terminal before replay — without a marker to anchor on, the tail's
+// cursor/attribute state can no longer be assumed correct.
+function trimHiddenBuffer(raw, maxLen) {
+  if (raw.length <= maxLen) return { data: raw, reset: false };
+
+  const markerIdx = findLastSafeRedrawMarker(raw);
+  if (markerIdx !== -1) {
+    const fromMarker = raw.slice(markerIdx);
+    if (fromMarker.length <= maxLen) {
+      return { data: fromMarker, reset: false };
+    }
+  }
+
+  const naiveStart = Math.max(0, raw.length - maxLen);
+  const safeStart = advanceToAnsiSafeBoundary(raw, naiveStart);
+  return { data: raw.slice(safeStart), reset: true };
+}
+
+function appendToHiddenAccumulator(sessionId, data) {
+  let acc = hiddenAccumulators.get(sessionId);
+  if (!acc) {
+    acc = { raw: '', reset: false };
+    hiddenAccumulators.set(sessionId, acc);
+  }
+  acc.raw += data;
+  if (acc.raw.length > HIDDEN_BUFFER_MAX_LEN) {
+    const trimmed = trimHiddenBuffer(acc.raw, HIDDEN_BUFFER_MAX_LEN);
+    acc.raw = trimmed.data;
+    acc.reset = trimmed.reset;
+  }
+}
+
+// Replay a hidden session's accumulated buffer in exactly one write() call,
+// resetting the terminal first if a hard (non-safe-marker) cut happened
+// somewhere in its history. Called from showSession/wrapInGridCard BEFORE
+// the container becomes visible, so the reveal never shows stale content.
+// A session with nothing accumulated (never received data while hidden, or
+// was never hidden at all) is a cheap no-op.
+function replayHiddenBuffer(sessionId) {
+  const acc = hiddenAccumulators.get(sessionId);
+  hiddenAccumulators.delete(sessionId);
+  if (!acc || !acc.raw) return;
+  const entry = openSessions.get(sessionId);
+  if (!entry) return; // destroySession may have removed it first
+  if (acc.reset) entry.terminal.reset();
+  entry.terminal.write(acc.raw);
 }
 
 // Entry point for PTY data (wired to window.api.onTerminalData in app.js).
@@ -462,6 +623,16 @@ function scheduleFlush(sessionId, buf) {
 function handleTerminalData(sessionId, data) {
   const entry = openSessions.get(sessionId);
   if (entry) {
+    if (isHiddenSingleViewSession(sessionId)) {
+      // Fully suspended — accumulate only, never touch terminalWriteBuffers/
+      // xterm at all. A flush already scheduled from data received WHILE the
+      // session was still visible (rAF/timer armed within the last 33ms)
+      // still fires normally here — a bounded, one-time leftover, not a
+      // recurring cost — rather than being intercepted mid-flight.
+      appendToHiddenAccumulator(sessionId, data);
+      trackActivity(sessionId, data);
+      return;
+    }
     let buf = terminalWriteBuffers.get(sessionId);
     if (!buf) {
       buf = { chunks: [], syncDepth: 0, rafId: 0, timerId: 0 };
@@ -789,6 +960,7 @@ function destroySession(sessionId) {
     terminalWriteBuffers.delete(sessionId);
   }
   lastFlushAt.delete(sessionId);
+  hiddenAccumulators.delete(sessionId); // no replay target left to flush into
   // terminal.dispose() also disposes the parser and its registered OSC
   // handlers (the OSC-52 clipboard hook) and all onX emitters — no manual
   // cleanup needed for those. The DnD/search-bar listeners live on
@@ -853,13 +1025,10 @@ function showSession(sessionId) {
       suspendTerminalWebgl(previousActiveSessionId);
     }
     if (entry) {
-      // The incoming session may have been throttled to
-      // HIDDEN_FLUSH_INTERVAL_MS while it wasn't visible — flush any pending
-      // buffer now so it never shows content staler than that window. Skip
-      // while mid an unclosed sync block (see isMidSyncBlock) so an in-flight
-      // atomic redraw still paints as one write once it closes or the
-      // SYNC_BUFFER_TIMEOUT valve fires.
-      if (!isMidSyncBlock(sessionId)) flushTerminalBuffer(sessionId);
+      // The incoming session may have accumulated a hidden buffer while it
+      // wasn't visible (see appendToHiddenAccumulator) — replay it now, in
+      // one atomic write, before the container becomes visible.
+      replayHiddenBuffer(sessionId);
       // Restore the full scrollback budget for the focused terminal (the grid
       // may have trimmed it — see showGridView). Growing the limit is lossless.
       entry.terminal.options.scrollback = SCROLLBACK_SINGLE;
@@ -903,5 +1072,8 @@ function setupDragAndDrop(container, getSessionId) {
 // Expose pure key-handling predicates to Node for unit testing. No-op in the
 // browser, where this file is loaded as a plain <script> and `module` is undefined.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { isImeComposing, shouldSendSpaceDirectly, decodeOsc52Payload };
+  module.exports = {
+    isImeComposing, shouldSendSpaceDirectly, decodeOsc52Payload,
+    findLastSafeRedrawMarker, findEscapeSequenceEnd, advanceToAnsiSafeBoundary, trimHiddenBuffer,
+  };
 }
