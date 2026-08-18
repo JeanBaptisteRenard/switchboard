@@ -24,21 +24,23 @@ function readFolderFromFilesystem(folder) {
   return { folder, projectPath, sessions, indexMtimeMs };
 }
 
-// Scan all folders
+// Scan all folders, streaming one message per folder as soon as it's read
+// instead of buffering every folder into one `results` array and posting a
+// single message at the very end. A large ~/.claude/projects/ (1GB+,
+// witnessed live) took many minutes to fully scan, during which the caller
+// (session-cache.js) had nothing to write to the DB or push to the renderer
+// \u2014 the sidebar showed a bare "Loading\u2026" the whole time. Streaming lets the
+// caller write + notify after every folder instead.
 try {
   const folders = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })
     .filter(d => d.isDirectory() && d.name !== '.git')
     .map(d => d.name);
 
-  const results = [];
   for (let i = 0; i < folders.length; i++) {
-    if (i % 5 === 0 || i === folders.length - 1) {
-      parentPort.postMessage({ type: 'progress', text: `Scanning projects (${i + 1}/${folders.length})\u2026` });
-    }
     const result = readFolderFromFilesystem(folders[i]);
-    if (result) results.push(result);
+    parentPort.postMessage({ type: 'folder', result, current: i + 1, total: folders.length });
   }
-  parentPort.postMessage({ ok: true, results });
+  parentPort.postMessage({ type: 'done', ok: true, total: folders.length });
 } catch (err) {
-  parentPort.postMessage({ ok: false, error: err.message });
+  parentPort.postMessage({ type: 'done', ok: false, error: err.message });
 }

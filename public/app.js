@@ -1,5 +1,7 @@
 const statusBarInfo = document.getElementById('status-bar-info');
 const statusBarActivity = document.getElementById('status-bar-activity');
+const indexingBanner = document.getElementById('indexing-banner');
+const indexingBannerText = document.getElementById('indexing-banner-text');
 const terminalsEl = document.getElementById('terminals');
 const sidebarContent = document.getElementById('sidebar-content');
 const plansContent = document.getElementById('plans-content');
@@ -1367,6 +1369,46 @@ window.api.onStatusUpdate((text, type) => {
     }, type === 'done' ? 3000 : 0);
   }
 });
+
+// --- First-run cold-start indexing banner ---
+// A large ~/.claude/projects/ (1GB+, witnessed live) can take many minutes to
+// fully index on first launch. Without this, the sidebar showed nothing but a
+// bare "Loading…" the whole time — the user force-quit twice believing the
+// app had hung. main.js/session-cache.js now stream `indexing-progress`
+// events (only emitted when the scan started with an empty cache — see
+// populateCacheViaWorker's coldStart capture), which this banner turns into
+// an explanatory message with a real dismiss button (in addition to
+// auto-hiding once indexing finishes). Warm-start rebuilds (including the
+// full re-index that already runs on every startup) never emit these, so the
+// banner never flashes outside a genuine first run.
+let indexingBannerDismissed = false;
+function updateIndexingBanner(payload) {
+  if (!payload || !payload.coldStart) return;
+  if (payload.done) {
+    if (payload.error) {
+      // A failed scan used to just hide the banner, leaving the tiny status
+      // text as the only trace of the failure. Show it where the user was
+      // already looking — even past a dismiss, since "your history didn't
+      // finish indexing" is new information, not more of the same progress.
+      indexingBannerText.textContent = formatIndexingBannerText(payload);
+      indexingBanner.style.display = '';
+      indexingBannerDismissed = false;
+      return;
+    }
+    indexingBanner.style.display = 'none';
+    indexingBannerDismissed = false; // a future cold-start run gets its own banner
+    return;
+  }
+  if (indexingBannerDismissed) return;
+  indexingBannerText.textContent = formatIndexingBannerText(payload);
+  indexingBanner.style.display = '';
+}
+function dismissIndexingBanner() {
+  indexingBanner.style.display = 'none';
+  indexingBannerDismissed = true;
+}
+window.api.onIndexingProgress(updateIndexingBanner);
+document.getElementById('indexing-banner-dismiss').addEventListener('click', dismissIndexingBanner);
 
 // Refocus the active terminal after a fullscreen transition (F11, menu, IPC).
 // The transition reflows the window and drops keyboard focus on <body>, so

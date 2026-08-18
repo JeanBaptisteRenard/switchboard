@@ -106,6 +106,7 @@ const {
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
   searchByType, isSearchIndexPopulated, searchFtsRecreated,
   getSetting, setSetting, deleteSetting,
+  isInitialScanComplete, setInitialScanComplete,
   getDailyMetrics, getDailyModelTokens, getModelUsage, getTotalCounts,
   closeDb,
   DB_PATH,
@@ -389,6 +390,7 @@ sessionCache.init({
     deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession, replaceSessionMetrics, touchCachedModified,
     deleteSearchFolder, deleteSearchSession, upsertSearchEntries,
     setFolderMeta, getFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName,
+    isInitialScanComplete, setInitialScanComplete,
   },
 });
 const { readSessionFile, readFolderFromFilesystem, refreshFolder, reconcileCacheFromFilesystem,
@@ -771,29 +773,50 @@ ipcMain.handle('rebuild-cache', async () => {
 
 ipcMain.handle('get-projects', async (_event, showArchived) => {
   try {
-    const needsPopulate = !isCachePopulated() || !isSearchIndexPopulated();
+    // "Cache has rows" is NOT enough to call the start warm: the scan worker
+    // streams one DB write per folder, so killing the app mid-scan leaves
+    // session_cache partially populated. Only the completeness marker —
+    // written when the worker's final done message arrives — proves the
+    // initial scan actually finished. Without it, a partial cache must take
+    // the cold branch below: the warm branch's reconcileCacheFromFilesystem()
+    // would find every still-missing folder stat-dirty and re-parse them all
+    // synchronously on the main thread — the original multi-minute freeze,
+    // reachable by simply relaunching after an interrupted first scan.
+    const needsPopulate = !isCachePopulated() || !isSearchIndexPopulated() || !isInitialScanComplete();
 
     if (needsPopulate) {
-      // First call after a migration that clears session_cache (e.g. v4) finds
-      // an empty cache. Returning [] immediately makes the renderer paint an
-      // empty list and rely on `notifyRendererProjectsChanged` firing later —
-      // which only triggers a reload if the user is on the Sessions tab. To
-      // avoid that race, await the scan here so the response carries the
-      // freshly-populated cache. Concurrent callers share the same Promise.
-      await populateCacheViaWorker();
+      // First call after a migration that clears session_cache (e.g. v4), or a
+      // genuine first launch, finds an empty cache. Used to `await` the full
+      // scan here so the response carried the freshly-populated cache — but on
+      // a large ~/.claude/projects/ (1GB+, witnessed live) that scan takes many
+      // minutes, and awaiting it left the renderer's very first get-projects
+      // call — and therefore the whole sidebar — blocked the entire time with
+      // nothing but a "Loading…" label (the user force-quit believing the app
+      // had hung). Kick the scan off in the background instead: it now writes
+      // each folder to the DB and pushes `projects-changed` as it completes
+      // (see populateCacheViaWorker in session-cache.js), and emits
+      // `indexing-progress` events the renderer turns into a one-time banner.
+      // This immediate response returns whatever's cached right now (empty
+      // session rows on a true first run, but buildProjectsFromCache still
+      // lists every on-disk project directory synchronously below).
+      populateCacheViaWorker();
     } else {
       // Cache already populated: pick up folders changed while the app was
       // closed, or never indexed by an older build, so sessions/worktrees don't
       // silently go missing. Stat-gated, so it's cheap when nothing has changed.
-      // Synchronous (readdir/stat sweep) — completes before buildProjectsFromCache
-      // below; no await needed despite the await in the cold-start branch above.
+      //
+      // Deliberately NOT called in the needsPopulate branch above: on a truly
+      // cold cache, cache_meta is still empty at this point (the background
+      // worker hasn't written a single folder yet), so this stat-gate would be
+      // true for every folder and reconcileCacheFromFilesystem would run a full
+      // synchronous refreshFolder() sweep -- a full JSONL parse of the entire
+      // tree, on the main thread, before this handler could return. That
+      // reintroduces the exact multi-minute blocking hang the fire-and-forget
+      // populateCacheViaWorker() call above exists to avoid (PR #124 review
+      // finding F1 -- see test/get-projects-cold-start-reconcile.test.js).
       reconcileCacheFromFilesystem();
     }
 
-    // Pick up folders changed while the app was closed, or never indexed by an
-    // older build, so sessions/worktrees don't silently go missing. Stat-gated,
-    // so it's cheap when nothing has changed.
-    reconcileCacheFromFilesystem();
     return buildProjectsFromCache(showArchived);
   } catch (err) {
     console.error('Error listing projects:', err);

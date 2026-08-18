@@ -89,6 +89,9 @@ contextBridge.exposeInMainWorld('api', {
   onStatusUpdate: (callback) => {
     ipcRenderer.on('status-update', (_event, text, type) => callback(text, type));
   },
+  onIndexingProgress: (callback) => {
+    ipcRenderer.on('indexing-progress', (_event, payload) => callback(payload));
+  },
   onFullScreenChanged: (callback) => {
     ipcRenderer.on('full-screen-changed', (_event, isFullScreen) => callback(isFullScreen));
   },

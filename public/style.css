@@ -388,6 +388,35 @@ body { display: flex; flex-direction: column; }
   display: flex;
 }
 
+/* ========== FIRST-RUN INDEXING BANNER ========== */
+/* Shown only on a genuine first launch (empty session_cache) while the
+   cold-start scan runs in the background; see app.js's updateIndexingBanner. */
+#indexing-banner {
+  margin: 0 16px 10px;
+  padding: 8px 12px;
+  background: rgba(128,136,255,0.08);
+  border: 1px solid rgba(128,136,255,0.25);
+  border-radius: 6px;
+  font-size: 12px;
+  color: #b0b4e0;
+  line-height: 1.4;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#indexing-banner-text { flex: 1; }
+#indexing-banner-dismiss {
+  background: none;
+  border: none;
+  color: #8888a8;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+#indexing-banner-dismiss:hover { color: #c0c0d8; }
+
 #search-input:focus {
   background: rgba(255,255,255,0.06);
   border-color: rgba(120,130,255,0.4);

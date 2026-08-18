@@ -4,7 +4,7 @@ const { Worker } = require('worker_threads');
 const { getFolderIndexMtimeMs } = require('./folder-index-state');
 const { deriveProjectPath } = require('./derive-project-path');
 const { readSessionFile, readSessionDisplayHeader, enumerateSessionFiles, resolveJsonlPath } = require('./read-session-file');
-const { encodeProjectPath } = require('./encode-project-path');
+const { encodeProjectPath, decodeProjectFolderBestEffort } = require('./encode-project-path');
 
 /**
  * Session cache module.
@@ -14,6 +14,7 @@ let PROJECTS_DIR, activeSessions, getMainWindow, log;
 let deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession, touchCachedModified, replaceSessionMetrics;
 let deleteSearchFolder, deleteSearchSession, upsertSearchEntries;
 let setFolderMeta, getFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName;
+let isInitialScanComplete, setInitialScanComplete;
 
 function init(ctx) {
   PROJECTS_DIR = ctx.PROJECTS_DIR;
@@ -38,6 +39,8 @@ function init(ctx) {
   getSetting = ctx.db.getSetting;
   getMeta = ctx.db.getMeta;
   setName = ctx.db.setName;
+  isInitialScanComplete = ctx.db.isInitialScanComplete;
+  setInitialScanComplete = ctx.db.setInitialScanComplete;
 }
 
 // readSessionFile is imported from read-session-file.js (shared with worker)
@@ -76,7 +79,7 @@ function refreshFolder(folder, opts = {}) {
 
   // Reuse the previously-derived projectPath when its directory still exists.
   // deriveProjectPath reads session JSONL heads, and refreshFolder runs on
-  // every watcher flush — deriving each time is wasted I/O on hot folders.
+  // every watcher flush -- deriving each time is wasted I/O on hot folders.
   // A vanished directory falls through to a fresh derive so the missing-
   // project remap detection keeps working.
   const knownMeta = getFolderMeta ? getFolderMeta(folder) : null;
@@ -90,10 +93,10 @@ function refreshFolder(folder, opts = {}) {
   }
 
   // Get what's currently cached for this folder.
-  // cachedMap: DB sessionId → { modified, filePath } so we can do mtime comparison
+  // cachedMap: DB sessionId -> { modified, filePath } so we can do mtime comparison
   // even for subagents whose DB sessionId differs from the on-disk filename.
-  // filePathToDbId: inverted index so the per-file lookup is O(1) — without it,
-  // refreshing a folder with N cached sessions costs O(N²) per flush (the watcher
+  // filePathToDbId: inverted index so the per-file lookup is O(1) -- without it,
+  // refreshing a folder with N cached sessions costs O(N^2) per flush (the watcher
   // fires frequently while live Claude sessions append JSONL, freezing the main
   // process for folders with thousands of subagents).
   const cachedSessions = getCachedByFolder(folder);
@@ -144,7 +147,7 @@ function refreshFolder(folder, opts = {}) {
   const sessionsToDelete = [];
 
   // Refresh strategy:
-  //   - NEW file (no cache row): full readSessionFile — small at first turn,
+  //   - NEW file (no cache row): full readSessionFile -- small at first turn,
   //     seeds session_cache + FTS body in one shot.
   //   - EXISTING file (already cached): header-only read (~256 KB / 500 lines).
   //     Updates display fields (summary, slug, titles, mtime) without reading
@@ -175,7 +178,7 @@ function refreshFolder(folder, opts = {}) {
     }
 
     if (cachedEntry) {
-      // EXISTING — header-only refresh.
+      // EXISTING -- header-only refresh.
       const h = readSessionDisplayHeader(filePath, { parentSessionId });
       if (h) {
         // Merge: keep cached body/messageCount/created, overlay fresh display fields.
@@ -204,7 +207,7 @@ function refreshFolder(folder, opts = {}) {
           namesToSet.push({ id: merged.sessionId, name: h.customTitle });
         }
       } else {
-        // Header read couldn't extract signal — just bump mtime so sort order
+        // Header read couldn't extract signal -- just bump mtime so sort order
         // stays current. fileMtime has to move too, otherwise this file stays
         // permanently "dirty" and gets re-read on every watcher flush.
         touchCachedModified(cachedDbId, fileMtime);
@@ -215,18 +218,18 @@ function refreshFolder(folder, opts = {}) {
       continue;
     }
 
-    // NEW file — full readSessionFile so the FTS index gets seeded.
+    // NEW file -- full readSessionFile so the FTS index gets seeded.
     const s = readSessionFile(filePath, folder, projectPath, { parentSessionId });
     if (s) {
       currentIds.add(s.sessionId);
       sessionsToUpsert.push(s);
       // Per-(date,model) metrics only exist on the full-read path. The header-only
       // refresh branch above doesn't produce dailyMetrics, so this is the sole
-      // write point for an incremental refresh — short transaction, fine to run
+      // write point for an incremental refresh -- short transaction, fine to run
       // outside the upsert batch.
       replaceSessionMetrics(s.sessionId, s.dailyMetrics);
       // Title precedence: user rename (session_meta.name) > JSONL custom-title > JSONL ai-title.
-      // Only customTitle (Claude /title) promotes to session_meta.name — AI titles must NEVER
+      // Only customTitle (Claude /title) promotes to session_meta.name -- AI titles must NEVER
       // be written there or they'd overwrite the user's UI rename on the next index pass.
       const name = getMeta(s.sessionId)?.name || s.customTitle || s.aiTitle || '';
       searchEntriesToUpsert.push({
@@ -238,7 +241,7 @@ function refreshFolder(folder, opts = {}) {
     changed = true;
   }
 
-  // Remove sessions whose .jsonl files were deleted. Skip in targeted mode —
+  // Remove sessions whose .jsonl files were deleted. Skip in targeted mode --
   // we only stat'd the dirty files, so cachedMap entries not in currentIds
   // weren't checked and may still exist on disk. Targeted-mode deletions are
   // handled by the watcher path-stat: missing files surface via statSync's
@@ -253,7 +256,7 @@ function refreshFolder(folder, opts = {}) {
     }
   } else {
     // Targeted mode still needs to delete entries for files explicitly deleted
-    // in this flush — detected by statSync failing on a path we tried to scan.
+    // in this flush -- detected by statSync failing on a path we tried to scan.
     for (const { filePath } of filesToScan) {
       const dbId = filePathToDbId.get(filePath);
       if (!dbId) continue;
@@ -290,7 +293,7 @@ function refreshFolder(folder, opts = {}) {
  * Reconcile the cache with the filesystem.
  *
  * Re-indexes only folders that are new or whose newest transcript is newer than
- * what we last indexed — a cheap, stat-only gate (getFolderIndexMtimeMs vs the
+ * what we last indexed -- a cheap, stat-only gate (getFolderIndexMtimeMs vs the
  * cached cache_meta.indexMtimeMs) when nothing changed. This is what keeps
  * sessions from silently going missing: a project folder that changed while the
  * app was closed, or that predates the build which first indexed it, is
@@ -299,14 +302,14 @@ function refreshFolder(folder, opts = {}) {
  *
  * Throttled: the renderer's loadProjects() fires get-projects twice per sidebar
  * paint (showArchived false/true via Promise.all), which would run the sweep
- * back-to-back. The second pass is idempotent but wasted work — and skipping it
+ * back-to-back. The second pass is idempotent but wasted work -- and skipping it
  * keeps a single metaMap snapshot per paint. Changes landing inside the
  * throttle window are still picked up by the live watcher.
  */
-// 5s is plenty for sidebar freshness — the live watcher picks up real-time
+// 5s is plenty for sidebar freshness -- the live watcher picks up real-time
 // changes; this guard only prevents redundant readdir sweeps triggered by
 // the double loadProjects() call per sidebar paint. Raising from 1s to 5s
-// cuts idle readdirSync churn by 5× with no user-visible staleness.
+// cuts idle readdirSync churn by 5x with no user-visible staleness.
 const RECONCILE_THROTTLE_MS = 5000;
 let lastReconcileAt = 0;
 function reconcileCacheFromFilesystem() {
@@ -342,7 +345,7 @@ function buildProjectsFromCache(showArchived) {
   // directories can resolve to the same projectPath (Claude Code's folder-name encoding
   // scheme has changed over time, leaving legacy stragglers around), so we merge them into
   // a single sidebar group to avoid duplicate-id collisions in the morphdom render.
-  // Only insert a project entry once we have a session that survives the archive filter —
+  // Only insert a project entry once we have a session that survives the archive filter --
   // otherwise folders whose sessions are all archived would appear in the sidebar as
   // undismissable phantom entries.
   const projectMap = new Map();
@@ -380,29 +383,50 @@ function buildProjectsFromCache(showArchived) {
     projectMap.get(row.projectPath).sessions.push(s);
   }
 
-  // Include empty project directories (no sessions yet). Resolve folder→projectPath
+  // Include empty project directories (no sessions yet). Resolve folder->projectPath
   // through cache_meta (populated by the indexer) instead of re-reading a JSONL off
   // disk for every directory on every render. Fall back to deriveProjectPath only
   // for folders the indexer hasn't seen yet, and backfill cache_meta so subsequent
   // renders are pure DB reads.
+  //
+  // While the INITIAL scan is still incomplete (completeness marker absent),
+  // that fallback is forbidden: cache_meta is mostly/entirely empty, so
+  // deriveProjectPath (readdir + up to 256 KB JSONL read) would run for every
+  // folder under PROJECTS_DIR — twice per sidebar paint (the renderer's
+  // showArchived false/true Promise.all) — synchronously on the main process,
+  // undermining the "return whatever's cached, zero per-folder I/O" contract
+  // of the non-blocking first launch. Use a best-effort decode of the folder
+  // name instead (display-only, corrected per folder as the scan worker fills
+  // cache_meta and fires projects-changed) and skip the fs.existsSync missing
+  // probe for the same zero-I/O reason. Nothing is written to cache_meta on
+  // this path — a lossy guess must never shadow the real derived path.
   try {
+    const scanComplete = isInitialScanComplete ? isInitialScanComplete() : true;
     const folderMeta = getAllFolderMeta();
     const dirs = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })
       .filter(d => d.isDirectory() && d.name !== '.git');
     for (const d of dirs) {
       let projectPath = folderMeta.get(d.name)?.projectPath;
+      let placeholder = false;
       if (!projectPath) {
-        projectPath = deriveProjectPath(path.join(PROJECTS_DIR, d.name), d.name);
-        if (projectPath) setFolderMeta(d.name, projectPath, 0);
+        if (scanComplete) {
+          projectPath = deriveProjectPath(path.join(PROJECTS_DIR, d.name), d.name);
+          if (projectPath) setFolderMeta(d.name, projectPath, 0);
+        } else {
+          projectPath = decodeProjectFolderBestEffort(d.name);
+          placeholder = true;
+        }
       }
       if (!projectPath) continue;
       if (hiddenProjects.has(projectPath)) continue;
       if (!projectMap.has(projectPath)) {
         projectMap.set(projectPath, {
-          folder: encodeProjectPath(projectPath),
+          // For a placeholder the on-disk name IS the ground truth — re-encoding
+          // the lossy decode could diverge from it (>200-char hashed names).
+          folder: placeholder ? d.name : encodeProjectPath(projectPath),
           projectPath,
           sessions: [],
-          missing: !fs.existsSync(projectPath),
+          missing: placeholder ? false : !fs.existsSync(projectPath),
         });
       }
     }
@@ -485,6 +509,24 @@ function sendStatus(text, type) {
   }
 }
 
+// First-run cold-start progress, consumed by the renderer's dismissible
+// indexing banner (see public/app.js). Deliberately separate from sendStatus:
+// status-update already fires unconditionally on every populateCacheViaWorker
+// run (cold start AND warm-start rebuilds AND manual rebuild-cache clicks) to
+// feed the small, always-on statusBarActivity text -- overloading that stream
+// to also drive a prominent banner would require the renderer to distinguish
+// "genuine first run" from "routine background rebuild" by string-matching a
+// human-readable message, which breaks the moment the wording changes.
+// sendIndexingProgress instead only ever fires when populateCacheViaWorker
+// captured coldStart=true at call time, so the banner's visibility is a pure
+// function of "did I receive one of these events" -- never a warm-start flash.
+function sendIndexingProgress(payload) {
+  const mw = getMainWindow();
+  if (mw && !mw.isDestroyed()) {
+    mw.webContents.send('indexing-progress', payload);
+  }
+}
+
 // --- Worker-based cache population ---
 // Returns a Promise that resolves when the in-flight scan finishes. Concurrent
 // callers share the same Promise so the first get-projects after a migration
@@ -493,7 +535,43 @@ let populatePromise = null;
 
 function populateCacheViaWorker() {
   if (populatePromise) return populatePromise;
-  sendStatus('Scanning projects\u2026', 'active');
+
+  // Captured once, up front. Keyed on the persistent completeness marker, not
+  // on isCachePopulated(): the worker streams per-folder writes, so a scan
+  // interrupted mid-run leaves session_cache non-empty — a row-count check
+  // would classify the resumed scan as warm and silently drop its banner.
+  // Marker absent covers both a genuine first launch AND the resume after an
+  // interruption; it flips true only via setInitialScanComplete() on the
+  // worker's final successful done message below.
+  const coldStart = !isInitialScanComplete();
+  sendStatus('Scanning projects…', 'active');
+
+  let scannedFolders = 0;
+  let totalFolders = 0;
+  let sessionCount = 0;
+  let indexedProjects = 0;
+
+  // ~4 events/s: one IPC message per folder is wasteful on a large tree (the
+  // comparable notifyRendererProjectsChanged is throttled too). The FIRST
+  // event (lastProgressAt still 0) and every done event always pass, so the
+  // banner appears immediately and never misses the terminal state.
+  const PROGRESS_THROTTLE_MS = 250;
+  let lastProgressAt = 0;
+
+  const reportProgress = (done, error) => {
+    if (!coldStart) return;
+    const now = Date.now();
+    if (!done && lastProgressAt !== 0 && now - lastProgressAt < PROGRESS_THROTTLE_MS) return;
+    lastProgressAt = now;
+    sendIndexingProgress({
+      coldStart: true,
+      current: scannedFolders,
+      total: totalFolders,
+      sessionsSoFar: sessionCount,
+      done,
+      ...(error ? { error } : {}),
+    });
+  };
 
   populatePromise = new Promise((resolve) => {
     let settled = false;
@@ -504,77 +582,100 @@ function populateCacheViaWorker() {
       resolve();
     };
 
-  const worker = new Worker(path.join(__dirname, 'workers', 'scan-projects.js'), {
-    workerData: { projectsDir: PROJECTS_DIR },
-  });
+    const worker = new Worker(path.join(__dirname, 'workers', 'scan-projects.js'), {
+      workerData: { projectsDir: PROJECTS_DIR },
+    });
 
-  worker.on('message', (msg) => {
-    // Progress updates from worker
-    if (msg.type === 'progress') {
-      sendStatus(msg.text, 'active');
-      return;
-    }
-
-    if (!msg.ok) {
-      console.error('Worker scan error:', msg.error);
-      sendStatus('Scan failed: ' + msg.error, 'error');
-      settle();
-      return;
-    }
-
-    sendStatus(`Indexing ${msg.results.length} projects\u2026`, 'active');
-
-    // Write results to DB on main thread (fast)
-    let sessionCount = 0;
-    for (const { folder, projectPath, sessions, indexMtimeMs } of msg.results) {
-      deleteCachedFolder(folder);
-      deleteSearchFolder(folder);
-      if (sessions.length > 0) {
-        sessionCount += sessions.length;
-        upsertCachedSessions(sessions);
-        for (const s of sessions) {
-          // Only JSONL custom-title (genuine user title) promotes to the DB name column.
-          // AI titles must not — see refreshFolder for the rationale.
-          if (s.customTitle) setName(s.sessionId, s.customTitle);
-          // Worker called readSessionFile, so dailyMetrics is present.
-          replaceSessionMetrics(s.sessionId, s.dailyMetrics);
+    worker.on('message', (msg) => {
+      // One folder finished scanning. Write it to the DB immediately instead
+      // of waiting for the rest of the tree, and push a sidebar update
+      // (notifyRendererProjectsChanged is already throttled ~1.5s) so a large
+      // history fills in progressively rather than sitting empty for minutes.
+      if (msg.type === 'folder') {
+        scannedFolders = msg.current;
+        totalFolders = msg.total;
+        const r = msg.result;
+        if (r) {
+          const { folder, projectPath, sessions, indexMtimeMs } = r;
+          deleteCachedFolder(folder);
+          deleteSearchFolder(folder);
+          if (sessions.length > 0) {
+            sessionCount += sessions.length;
+            indexedProjects++;
+            upsertCachedSessions(sessions);
+            for (const s of sessions) {
+              // Only JSONL custom-title (genuine user title) promotes to the DB name column.
+              // AI titles must not -- see refreshFolder for the rationale.
+              if (s.customTitle) setName(s.sessionId, s.customTitle);
+              // Worker called readSessionFile, so dailyMetrics is present.
+              replaceSessionMetrics(s.sessionId, s.dailyMetrics);
+            }
+            upsertSearchEntries(sessions.map(s => {
+              // Search title precedence matches the sidebar: user rename > custom-title > ai-title.
+              const name = getMeta(s.sessionId)?.name || s.customTitle || s.aiTitle || '';
+              return {
+                id: s.sessionId, type: 'session', folder: s.folder,
+                title: (name ? name + ' ' : '') + s.summary,
+                body: s.textContent,
+              };
+            }));
+          }
+          setFolderMeta(folder, projectPath, indexMtimeMs);
         }
-        upsertSearchEntries(sessions.map(s => {
-          // Search title precedence matches the sidebar: user rename > custom-title > ai-title.
-          const name = getMeta(s.sessionId)?.name || s.customTitle || s.aiTitle || '';
-          return {
-            id: s.sessionId, type: 'session', folder: s.folder,
-            title: (name ? name + ' ' : '') + s.summary,
-            body: s.textContent,
-          };
-        }));
+
+        sendStatus(`Scanning projects (${scannedFolders}/${totalFolders})…`, 'active');
+        reportProgress(false);
+        notifyRendererProjectsChanged();
+        return;
       }
-      setFolderMeta(folder, projectPath, indexMtimeMs);
-    }
 
-    sendStatus(`Indexed ${sessionCount} sessions across ${msg.results.length} projects`, 'done');
-    // Clear status after a few seconds
-    setTimeout(() => sendStatus(''), 5000);
-    notifyRendererProjectsChanged();
-    settle();
+      // msg.type === 'done'
+      if (!msg.ok) {
+        console.error('Worker scan error:', msg.error);
+        sendStatus('Scan failed: ' + msg.error, 'error');
+        reportProgress(true, msg.error);
+        settle();
+        return;
+      }
+
+      // The scan reached its final message with every folder written: persist
+      // the completeness marker. This is the ONLY place it is set (besides the
+      // one-time migration backfill for pre-marker installs) — error/exit
+      // paths must not set it, so an interrupted or failed scan leaves it
+      // absent and the next get-projects resumes the background worker
+      // instead of running the synchronous reconcile sweep on a partial
+      // cache. Resuming is safe: each folder message above is a
+      // delete-then-insert (deleteCachedFolder/deleteSearchFolder before the
+      // upserts), so re-scanning already-written folders never duplicates rows.
+      if (setInitialScanComplete) setInitialScanComplete();
+      sendStatus(`Indexed ${sessionCount} sessions across ${indexedProjects} projects`, 'done');
+      // Clear status after a few seconds
+      setTimeout(() => sendStatus(''), 5000);
+      reportProgress(true);
+      notifyRendererProjectsChanged();
+      settle();
+    });
+
+    worker.on('error', (err) => {
+      console.error('Worker error:', err);
+      sendStatus('Worker error: ' + err.message, 'error');
+      reportProgress(true, err.message);
+      settle();
+    });
+
+    // If the worker exits abnormally (SIGSEGV, OOM, uncaught exception) without
+    // sending a message, neither the 'message' nor 'error' handler will fire.
+    // Resolve here so awaiters aren't stuck forever and the next call can retry.
+    worker.on('exit', (code) => {
+      if (!settled && code !== 0) {
+        sendStatus('Scan worker exited unexpectedly', 'error');
+        reportProgress(true, 'worker exited unexpectedly');
+      }
+      settle();
+    });
   });
 
-  worker.on('error', (err) => {
-    console.error('Worker error:', err);
-    sendStatus('Worker error: ' + err.message, 'error');
-    settle();
-  });
-
-  // If the worker exits abnormally (SIGSEGV, OOM, uncaught exception) without
-  // sending a message, neither the 'message' nor 'error' handler will fire.
-  // Resolve here so awaiters aren't stuck forever and the next call can retry.
-  worker.on('exit', (code) => {
-    if (!settled && code !== 0) {
-      sendStatus('Scan worker exited unexpectedly', 'error');
-    }
-    settle();
-  });
-  });
+  return populatePromise;
 }
 
 module.exports = {
