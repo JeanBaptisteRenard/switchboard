@@ -52,8 +52,10 @@ per second, and the effect is chosen so that stepping looks intentional:
   discreteness reads as native.
 - **Busy summary text** → static light-blue tint (`#7fd4f9`), no animation.
   Replaces the animated shimmer; color alone carries the "busy" identity.
-- **Needs-attention dot** → 1Hz LED blink (`steps(1)` opacity) + a *static*
-  halo (`box-shadow`) that keeps the old ripple's visual weight for free.
+- **Needs-attention dot** → 1Hz LED blink (`steps(1)` opacity) + a fixed-size
+  halo (`box-shadow`) that keeps the old ripple's visual weight for free. The
+  halo dims together with the blink (element opacity includes the box-shadow) —
+  intentional, validated visually.
 - **Group / grid running dots** → the existing `pulse-dot` keyframes with
   `steps(4)` timing instead of `ease-in-out`.
 

@@ -940,8 +940,8 @@ body { display: flex; flex-direction: column; }
 /* ---- CLI busy spinner (braille spinner detected) ---- */
 /* needs-attention takes precedence — when both are set, the attention indicator shows */
 /* The dot becomes a braille spinner mirroring the CLI's own — a discrete content
-   animation (steps) instead of a 60fps border rotation: the rotating border cost
-   ~20% renderer / ~38% GPU of a core for 8 busy sessions (measured 2026-08-19). */
+   animation (steps) instead of a 60fps border rotation, which was one of the most
+   expensive steady-state effects in the app (measured in docs/decisions/0002). */
 .session-item.cli-busy:not(.needs-attention) .session-status-dot,
 .session-item.cli-busy:not(.needs-attention) .session-status-dot.running {
   background: transparent !important;
@@ -980,8 +980,8 @@ body { display: flex; flex-direction: column; }
 
 /* Static tint instead of the old animated shimmer: the background-position +
    background-clip:text shimmer repainted every busy summary at 60fps on the
-   renderer main thread (+45% renderer / +71% GPU for 8 sessions, measured
-   2026-08-19). A fixed color keeps the "busy" identity for free. */
+   renderer main thread — the single most expensive indicator (measured in
+   docs/decisions/0002). A fixed color keeps the "busy" identity for free. */
 .session-item.cli-busy:not(.needs-attention) .session-summary {
   color: #7fd4f9;
 }
@@ -1164,11 +1164,11 @@ body { display: flex; flex-direction: column; }
   color: rgba(79,195,247,0.6);
 }
 
-/* ---- Needs attention indicator (blinking LED + static halo) ---- */
-/* Replaces the expanding-rings ripple: two ::before/::after rings animating at
-   60fps cost +33% renderer / +44% GPU of a core for 8 sessions (measured
-   2026-08-19). A steps(1) opacity blink is 2 frames/s — visually a notification
-   LED — and the static halo keeps the ripple's visual weight. */
+/* ---- Needs attention indicator (blinking LED + halo) ---- */
+/* Replaces the expanding-rings ripple, which repainted at 60fps (cost measured
+   in docs/decisions/0002). A steps(1) opacity blink is 2 frames/s — visually a
+   notification LED — and the fixed-size halo keeps the ripple's visual weight
+   (it dims with the blink: element opacity includes the box-shadow). */
 .session-item.needs-attention .session-status-dot,
 .session-item.needs-attention .session-status-dot.running {
   background: #f0a050;
