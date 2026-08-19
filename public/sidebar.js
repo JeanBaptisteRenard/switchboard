@@ -895,6 +895,40 @@ function rebindSidebarEvents(projects) {
       };
     }
 
+    const deleteBtn = item.querySelector('.session-delete-btn');
+    if (deleteBtn) {
+      deleteBtn.onclick = async (e) => {
+        e.stopPropagation();
+        const ok = await showDeleteSessionDialog(session);
+        if (!ok) return;
+        if (activePtyIds.has(session.sessionId)) {
+          await window.api.stopSession(session.sessionId);
+          pollActiveSessions();
+        }
+        const res = await window.api.deleteSession(session.sessionId);
+        if (!res || !res.ok) {
+          // Not a modal: an alert() here is hard to dismiss and blocks the
+          // renderer. Flash the button and log the reason instead.
+          console.error('[delete-session]', (res && res.error) || 'unknown error');
+          if (typeof window.flashButtonText === 'function') {
+            window.flashButtonText(deleteBtn, 'Failed', 1500);
+          }
+          return;
+        }
+        // The sidebar re-injects transcript-less sessions from pendingSessions on
+        // every load, so forget it here or a deleted placeholder card comes back.
+        if (typeof pendingSessions !== 'undefined') pendingSessions.delete(session.sessionId);
+        if (typeof sessionMap !== 'undefined') sessionMap.delete(session.sessionId);
+        // Close the tab too — otherwise it stays open pointing at a transcript
+        // that no longer exists for the rest of this run.
+        if (typeof destroySession === 'function' && typeof openSessions !== 'undefined'
+            && openSessions.has(session.sessionId)) {
+          destroySession(session.sessionId);
+        }
+        loadProjects();
+      };
+    }
+
     const archiveBtn = item.querySelector('.session-archive-btn');
     if (archiveBtn) {
       archiveBtn.onclick = async (e) => {
@@ -1007,6 +1041,11 @@ function buildSessionItem(session) {
   jsonlBtn.title = 'View messages';
   jsonlBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z"/><path d="M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1"/></svg>';
 
+  const deleteBtn = document.createElement('button');
+  deleteBtn.className = 'session-delete-btn';
+  deleteBtn.title = 'Delete session (removes the transcript from disk)';
+  deleteBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>';
+
   const launchConfigBtn = document.createElement('button');
   launchConfigBtn.className = 'session-launch-config-btn';
   launchConfigBtn.title = 'Resume with config';
@@ -1018,6 +1057,7 @@ function buildSessionItem(session) {
     actions.appendChild(jsonlBtn);
     actions.appendChild(archiveBtn);
     actions.appendChild(launchConfigBtn);
+    actions.appendChild(deleteBtn);
   }
 
   row.appendChild(pin);
@@ -1070,6 +1110,80 @@ function startRename(summaryEl, session) {
       });
       input.replaceWith(restored);
     }
+  });
+}
+
+// --- Delete session confirmation dialog ---
+// Returns a Promise<boolean> — true if the user confirmed deletion.
+//
+// Deliberately not window.confirm: this is the only action in the app that
+// destroys history, and a native prompt blocks the whole renderer (every other
+// live terminal with it) and cannot show what is about to be lost. Same shape as
+// showDeleteWorktreeDialog below, which is the precedent for a destructive
+// confirmation that states its consequences.
+async function showDeleteSessionDialog(session) {
+  const previewPromise = window.api.deleteSessionPreview
+    ? window.api.deleteSessionPreview(session.sessionId)
+    : Promise.resolve(null);
+
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'new-session-overlay';
+
+    const dialog = document.createElement('div');
+    dialog.className = 'new-session-dialog delete-worktree-dialog';
+
+    const label = cleanDisplayName(session.name || session.aiTitle || session.summary) || session.sessionId;
+    dialog.innerHTML = `
+      <h3>Delete session "${escapeHtml(label)}"?</h3>
+      <div class="delete-worktree-warning">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;margin-top:1px"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span>The transcript is removed from disk permanently. This cannot be undone — use <strong>Archive</strong> instead to hide a session while keeping the file.</span>
+      </div>
+      <div class="delete-worktree-status" id="dss-status">
+        <span class="dwt-loading">Checking what will be removed…</span>
+      </div>
+      <div class="new-session-actions">
+        <button class="new-session-cancel-btn" id="dss-cancel">Cancel</button>
+        <button class="delete-worktree-confirm-btn" id="dss-confirm">Delete permanently</button>
+      </div>
+    `;
+
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    const statusEl = dialog.querySelector('#dss-status');
+    const projectLine = `<div class="dwt-dirty-label">Project: ${escapeHtml(session.projectPath || 'unknown')}</div>`;
+
+    previewPromise.then((p) => {
+      if (!overlay.isConnected) return;
+      if (!p || !p.ok) {
+        statusEl.innerHTML = projectLine;
+        return;
+      }
+      const parts = [];
+      parts.push(p.transcripts > 0
+        ? `${p.transcripts} file${p.transcripts !== 1 ? 's' : ''} on disk`
+        : 'no transcript on disk (this session never started)');
+      if (p.subagents > 0) parts.push(`${p.subagents} subagent transcript${p.subagents !== 1 ? 's' : ''}`);
+      if (p.running) parts.push('session is still running and will be stopped first');
+      statusEl.innerHTML = projectLine + `<pre class="dwt-dirty-list">${escapeHtml(parts.join('\n'))}</pre>`;
+    }).catch(() => {
+      if (overlay.isConnected) statusEl.innerHTML = projectLine;
+    });
+
+    function close(confirmed) {
+      overlay.remove();
+      document.removeEventListener('keydown', onKey);
+      resolve(confirmed);
+    }
+
+    dialog.querySelector('#dss-cancel').onclick = () => close(false);
+    dialog.querySelector('#dss-confirm').onclick = () => close(true);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(false); });
+
+    function onKey(e) { if (e.key === 'Escape') close(false); }
+    document.addEventListener('keydown', onKey);
   });
 }
 

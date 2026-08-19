@@ -124,6 +124,7 @@ function setupSidebarDom() {
       buildSessionItem: window.buildSessionItem,
       buildSubagentItem: window.buildSubagentItem,
       folderId: window.folderId,
+      showDeleteSessionDialog: window.showDeleteSessionDialog,
     },
     destroy() {
       window.close();

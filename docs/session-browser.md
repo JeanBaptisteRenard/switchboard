@@ -34,6 +34,16 @@ The search bar at the top searches across session content — not just titles. S
 
 To scope a search to a specific content type, use the type selector next to the search bar (Sessions, Subagents, Plans, Memory, Work Files).
 
+## Delete a session
+
+The trash button on a session card **permanently removes that session's transcript from disk**, along with any subagent transcripts belonging to it. There is no trash to recover it from, so the action asks for confirmation naming the session first.
+
+Use **archive** instead if you only want the session out of the way — archiving hides it from the sidebar but keeps the file.
+
+The confirmation dialog states what will be removed: the project, how many files are on disk, and how many subagent transcripts belong to the session. Subagent transcripts are removed with their parent, and their search/index entries with them.
+
+If the session is still running it is stopped first when Switchboard knows it is live; otherwise the deletion is refused with a reason rather than pulling a transcript out from under a running process. Anything that resolves outside `~/.claude/projects` — a symlinked transcript, for instance — is refused and logged. A session that never started has no transcript to remove, so deleting it just clears the leftover card.
+
 ## Star and archive
 
 - **Star** — right-click a session and choose Star, or use the star icon in the session header. Starred sessions appear at the top of their project group.
