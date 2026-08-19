@@ -7,3 +7,4 @@ Format: lightweight — Status, Context, Decision, Consequences. No fixed templa
 ## Index
 
 - [0001 — No full Go rewrite; Go backend sidecar only, if ever](0001-no-full-go-rewrite.md)
+- [0002 — Steady-state indicator animations must be discrete (`steps()`), never smooth 60fps](0002-discrete-steps-sidebar-animations.md)
