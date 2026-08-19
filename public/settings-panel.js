@@ -77,6 +77,7 @@
     const rightClickValue = fieldValue('terminalRightClick', 'menu');
     const restoreStartupValue = fieldValue('restoreOnStartup', 'ask');
     const mcpEmulationValue = fieldValue('mcpEmulation', true);
+    const autoUpdateValue = fieldValue('autoUpdate', true);
     const shellProfileValue = fieldValue('shellProfile', 'auto');
 
     // Working copy of the (global-only) re-bindable keyboard shortcuts.
@@ -305,6 +306,15 @@
         <div class="settings-section-title">Updates</div>
         <div class="settings-field">
           <div class="settings-field-info">
+            <span class="settings-label">Automatic Updates</span>
+            <div class="settings-description">Download updates in the background and install them when Switchboard quits. Turn off to keep the installed binary exactly as it is \u2014 "Check for Updates" below still works on demand. Takes effect on next launch.</div>
+          </div>
+          <div class="settings-field-control">
+            <label class="settings-toggle"><input type="checkbox" id="sv-auto-update" ${autoUpdateValue ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
+          </div>
+        </div>
+        <div class="settings-field">
+          <div class="settings-field-info">
             <span class="settings-label">Version</span>
             <div class="settings-description"><span id="sv-current-version"></span> <span id="sv-update-status"></span></div>
           </div>
@@ -424,6 +434,7 @@
         settings.terminalRightClick = settingsViewerBody.querySelector('#sv-right-click').value || 'menu';
         settings.restoreOnStartup = settingsViewerBody.querySelector('#sv-restore-startup').value || 'ask';
         settings.mcpEmulation = settingsViewerBody.querySelector('#sv-mcp-emulation').checked;
+        settings.autoUpdate = settingsViewerBody.querySelector('#sv-auto-update').checked;
         settings.shellProfile = settingsViewerBody.querySelector('#sv-shell-profile').value || 'auto';
         settings.shortcuts = scShortcuts;
       }

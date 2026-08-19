@@ -87,7 +87,19 @@ if (app.isPackaged || process.env.FORCE_UPDATER) {
     }
   }
   autoUpdater.on('checking-for-update', () => sendUpdaterEvent('checking'));
-  autoUpdater.on('update-available', (info) => sendUpdaterEvent('update-available', info));
+  autoUpdater.on('update-available', (info) => {
+    sendUpdaterEvent('update-available', info);
+    // With Automatic Updates off there are no scheduled checks, so this event
+    // can only come from the user pressing "Check for Updates". electron-updater
+    // does not fetch in that case — AppUpdater's downloadPromise is null unless
+    // autoDownload — and nothing else calls downloadUpdate(), so a deliberate
+    // check would otherwise stall at "found, never downloaded". Install still
+    // waits for the user, since autoInstallOnAppQuit is off too.
+    if (!autoUpdater.autoDownload) {
+      autoUpdater.downloadUpdate().catch(err =>
+        log.error('[updater] manual download failed:', err?.message || String(err)));
+    }
+  });
   autoUpdater.on('update-not-available', (info) => sendUpdaterEvent('update-not-available', info));
   autoUpdater.on('download-progress', (progress) => sendUpdaterEvent('download-progress', progress));
   autoUpdater.on('update-downloaded', (info) => sendUpdaterEvent('update-downloaded', info));
@@ -1404,6 +1416,10 @@ const SETTING_DEFAULTS = {
   sidebarWidth: 340,
   terminalTheme: 'switchboard',
   mcpEmulation: false,
+  // Automatic update download + install-on-quit. On by default so behaviour is
+  // unchanged; off means the app never fetches or swaps its own binary without
+  // being asked. The manual "Check for Updates" button still works either way.
+  autoUpdate: true,
   shellProfile: 'auto',
 };
 
@@ -2481,9 +2497,20 @@ if (!gotSingleInstanceLock) {
 
     // Check for updates after launch
     if (autoUpdater) {
-      setTimeout(() => autoUpdater.checkForUpdates().catch(e => log.error('[updater] check failed:', e?.message || String(e))), 5000);
-      // Re-check every 4 hours for long-running sessions
-      setInterval(() => autoUpdater.checkForUpdates().catch(e => log.error('[updater] check failed:', e?.message || String(e))), 4 * 60 * 60 * 1000);
+      // Read the setting here rather than at the updater's construction: that
+      // block runs before db.js is required, so getSetting isn't available yet.
+      // Nothing checks for updates before this point, so overriding the flags
+      // now is early enough.
+      const autoUpdate = (getSetting('global') || {}).autoUpdate !== false;
+      autoUpdater.autoDownload = autoUpdate;
+      autoUpdater.autoInstallOnAppQuit = autoUpdate;
+      if (!autoUpdate) {
+        log.info('[updater] automatic updates disabled by setting — not checking');
+      } else {
+        setTimeout(() => autoUpdater.checkForUpdates().catch(e => log.error('[updater] check failed:', e?.message || String(e))), 5000);
+        // Re-check every 4 hours for long-running sessions
+        setInterval(() => autoUpdater.checkForUpdates().catch(e => log.error('[updater] check failed:', e?.message || String(e))), 4 * 60 * 60 * 1000);
+      }
     }
 
     app.on('activate', () => {
