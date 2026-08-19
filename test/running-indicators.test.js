@@ -1,9 +1,19 @@
 // Tests for Q9: updateRunningIndicators() pty-set gating.
 //
-// app.js cannot be loaded in jsdom (line 198 calls window.api.onTerminalData at
-// module scope, which fires before our stubs are in place). Instead we test the
-// gating logic in isolation: build a minimal DOM, replicate the function from
-// public/app.js, and assert that:
+// app.js cannot be eval-ed in jsdom: module scope constructs real classes
+// (`new ViewerPanel(...)`, line 25) and wires xterm/WebGL terminal setup
+// across ~1500 LOC of renderer glue, none of which jsdom can stand in for
+// without effectively re-building the whole public/ dependency chain
+// (verified directly: eval-ing the real file throws `ViewerPanel is not
+// defined` before it even reaches the code under test here).
+//
+// `makeIndicatorFn` below is therefore a HAND-MAINTAINED MIRROR of
+// `updateRunningIndicators()`, not the shipped function — it tests the
+// gating *logic* in isolation, not app.js's actual behavior. Keep it in sync
+// by hand on every edit to the real function; a source-level test at the
+// bottom of this file (`public/app.js: ...guard is still present`) catches
+// the one regression that matters most (the guard being silently dropped
+// from the shipped file) without needing a full eval.
 //
 //   a) When activePtyIds is unchanged between calls, the two sidebar
 //      querySelectorAll scans are skipped entirely.
@@ -14,6 +24,8 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { JSDOM } = require('jsdom');
 
 // ---------------------------------------------------------------------------
@@ -52,6 +64,10 @@ function makeIndicatorFn(doc, state) {
 
     if (ptySetChanged) {
       doc.querySelectorAll('.session-item').forEach(item => {
+        // Subagents never own a PTY — their .running state is tracked
+        // separately via activeSubagentsByParent (sidebar.js), driven by the
+        // subagent-spawned/completed IPC pair, not activePtyIds (issue #129).
+        if (item.dataset.subagent) return;
         const id = item.dataset.sessionId;
         const running = state.activePtyIds.has(id);
         item.classList.toggle('has-running-pty', running);
@@ -243,6 +259,51 @@ test('updateRunningIndicators: gridCards loop runs on every call, not gated by p
   window.close();
 });
 
+test('makeIndicatorFn replica: subagent items (dataset.subagent) are untouched by the pty-set scan (issue #129)', () => {
+  // Documents the intended behavior of the hand-maintained replica above —
+  // this does NOT exercise public/app.js's real updateRunningIndicators (see
+  // file header: app.js can't be eval-ed in jsdom). Disabling the replica's
+  // own guard (line ~58) turns this red; disabling the *real* guard in
+  // public/app.js does not touch this test at all — that gap is covered
+  // separately by the source-level test at the bottom of this file.
+  //
+  // Without the guard, this scan runs `activePtyIds.has(id)` for the
+  // subagent's own sessionId — always false, since subagents never own a
+  // PTY — and would immediately clear the .running class + dot that
+  // sidebar.js's subagent-spawned listener just set.
+  const dom = buildDom();
+  const { window } = dom;
+  const { document } = window;
+
+  const sidebarContent = document.getElementById('sidebar-content');
+  const subagentItem = document.createElement('div');
+  subagentItem.className = 'session-item running';
+  subagentItem.dataset.sessionId = 'sub:s-top-1:agent-1';
+  subagentItem.dataset.subagent = '1';
+  subagentItem.innerHTML = '<div class="session-status-dot running"></div>';
+  sidebarContent.appendChild(subagentItem);
+
+  const state = {
+    activePtyIds: new Set(['s1']),
+    attentionSessions: new Set(),
+    responseReadySessions: new Set(),
+    sessionBusyState: new Map(),
+    gridCards: new Map(),
+  };
+  const update = makeIndicatorFn(document, state);
+  update(); // primes lastPtySignature
+
+  // Change the pty-set (unrelated to the subagent) so the sidebar scan runs again.
+  state.activePtyIds = new Set(['s2']);
+  update();
+
+  assert.ok(subagentItem.classList.contains('running'), 'subagent item keeps .running across an unrelated pty-set change');
+  assert.ok(subagentItem.querySelector('.session-status-dot').classList.contains('running'), 'subagent dot keeps .running');
+  assert.ok(!subagentItem.classList.contains('has-running-pty'), 'subagent item never gets has-running-pty (no PTY, guard short-circuits before that toggle)');
+
+  window.close();
+});
+
 test('updateRunningIndicators: empty pty-set — all sessions marked stopped', () => {
   const dom = buildDom();
   const { window } = dom;
@@ -267,4 +328,32 @@ test('updateRunningIndicators: empty pty-set — all sessions marked stopped', (
   }
 
   window.close();
+});
+
+// ---------------------------------------------------------------------------
+// Source-level pin for the REAL public/app.js (not the replica above).
+//
+// The replica tests above cannot detect a real-file regression: app.js can't
+// be eval-ed in jsdom (see file header), so nothing here actually calls the
+// shipped updateRunningIndicators. This test reads public/app.js's own
+// source and asserts the subagent guard is still the first statement inside
+// the `.session-item` forEach — the exact line whose removal would let the
+// periodic pty-set poll wipe a subagent's .running indicator (issue #129).
+// Removing that line from public/app.js turns this test red on its own,
+// independent of the replica staying in sync.
+// ---------------------------------------------------------------------------
+
+test('public/app.js: updateRunningIndicators still guards subagent items before touching activePtyIds', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const scanStart = src.indexOf("document.querySelectorAll('.session-item').forEach(item => {");
+  assert.notEqual(scanStart, -1, 'the .session-item pty-set scan must still exist in public/app.js');
+
+  // The guard must appear before the forEach body reads item.dataset.sessionId
+  // — i.e. before any activePtyIds lookup for this item.
+  const body = src.slice(scanStart, scanStart + 800);
+  const guardIdx = body.search(/if\s*\(\s*item\.dataset\.subagent\s*\)\s*return;/);
+  const sessionIdIdx = body.indexOf('item.dataset.sessionId');
+
+  assert.notEqual(guardIdx, -1, 'public/app.js must still contain `if (item.dataset.subagent) return;` in the pty-set scan');
+  assert.ok(guardIdx < sessionIdIdx, 'the subagent guard must run before the item is treated as a PTY-backed session');
 });

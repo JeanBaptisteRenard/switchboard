@@ -1715,6 +1715,19 @@ body { display: flex; flex-direction: column; }
   transform: rotate(90deg);
 }
 
+/* Static color, no animation — see docs/decisions/0002 */
+.caret-running-dot {
+  display: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #3ecf5a;
+  flex-shrink: 0;
+}
+.sidebar-children-caret.has-running-child:not(.expanded) .caret-running-dot {
+  display: inline-block;
+}
+
 /* Container for the child subagent items */
 .sidebar-subagents-container {
   /* display toggled via JS */
