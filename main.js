@@ -87,7 +87,19 @@ if (app.isPackaged || process.env.FORCE_UPDATER) {
     }
   }
   autoUpdater.on('checking-for-update', () => sendUpdaterEvent('checking'));
-  autoUpdater.on('update-available', (info) => sendUpdaterEvent('update-available', info));
+  autoUpdater.on('update-available', (info) => {
+    sendUpdaterEvent('update-available', info);
+    // With Automatic Updates off there are no scheduled checks, so this event
+    // can only come from the user pressing "Check for Updates". electron-updater
+    // does not fetch in that case — AppUpdater's downloadPromise is null unless
+    // autoDownload — and nothing else calls downloadUpdate(), so a deliberate
+    // check would otherwise stall at "found, never downloaded". Install still
+    // waits for the user, since autoInstallOnAppQuit is off too.
+    if (!autoUpdater.autoDownload) {
+      autoUpdater.downloadUpdate().catch(err =>
+        log.error('[updater] manual download failed:', err?.message || String(err)));
+    }
+  });
   autoUpdater.on('update-not-available', (info) => sendUpdaterEvent('update-not-available', info));
   autoUpdater.on('download-progress', (progress) => sendUpdaterEvent('download-progress', progress));
   autoUpdater.on('update-downloaded', (info) => sendUpdaterEvent('update-downloaded', info));
