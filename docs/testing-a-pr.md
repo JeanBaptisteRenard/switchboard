@@ -206,6 +206,63 @@ subprocesses complicate naming:
   the GPU process has `VizCompositorTh`. Use that to distinguish AppImage
   subprocesses from test-instance subprocesses when both are running.
 
+## Measuring CPU and driving the UI
+
+How the perf numbers in
+[decisions/0002](decisions/0002-discrete-steps-sidebar-animations.md) were
+produced, against an isolated instance launched per this doc. The short
+version:
+
+1. Measure CPU with **`/proc` stat deltas** over a fixed window — never
+   `ps`/`top` `%CPU` (averaged since process start, useless for before/after).
+2. Simulate UI states over **CDP** (`--remote-debugging-port`) instead of
+   trying to produce real sessions in the right state.
+3. **Re-verify the simulated state after every measurement window** — sidebar
+   re-renders silently wipe DOM marks (details below).
+
+### CPU: /proc stat deltas
+
+Sample utime+stime (fields 14+15 of `/proc/<pid>/stat`, 100 ticks =
+1 core·second) around a sleep:
+
+```bash
+read_ticks() { awk '{print $14+$15}' /proc/$1/stat; }
+S=$(read_ticks $PID); sleep 30; E=$(read_ticks $PID)
+echo "scale=1; ($E - $S) / 30" | bc   # % of one core over the window
+```
+
+Identify the renderer and GPU PIDs via the thread-name trick above. For a
+per-thread breakdown, do the same over `/proc/<pid>/task/*/stat`: the
+renderer main thread carries JS + style + layout + paint; the `Compositor`
+thread is the cc impl thread.
+
+### Driving the UI: Chrome DevTools Protocol
+
+Launch the isolated instance with `--remote-debugging-port=9223` appended.
+`http://localhost:9223/json` lists targets; the `ws` package already in
+`node_modules` is enough for a ~30-line evaluator calling `Runtime.evaluate`
+over the target's websocket. From there, mark sidebar items with state
+classes or inject `<style>` variants for A/B comparisons.
+
+### Pitfalls (all hit live, 2026-08-19)
+
+- **Sidebar re-renders wipe DOM edits within seconds.** The watcher sees the
+  real `~/.claude/projects` (data-dir isolation does not isolate it), so live
+  sessions elsewhere keep triggering re-renders, and classes added to
+  `.session-item` nodes silently vanish — the measurement window quietly
+  degrades to baseline. Verify the marked state after every window. Wipe-proof
+  alternatives: a `<style>` in `<head>` targeting stable per-item ids
+  (`#si-<sessionId>`), a `position:fixed` overlay for visual demos, or a
+  `setInterval` re-applying real state classes when the shipped selectors
+  themselves are under test.
+- **A user interacting with the instance mid-window invalidates it.** Opening
+  a session spawns a real `claude --resume` whose output dwarfs the effect
+  being measured. Re-measure; don't average over the contamination.
+- **Every smooth 60fps animation pays a compositing floor** (~27% of a GPU
+  core on the reference machine — full-window composite per frame). Establish
+  a no-animation baseline first, or every comparison is against a moving
+  floor.
+
 ## Cleaning up
 
 ```bash
