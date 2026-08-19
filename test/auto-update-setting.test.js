@@ -54,11 +54,27 @@ test('the manual Check for Updates path is left working when auto-update is off'
   assert.doesNotMatch(check, /autoUpdate/, 'a deliberate check must not consult the automation setting');
 });
 
+test('a manual check can still complete while automation is off', () => {
+  const src = main();
+  // electron-updater only fetches when autoDownload is true (AppUpdater's
+  // downloadPromise is null otherwise), and nothing in public/*.js calls the
+  // updater-download IPC — it has no call sites. So without this, pressing
+  // "Check for Updates" with the toggle off would report an update and then
+  // stall, contradicting what the setting promises.
+  const i = src.indexOf("autoUpdater.on('update-available'");
+  assert.ok(i !== -1);
+  const handler = src.slice(i, src.indexOf('});', i));
+  assert.match(handler, /if \(!autoUpdater\.autoDownload\)/,
+    'the fetch must be kicked precisely when automation is off');
+  assert.match(handler, /downloadUpdate\(\)/, 'and it must actually download');
+  assert.match(handler, /\.catch\(/, 'a failed download must not surface as an unhandled rejection');
+});
+
 test('the toggle is rendered in Global settings only and is persisted', () => {
   const panel = fs.readFileSync(path.join(ROOT, 'public', 'settings-panel.js'), 'utf8');
   assert.match(panel, /const autoUpdateValue = fieldValue\('autoUpdate', true\)/);
   assert.match(panel, /id="sv-auto-update"/, 'the toggle must exist');
-  assert.match(panel, /settings\.autoUpdate = autoUpdateEl\.checked/, 'it must be saved');
+  assert.match(panel, /settings\.autoUpdate = settingsViewerBody\.querySelector\('#sv-auto-update'\)\.checked/, 'it must be saved');
 
   // It lives in the Updates section, which is inside a `!isProject` block —
   // updating the binary is not a per-project concern.

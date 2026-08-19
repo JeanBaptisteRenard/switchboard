@@ -434,8 +434,7 @@
         settings.terminalRightClick = settingsViewerBody.querySelector('#sv-right-click').value || 'menu';
         settings.restoreOnStartup = settingsViewerBody.querySelector('#sv-restore-startup').value || 'ask';
         settings.mcpEmulation = settingsViewerBody.querySelector('#sv-mcp-emulation').checked;
-        const autoUpdateEl = settingsViewerBody.querySelector('#sv-auto-update');
-        if (autoUpdateEl) settings.autoUpdate = autoUpdateEl.checked;
+        settings.autoUpdate = settingsViewerBody.querySelector('#sv-auto-update').checked;
         settings.shellProfile = settingsViewerBody.querySelector('#sv-shell-profile').value || 'auto';
         settings.shortcuts = scShortcuts;
       }
