@@ -1749,11 +1749,10 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   log.info(`[shell] profile=${shellProfile.id} shell=${shell} args=${JSON.stringify(shellExtraArgs)}`);
 
   let knownJsonlFiles = new Set();
-  let sessionSlug = null;
   let projectFolder = null;
 
   if (!isPlainTerminal) {
-    // Snapshot existing .jsonl files before spawning (for new session + fork/plan detection)
+    // Snapshot existing .jsonl files before spawning (for new session + fork detection)
     projectFolder = encodeProjectPath(spawnCwd);
     const claudeProjectDir = path.join(PROJECTS_DIR, projectFolder);
     if (fs.existsSync(claudeProjectDir)) {
@@ -1761,19 +1760,6 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         knownJsonlFiles = new Set(
           fs.readdirSync(claudeProjectDir).filter(f => f.endsWith('.jsonl'))
         );
-      } catch {}
-    }
-
-    // Read slug from the session's jsonl file (for plan-accept detection)
-    if (!isNew) {
-      try {
-        const jsonlPath = path.join(claudeProjectDir, sessionId + '.jsonl');
-        const head = fs.readFileSync(jsonlPath, 'utf8').slice(0, 8000);
-        const firstLines = head.split('\n').filter(Boolean);
-        for (const line of firstLines) {
-          const entry = JSON.parse(line);
-          if (entry.slug) { sessionSlug = entry.slug; break; }
-        }
       } catch {}
     }
   }
@@ -1955,7 +1941,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     pty: ptyProcess, rendererAttached: true, exited: false,
     outputBuffer: [], outputBufferSize: 0, altScreen: false,
     projectPath, firstResize: true,
-    projectFolder, knownJsonlFiles, sessionSlug,
+    projectFolder, knownJsonlFiles,
     isPlainTerminal, forkFrom: sessionOptions?.forkFrom || null,
     // Recorded so a reattach can report it too — the renderer badges sandboxed
     // sessions, and a reattached session is still inside the same sandbox.
@@ -2060,9 +2046,9 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     const realId = session.realSessionId || sessionId;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('process-exited', realId, exitCode);
-      // If a fork/plan-accept transition re-keyed this session under realId
-      // but the PTY exited before transition detection ran, also notify the
-      // renderer for the original sessionId so it doesn't stay stuck as "Running".
+      // If a fork transition re-keyed this session under realId but the PTY
+      // exited before transition detection ran, also notify the renderer for
+      // the original sessionId so it doesn't stay stuck as "Running".
       if (realId !== sessionId && activeSessions.has(sessionId)) {
         mainWindow.webContents.send('process-exited', sessionId, exitCode);
       }

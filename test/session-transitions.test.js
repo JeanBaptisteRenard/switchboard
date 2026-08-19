@@ -299,3 +299,99 @@ test('concurrent monitoring: detectSubagentTransitions for 2 distinct sessions e
     cleanup(tmp);
   }
 });
+
+/** Init the module with a capturing log and a caller-owned activeSessions map. */
+function setupForkDetection(projectsDir) {
+  const win = makeMockWindow();
+  const activeSessions = new Map();
+  const logLines = [];
+  const capture = (...args) => logLines.push(args.join(' '));
+  init({
+    PROJECTS_DIR: projectsDir,
+    activeSessions,
+    getMainWindow: () => win,
+    log: { info: capture, debug: capture, warn: capture, error: capture },
+    rekeyMcpServer: () => {},
+  });
+  return { events: win._events, activeSessions, logLines };
+}
+
+function makePtySession(folder, overrides = {}) {
+  return {
+    exited: false, isPlainTerminal: false, projectFolder: folder,
+    knownJsonlFiles: new Set(), forkFrom: null, realSessionId: null,
+    ...overrides,
+  };
+}
+
+test('fork detection: new jsonl with matching forkedFrom re-keys the session and notifies the renderer', () => {
+  const tmp = mkTmp();
+  try {
+    const folder = 'proj';
+    fs.mkdirSync(path.join(tmp, folder), { recursive: true });
+    const { events, activeSessions } = setupForkDetection(tmp);
+    activeSessions.set('old-id', makePtySession(folder));
+
+    fs.writeFileSync(
+      path.join(tmp, folder, 'new-id.jsonl'),
+      JSON.stringify({ forkedFrom: { sessionId: 'old-id' }, type: 'user' }) + '\n',
+      'utf8'
+    );
+    sessionTransitions.detectSessionTransitions(folder);
+
+    assert.ok(!activeSessions.has('old-id'), 'old key removed after re-key');
+    const session = activeSessions.get('new-id');
+    assert.ok(session, 'session re-keyed under the new jsonl id');
+    assert.equal(session.realSessionId, 'new-id');
+    assert.ok(session.knownJsonlFiles.has('new-id.jsonl'), 'known files updated to current set');
+    const forked = events.find(e => e.channel === 'session-forked');
+    assert.equal(forked.payload, 'old-id', 'renderer notified with the original id');
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('fork detection: forkFrom session logs NO MATCH for an unrelated new jsonl and is not re-keyed', () => {
+  const tmp = mkTmp();
+  try {
+    const folder = 'proj';
+    fs.mkdirSync(path.join(tmp, folder), { recursive: true });
+    const { activeSessions, logLines } = setupForkDetection(tmp);
+    activeSessions.set('pty-id', makePtySession(folder, { forkFrom: 'source-id' }));
+
+    fs.writeFileSync(
+      path.join(tmp, folder, 'other.jsonl'),
+      JSON.stringify({ sessionId: 'unrelated', type: 'user' }) + '\n',
+      'utf8'
+    );
+    sessionTransitions.detectSessionTransitions(folder);
+
+    assert.ok(activeSessions.has('pty-id'), 'session keeps its original key');
+    assert.equal(activeSessions.get('pty-id').realSessionId, null);
+    assert.ok(logLines.some(l => l.includes('NO MATCH')), 'the no-match path was taken and logged');
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('fork detection: an unreadable .jsonl entry is treated as signal-less and rechecked next cycle', () => {
+  const tmp = mkTmp();
+  try {
+    const folder = 'proj';
+    fs.mkdirSync(path.join(tmp, folder), { recursive: true });
+    const { activeSessions } = setupForkDetection(tmp);
+    activeSessions.set('pty-id', makePtySession(folder));
+
+    // A directory named *.jsonl makes readNewSessionSignals hit its catch path
+    fs.mkdirSync(path.join(tmp, folder, 'weird.jsonl'));
+    sessionTransitions.detectSessionTransitions(folder);
+
+    assert.ok(activeSessions.has('pty-id'), 'session untouched');
+    assert.ok(
+      !activeSessions.get('pty-id').knownJsonlFiles.has('weird.jsonl'),
+      'signal-less file excluded from known set so it is rechecked next cycle'
+    );
+  } finally {
+    cleanup(tmp);
+  }
+});
