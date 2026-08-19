@@ -808,7 +808,9 @@ body { display: flex; flex-direction: column; }
   display: inline-block;
   background: #3ecf5a;
   box-shadow: 0 0 6px rgba(62,207,90,0.5);
-  animation: pulse-dot 2s ease-in-out infinite;
+  /* steps() keeps continuous sidebar animations off the 60fps compositing path —
+     a smooth infinite animation forces a full-window composite every frame */
+  animation: pulse-dot 2s steps(4) infinite;
 }
 .slug-group-count {
   font-size: 10px;
@@ -935,38 +937,53 @@ body { display: flex; flex-direction: column; }
   background: #3ecf5a;
 }
 
-@keyframes pulse-dot {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
-
 /* ---- CLI busy spinner (braille spinner detected) ---- */
-/* needs-attention takes precedence — when both are set, attention ripple shows */
+/* needs-attention takes precedence — when both are set, the attention indicator shows */
+/* The dot becomes a braille spinner mirroring the CLI's own — a discrete content
+   animation (steps) instead of a 60fps border rotation: the rotating border cost
+   ~20% renderer / ~38% GPU of a core for 8 busy sessions (measured 2026-08-19). */
 .session-item.cli-busy:not(.needs-attention) .session-status-dot,
 .session-item.cli-busy:not(.needs-attention) .session-status-dot.running {
   background: transparent !important;
-  border: 1.5px solid #4fc3f7;
-  border-top-color: transparent;
-  animation: spin-dot 0.8s linear infinite !important;
+  animation: none !important;
   box-shadow: none !important;
+  position: relative;
+}
+
+.session-item.cli-busy:not(.needs-attention) .session-status-dot::before {
+  content: "\280B";
+  animation: braille-spin 0.8s steps(1) infinite;
+  color: #4fc3f7;
+  font-size: 11px;
+  line-height: 6px;
+  position: absolute;
+  left: -2px;
+  top: 0;
+}
+
+@keyframes braille-spin {
+  0%  { content: "\280B"; }
+  10% { content: "\2819"; }
+  20% { content: "\2839"; }
+  30% { content: "\2838"; }
+  40% { content: "\283C"; }
+  50% { content: "\2834"; }
+  60% { content: "\2826"; }
+  70% { content: "\2827"; }
+  80% { content: "\2807"; }
+  90% { content: "\280F"; }
 }
 
 @keyframes spin-dot {
   to { transform: rotate(360deg); }
 }
 
+/* Static tint instead of the old animated shimmer: the background-position +
+   background-clip:text shimmer repainted every busy summary at 60fps on the
+   renderer main thread (+45% renderer / +71% GPU for 8 sessions, measured
+   2026-08-19). A fixed color keeps the "busy" identity for free. */
 .session-item.cli-busy:not(.needs-attention) .session-summary {
-  background: linear-gradient(110deg, #f0f0ff 44%, #4fc3f7 48%, #ffffff 50%, #4fc3f7 52%, #f0f0ff 56%);
-  background-size: 300% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: shimmer-text 3s linear infinite;
-}
-
-@keyframes shimmer-text {
-  0% { background-position: 200% 0; }
-  100% { background-position: -100% 0; }
+  color: #7fd4f9;
 }
 
 /* ---- Session info ---- */
@@ -1147,32 +1164,22 @@ body { display: flex; flex-direction: column; }
   color: rgba(79,195,247,0.6);
 }
 
-/* ---- Needs attention indicator (ripple) ---- */
+/* ---- Needs attention indicator (blinking LED + static halo) ---- */
+/* Replaces the expanding-rings ripple: two ::before/::after rings animating at
+   60fps cost +33% renderer / +44% GPU of a core for 8 sessions (measured
+   2026-08-19). A steps(1) opacity blink is 2 frames/s — visually a notification
+   LED — and the static halo keeps the ripple's visual weight. */
 .session-item.needs-attention .session-status-dot,
 .session-item.needs-attention .session-status-dot.running {
   background: #f0a050;
-  box-shadow: none;
-  animation: none;
+  box-shadow: 0 0 0 3px rgba(240,160,80,0.25);
+  animation: led-blink 1s steps(1) infinite;
   position: relative;
 }
 
-.session-item.needs-attention .session-status-dot::before,
-.session-item.needs-attention .session-status-dot::after {
-  content: '';
-  position: absolute;
-  inset: -2px;
-  border-radius: 50%;
-  border: 1.5px solid rgba(240,160,80,0.7);
-  animation: ripple-out 2s ease-out infinite;
-}
-
-.session-item.needs-attention .session-status-dot::after {
-  animation-delay: 1s;
-}
-
-@keyframes ripple-out {
-  0%   { transform: scale(1); opacity: 0.7; }
-  100% { transform: scale(3.5); opacity: 0; }
+@keyframes led-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0.3; }
 }
 
 .session-item.needs-attention .session-summary {
@@ -1562,7 +1569,8 @@ body { display: flex; flex-direction: column; }
 
 .grid-card-dot.busy {
   background: #3ecf5a;
-  animation: pulse-dot 1.5s ease-in-out infinite;
+  /* steps() — see .slug-group-dot.running */
+  animation: pulse-dot 1.5s steps(4) infinite;
 }
 
 @keyframes pulse-dot {
