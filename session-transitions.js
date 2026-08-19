@@ -3,7 +3,7 @@ const fs = require('fs');
 const { readSubagentMeta } = require('./read-session-file');
 
 /**
- * Fork / plan-accept detection for active PTY sessions.
+ * Fork detection for active PTY sessions.
  * Call init(ctx) once with shared context.
  */
 let PROJECTS_DIR, activeSessions, getMainWindow, log, rekeyMcpServer;
@@ -175,7 +175,7 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
   }
 }
 
-// --- Fork / plan-accept detection ---
+// --- Fork detection ---
 
 /** Read first few lines of a new .jsonl to extract signals.
  *  Skips file-history-snapshot lines which can be very large (tens of KB)
@@ -189,7 +189,6 @@ function readNewSessionSignals(filePath) {
     const head = buf.toString('utf8', 0, bytesRead);
     const lines = head.split('\n').filter(Boolean);
     let forkedFrom = null;
-    let planContent = false;
     let slug = null;
     let parentSessionId = null;
     let hasSnapshots = false;
@@ -198,45 +197,19 @@ function readNewSessionSignals(filePath) {
       // Skip snapshot lines — they carry no fork/session signals
       if (entry.type === 'file-history-snapshot') { hasSnapshots = true; continue; }
       if (entry.forkedFrom) forkedFrom = entry.forkedFrom.sessionId;
-      if (entry.planContent) planContent = true;
       if (entry.slug && !slug) slug = entry.slug;
       // --fork-session copies messages with original sessionId
       if (entry.sessionId && !parentSessionId) parentSessionId = entry.sessionId;
       // Stop after finding a user or assistant message
       if (entry.type === 'user' || entry.type === 'assistant') break;
     }
-    return { forkedFrom, planContent, slug, parentSessionId, hasSnapshots };
+    return { forkedFrom, slug, parentSessionId, hasSnapshots };
   } catch {
-    return { forkedFrom: null, planContent: false, slug: null, parentSessionId: null, hasSnapshots: false };
+    return { forkedFrom: null, slug: null, parentSessionId: null, hasSnapshots: false };
   }
 }
 
-/** Read tail of old session file for ExitPlanMode and slug */
-function readOldSessionTail(filePath) {
-  try {
-    const stat = fs.statSync(filePath);
-    const size = stat.size;
-    const readSize = Math.min(size, 8192);
-    const buf = Buffer.alloc(readSize);
-    const fd = fs.openSync(filePath, 'r');
-    fs.readSync(fd, buf, 0, readSize, size - readSize);
-    fs.closeSync(fd);
-    const tail = buf.toString('utf8');
-    const hasExitPlanMode = tail.includes('ExitPlanMode');
-    // Extract slug from tail (last occurrence)
-    let slug = null;
-    const slugMatches = tail.match(/"slug"\s*:\s*"([^"]+)"/g);
-    if (slugMatches) {
-      const last = slugMatches[slugMatches.length - 1].match(/"slug"\s*:\s*"([^"]+)"/);
-      if (last) slug = last[1];
-    }
-    return { hasExitPlanMode, slug };
-  } catch {
-    return { hasExitPlanMode: false, slug: null };
-  }
-}
-
-/** Detect fork or plan-accept transitions for active PTY sessions in a folder */
+/** Detect fork transitions for active PTY sessions in a folder */
 function detectSessionTransitions(folder) {
   const folderPath = path.join(PROJECTS_DIR, folder);
   let currentFiles;
@@ -273,7 +246,7 @@ function detectSessionTransitions(folder) {
 
       // File exists but has no parseable content yet — skip and retry next cycle
       // But if the file's mtime is older than 1 hour, treat it as stale and archive it
-      if (!signals.forkedFrom && !signals.parentSessionId && !signals.slug && !signals.planContent) {
+      if (!signals.forkedFrom && !signals.parentSessionId && !signals.slug) {
         // Fork file with only snapshots (no user turn yet) — match immediately
         if (signals.hasSnapshots && session.forkFrom && !session.realSessionId) {
           log.info(`[detect] session=${sessionId} matching snapshot-only fork file=${newId}`);
@@ -319,28 +292,10 @@ function detectSessionTransitions(folder) {
         log.info(`[detect] session=${sessionId} NO MATCH for newFile=${newId} forkFrom=${session.forkFrom} parentSessionId=${signals.parentSessionId||'null'} forkedFrom=${signals.forkedFrom||'null'}`);
       }
 
-      // Plan-accept: shared slug + planContent + old session has ExitPlanMode
-      if (!matched && signals.planContent && signals.slug) {
-        const oldFilePath = path.join(folderPath, sessionId + '.jsonl');
-        const oldTail = readOldSessionTail(oldFilePath);
-        if (oldTail.hasExitPlanMode && oldTail.slug === signals.slug) {
-          // Temporal check: new file created within 30s of old file's last modification
-          try {
-            const oldMtime = fs.statSync(oldFilePath).mtimeMs;
-            const newMtime = fs.statSync(newFilePath).mtimeMs;
-            if (Math.abs(newMtime - oldMtime) < 30000) {
-              matched = true;
-            }
-          } catch {}
-        }
-      }
-
       if (matched) {
-        log.info(`[session-transition] ${sessionId} → ${newId} (${signals.forkedFrom || session.forkFrom ? 'fork' : 'plan-accept'})`);
+        log.info(`[session-transition] ${sessionId} → ${newId} (fork)`);
         session.knownJsonlFiles = new Set(currentFiles);
         session.realSessionId = newId;
-        // Update slug from new session
-        if (signals.slug) session.sessionSlug = signals.slug;
         activeSessions.delete(sessionId);
         activeSessions.set(newId, session);
         // Re-key MCP server to match new session ID
