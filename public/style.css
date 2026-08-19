@@ -808,8 +808,7 @@ body { display: flex; flex-direction: column; }
   display: inline-block;
   background: #3ecf5a;
   box-shadow: 0 0 6px rgba(62,207,90,0.5);
-  /* steps() keeps continuous sidebar animations off the 60fps compositing path —
-     a smooth infinite animation forces a full-window composite every frame */
+  /* steps() — see docs/decisions/0002 */
   animation: pulse-dot 2s steps(4) infinite;
 }
 .slug-group-count {
@@ -939,9 +938,7 @@ body { display: flex; flex-direction: column; }
 
 /* ---- CLI busy spinner (braille spinner detected) ---- */
 /* needs-attention takes precedence — when both are set, the attention indicator shows */
-/* The dot becomes a braille spinner mirroring the CLI's own — a discrete content
-   animation (steps) instead of a 60fps border rotation, which was one of the most
-   expensive steady-state effects in the app (measured in docs/decisions/0002). */
+/* Braille spinner via content keyframes — see docs/decisions/0002 */
 .session-item.cli-busy:not(.needs-attention) .session-status-dot,
 .session-item.cli-busy:not(.needs-attention) .session-status-dot.running {
   background: transparent !important;
@@ -978,10 +975,7 @@ body { display: flex; flex-direction: column; }
   to { transform: rotate(360deg); }
 }
 
-/* Static tint instead of the old animated shimmer: the background-position +
-   background-clip:text shimmer repainted every busy summary at 60fps on the
-   renderer main thread — the single most expensive indicator (measured in
-   docs/decisions/0002). A fixed color keeps the "busy" identity for free. */
+/* Static tint replaces the animated shimmer — see docs/decisions/0002 */
 .session-item.cli-busy:not(.needs-attention) .session-summary {
   color: #7fd4f9;
 }
@@ -1165,10 +1159,7 @@ body { display: flex; flex-direction: column; }
 }
 
 /* ---- Needs attention indicator (blinking LED + halo) ---- */
-/* Replaces the expanding-rings ripple, which repainted at 60fps (cost measured
-   in docs/decisions/0002). A steps(1) opacity blink is 2 frames/s — visually a
-   notification LED — and the fixed-size halo keeps the ripple's visual weight
-   (it dims with the blink: element opacity includes the box-shadow). */
+/* Replaces the ripple — see docs/decisions/0002 */
 .session-item.needs-attention .session-status-dot,
 .session-item.needs-attention .session-status-dot.running {
   background: #f0a050;
@@ -1569,7 +1560,7 @@ body { display: flex; flex-direction: column; }
 
 .grid-card-dot.busy {
   background: #3ecf5a;
-  /* steps() — see .slug-group-dot.running */
+  /* steps() — see docs/decisions/0002 */
   animation: pulse-dot 1.5s steps(4) infinite;
 }
 
