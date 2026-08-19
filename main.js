@@ -378,6 +378,7 @@ function buildMenu() {
 // --- Session cache helpers ---
 
 const { deriveProjectPath, resolveSessionRealCwd, sessionTranscriptExists, isGitRepo } = require('./derive-project-path');
+const { resolveDeletionTargets } = require('./delete-session-target');
 
 // Session cache → session-cache.js
 const sessionCache = require('./session-cache');
@@ -1627,65 +1628,80 @@ ipcMain.handle('stop-subagent-watch', (_event, watchId) => {
 //
 // Subagent transcripts live in a sibling <sessionId>/ directory and are part of
 // the same conversation, so they go too — leaving them orphans the tree.
+// --- IPC: delete-session-preview ---
+// What deleting `sessionId` would remove, so the confirmation dialog can state
+// it rather than asking the user to trust a generic warning.
+ipcMain.handle('delete-session-preview', (_event, sessionId) => {
+  const id = String(sessionId || '');
+  let folder = null;
+  try { folder = getCachedFolder(id); } catch {}
+  const resolved = resolveDeletionTargets(PROJECTS_DIR, id, folder);
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+  let subagents = 0;
+  try {
+    subagents = (getCachedByParent(id) || []).filter(r => r.sessionId && r.sessionId !== id).length;
+  } catch {}
+  const running = activeSessions.has(id) && !activeSessions.get(id).exited;
+  return { ok: true, transcripts: resolved.targets.length, subagents, running };
+});
+
 ipcMain.handle('delete-session', (_event, sessionId) => {
   const id = String(sessionId || '');
-  if (!/^[A-Za-z0-9._-]+$/.test(id) || id === '.' || id === '..') {
-    return { ok: false, error: 'invalid session id' };
-  }
   if (activeSessions.has(id) && !activeSessions.get(id).exited) {
     return { ok: false, error: 'session is still running — close it first' };
   }
 
-  const removed = [];
-  let folders;
-  try {
-    folders = fs.readdirSync(PROJECTS_DIR);
-  } catch (err) {
-    return { ok: false, error: `cannot read projects directory: ${err.message}` };
+  // Validation, symlink resolution and containment live in
+  // delete-session-target.js so they can be executed by tests against real
+  // paths and symlinks. getCachedFolder makes the common case an O(1) lookup
+  // instead of a readdir of every project; fall back to the scan when the row
+  // is missing (a placeholder session that was never indexed).
+  let folder = null;
+  try { folder = getCachedFolder(id); } catch {}
+  const resolved = resolveDeletionTargets(PROJECTS_DIR, id, folder);
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+  for (const r of resolved.refused) {
+    log.warn(`[delete-session] refusing ${r.path} — ${r.reason} (${r.real})`);
   }
 
-  for (const folder of folders) {
-    const base = path.join(PROJECTS_DIR, folder);
-    for (const target of [path.join(base, id + '.jsonl'), path.join(base, id)]) {
-      if (!fs.existsSync(target)) continue;
-      // Resolve symlinks before deleting, and require the result to stay inside
-      // PROJECTS_DIR — otherwise a planted link turns this into arbitrary rm.
-      let real;
-      try {
-        real = fs.realpathSync(target);
-      } catch {
-        continue;
-      }
-      const root = fs.realpathSync(PROJECTS_DIR);
-      if (real !== root && !real.startsWith(root + path.sep)) {
-        log.warn(`[delete-session] refusing ${target} — resolves outside ${root}`);
-        continue;
-      }
-      try {
-        fs.rmSync(real, { recursive: true, force: true });
-        removed.push(real);
-      } catch (err) {
-        log.error(`[delete-session] failed to remove ${real}: ${err.message}`);
-        return { ok: false, error: `could not delete: ${err.message}` };
-      }
+  // Collect the subagents BEFORE removing anything: their transcripts sit inside
+  // the parent's directory and go with it, but they are indexed under their own
+  // composite `sub:<parent>:<agent>` ids, which nothing else here would clear.
+  // Left behind, the sidebar renders them as a phantom "Orphan subagents" group
+  // and search keeps returning hits pointing at deleted files.
+  let subagentIds = [];
+  try {
+    subagentIds = (getCachedByParent(id) || [])
+      .map(row => row.sessionId)
+      .filter(sid => sid && sid !== id);
+  } catch {}
+
+  const removed = [];
+  for (const target of resolved.targets) {
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      removed.push(target);
+    } catch (err) {
+      log.error(`[delete-session] failed to remove ${target}: ${err.message}`);
+      return { ok: false, error: `could not delete: ${err.message}` };
     }
+  }
+
+  for (const sid of [id, ...subagentIds]) {
+    try { deleteCachedSession(sid); } catch {}
+    try { deleteSearchSession(sid); } catch {}
   }
 
   // A session with no transcript on disk is not an error case: launchNewSession
   // shows a card before claude starts, so a launch that died leaves one with
   // nothing behind it — and those are precisely the cards a user wants gone.
-  // Clear the caches and report success so the row can be dismissed.
   if (!removed.length) {
-    try { deleteCachedSession(id); } catch {}
-    try { deleteSearchSession(id); } catch {}
     log.info(`[delete-session] ${id} had no transcript — cleared caches only`);
-    return { ok: true, removed: [], placeholder: true };
+    return { ok: true, removed: [], subagents: subagentIds.length, placeholder: true };
   }
 
-  try { deleteCachedSession(id); } catch {}
-  try { deleteSearchSession(id); } catch {}
-  log.info(`[delete-session] ${id} removed ${removed.length} path(s)`);
-  return { ok: true, removed };
+  log.info(`[delete-session] ${id} removed ${removed.length} path(s), ${subagentIds.length} subagent row(s)`);
+  return { ok: true, removed, subagents: subagentIds.length };
 });
 
 ipcMain.handle('archive-session', (_event, sessionId, archived) => {

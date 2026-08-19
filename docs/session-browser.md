@@ -40,7 +40,9 @@ The trash button on a session card **permanently removes that session's transcri
 
 Use **archive** instead if you only want the session out of the way — archiving hides it from the sidebar but keeps the file.
 
-A session that is still running is stopped first. If its transcript cannot be found, or something outside `~/.claude/projects` is somehow targeted, the deletion is refused and the reason is shown.
+The confirmation dialog states what will be removed: the project, how many files are on disk, and how many subagent transcripts belong to the session. Subagent transcripts are removed with their parent, and their search/index entries with them.
+
+If the session is still running it is stopped first when Switchboard knows it is live; otherwise the deletion is refused with a reason rather than pulling a transcript out from under a running process. Anything that resolves outside `~/.claude/projects` — a symlinked transcript, for instance — is refused and logged. A session that never started has no transcript to remove, so deleting it just clears the leftover card.
 
 ## Star and archive
 

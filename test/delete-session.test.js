@@ -1,8 +1,12 @@
-// Coverage for the Delete Session action.
+// Wiring checks for the Delete Session action.
 //
-// This is the only action in the app that destroys user history, so the tests
-// concentrate on the guards rather than the happy path: what it refuses, and
-// that it cannot be steered outside ~/.claude/projects.
+// The guards themselves — id validation, symlink resolution, containment within
+// PROJECTS_DIR, target selection — are EXECUTED against real paths and symlinks
+// in test/delete-session-target.test.js. Regex-matching main.js proved nothing:
+// the review neutered the containment check while leaving the matched substring
+// in place and every assertion here still passed. What remains below is only
+// what cannot be reached without electron: that the handler is wired to the
+// extracted module, cleans up the rows it owns, and that the UI confirms.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -18,21 +22,6 @@ test('delete-session: the IPC handler exists and is exposed to the renderer', ()
   assert.match(preload, /deleteSession: \(id\) => ipcRenderer\.invoke\('delete-session', id\)/);
 });
 
-test('delete-session: refuses ids that are not plain filename components', () => {
-  const main = fs.readFileSync(path.join(ROOT, 'main.js'), 'utf8');
-  const start = main.indexOf("ipcMain.handle('delete-session'");
-  const body = main.slice(start, main.indexOf('\n});', start));
-
-  assert.match(body, /\^\[A-Za-z0-9\._-\]\+\$/, 'id must be validated against a strict character set');
-  assert.match(body, /id === '\.'|id === '\.\.'/, 'dot segments must be rejected explicitly');
-
-  // The regex is the real guard — check it rejects traversal and separators.
-  const idRe = /^[A-Za-z0-9._-]+$/;
-  for (const bad of ['../../etc/passwd', 'a/b', 'a\\b', '', 'a b', 'a;rm -rf /']) {
-    assert.equal(idRe.test(bad), false, `must reject ${JSON.stringify(bad)}`);
-  }
-  assert.equal(idRe.test('57cf3347-04e1-485f-8063-4d8700785fba'), true, 'a real session id must pass');
-});
 
 test('delete-session: refuses while the session still has a live PTY', () => {
   const main = fs.readFileSync(path.join(ROOT, 'main.js'), 'utf8');
@@ -43,36 +32,15 @@ test('delete-session: refuses while the session still has a live PTY', () => {
   assert.match(body, /still running/, 'the refusal must say why');
 });
 
-test('delete-session: resolves symlinks and refuses anything outside PROJECTS_DIR', () => {
-  const main = fs.readFileSync(path.join(ROOT, 'main.js'), 'utf8');
-  const start = main.indexOf("ipcMain.handle('delete-session'");
-  const body = main.slice(start, main.indexOf('\n});', start));
-  assert.match(body, /realpathSync/, 'symlinks must be resolved before deleting');
-  assert.match(body, /startsWith\(root \+ path\.sep\)/,
-    'the resolved path must be confined to the projects directory');
-  // The containment check itself, exercised directly.
-  const root = '/home/u/.claude/projects';
-  const inside = (p) => p === root || p.startsWith(root + path.sep);
-  assert.equal(inside('/home/u/.claude/projects/-a/x.jsonl'), true);
-  assert.equal(inside('/home/u/.ssh/id_rsa'), false);
-  assert.equal(inside('/home/u/.claude/projects-evil/x'), false, 'prefix must not match a sibling directory');
-});
 
-test('delete-session: removes subagent transcripts with their parent', () => {
-  const main = fs.readFileSync(path.join(ROOT, 'main.js'), 'utf8');
-  const start = main.indexOf("ipcMain.handle('delete-session'");
-  const body = main.slice(start, main.indexOf('\n});', start));
-  assert.match(body, /path\.join\(base, id \+ '\.jsonl'\), path\.join\(base, id\)/,
-    'both the transcript and the sibling <id>/ subagent directory must be targeted');
-  assert.match(body, /recursive: true/, 'the subagent directory needs a recursive removal');
-});
 
 test('delete-session: clears the caches so the row does not reappear', () => {
   const main = fs.readFileSync(path.join(ROOT, 'main.js'), 'utf8');
   const start = main.indexOf("ipcMain.handle('delete-session'");
   const body = main.slice(start, main.indexOf('\n});', start));
-  assert.match(body, /deleteCachedSession\(id\)/, 'session cache row must go');
-  assert.match(body, /deleteSearchSession\(id\)/, 'search index entry must go');
+  // Cleared for the parent and every subagent in one loop.
+  assert.match(body, /deleteCachedSession\(sid\)/, 'session cache rows must go');
+  assert.match(body, /deleteSearchSession\(sid\)/, 'search index entries must go');
 });
 
 test('delete button: rendered on session cards and confirms before deleting', () => {
@@ -84,8 +52,8 @@ test('delete button: rendered on session cards and confirms before deleting', ()
   // Slice to the next handler rather than a fixed length — the block grew and a
   // fixed window silently dropped the assertions off the end.
   const handler = sidebar.slice(start, sidebar.indexOf('const archiveBtn', start));
-  assert.match(handler, /window\.confirm\(/, 'an irreversible action must be confirmed');
-  assert.match(handler, /cannot be undone/, 'the prompt must state that it is irreversible');
+  assert.match(handler, /await showDeleteSessionDialog\(session\)/,
+    'an irreversible action must be confirmed, via the styled dialog');
   assert.match(handler, /stopSession/, 'a running session must be stopped before deletion');
   assert.match(handler, /window\.api\.deleteSession/);
   assert.doesNotMatch(handler, /window\.alert\(/,
@@ -110,5 +78,56 @@ test('delete-session: a session with no transcript is dismissed, not refused', (
   const empty = body.slice(body.indexOf('if (!removed.length) {'));
   assert.match(empty, /ok: true/, 'a placeholder must be reported as deleted, not as a failure');
   assert.match(empty, /placeholder: true/, 'the caller should be able to tell the two apart');
-  assert.match(empty, /deleteCachedSession\(id\)/, 'caches must still be cleared');
+  // The cache clearing happens just above, for the parent and its subagents
+  // alike, so it covers the placeholder case without repeating itself.
+  assert.match(body, /for \(const sid of \[id, \.\.\.subagentIds\]\)/,
+    'caches must still be cleared for a placeholder');
+});
+
+test('delete-session: delegates its guards to the executable module', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'main.js'), 'utf8');
+  assert.match(src, /require\('\.\/delete-session-target'\)/,
+    'validation must live in the module the tests can execute, not inline in main.js');
+  const start = src.indexOf("ipcMain.handle('delete-session'");
+  const body = src.slice(start, src.indexOf('\n});', start));
+  assert.match(body, /resolveDeletionTargets\(PROJECTS_DIR, id, folder\)/);
+  assert.match(body, /getCachedFolder\(id\)/, 'the cached folder makes the lookup O(1)');
+  assert.match(body, /resolved\.refused/, 'a refused target must be logged, not silently dropped');
+});
+
+test('delete-session: clears subagent rows, which are indexed under their own ids', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'main.js'), 'utf8');
+  const start = src.indexOf("ipcMain.handle('delete-session'");
+  const body = src.slice(start, src.indexOf('\n});', start));
+
+  // Subagent transcripts live inside the parent directory and go with it, but
+  // they are cached under `sub:<parent>:<agent>` ids. Left behind, the sidebar
+  // renders them as a phantom "Orphan subagents" group and search returns hits
+  // for deleted files.
+  assert.match(body, /getCachedByParent\(id\)/, 'subagent rows must be collected');
+  const collect = body.indexOf('getCachedByParent(id)');
+  const remove = body.indexOf('fs.rmSync');
+  assert.ok(collect < remove, 'they must be collected BEFORE the files are removed');
+  assert.match(body, /for \(const sid of \[id, \.\.\.subagentIds\]\)/,
+    'the parent and every subagent row must be cleared');
+});
+
+test('delete button: uses the styled dialog, not a renderer-blocking native prompt', () => {
+  const sidebar = fs.readFileSync(path.join(ROOT, 'public', 'sidebar.js'), 'utf8');
+  assert.match(sidebar, /async function showDeleteSessionDialog/, 'the dialog must exist');
+  assert.doesNotMatch(sidebar, /window\.confirm\(/,
+    'confirm() blocks the whole renderer, including every other live terminal');
+
+  const start = sidebar.indexOf('async function showDeleteSessionDialog');
+  const dlg = sidebar.slice(start, sidebar.indexOf('// --- Delete worktree', start));
+  assert.match(dlg, /deleteSessionPreview/, 'it must state what will be lost');
+  assert.match(dlg, /Archive/, 'and point at the non-destructive alternative');
+  assert.match(dlg, /Escape/, 'Esc must cancel, like the worktree dialog');
+});
+
+test('delete button: closes the tab so it cannot point at a deleted transcript', () => {
+  const sidebar = fs.readFileSync(path.join(ROOT, 'public', 'sidebar.js'), 'utf8');
+  const start = sidebar.indexOf("item.querySelector('.session-delete-btn')");
+  const handler = sidebar.slice(start, sidebar.indexOf('const archiveBtn', start));
+  assert.match(handler, /destroySession\(session\.sessionId\)/);
 });
