@@ -167,6 +167,35 @@ an agent tracked from its first line. The renderer's 60 s TTL has the same
 shape. Anything that needs true liveness would have to come from the parent
 process, not from mtime.
 
+## Subagent children inside a slug group (issue #128 ask 4, rehab-plan.md A3)
+
+- **The bug**: `buildSlugGroup()` used to append its sessions via the raw
+  `buildSessionItem(session)`, never through `appendSubagentChildren()` — only
+  the ungrouped/top-level render path (`buildSessionsList`) called that
+  helper. Any session rendered inside a slug group (i.e. any second-or-later
+  rerun of a schedule sharing a slug — the only real producer, see
+  `schedule-runner.js:createScheduleSession()`) silently lost its subagent
+  caret/children.
+- **The fix**: `appendSubagentChildren()` was hoisted from a closure inside
+  `renderProjects()` to module scope (it never captured any of that
+  function's locals) so `buildSlugGroup(slug, sessions, subagentIndex)` can
+  call it directly for each session it renders, exactly like
+  `buildSessionsList` does for ungrouped sessions.
+- **The knock-on bug this caused**: a slug-group `<div>` carries no
+  `dataset.sessionId` of its own, so the "orphan subagents" pass in
+  `buildSessionsList` — which built `allTopLevelIds` from
+  `item.element.dataset.sessionId` — never counted the sessions grouped
+  inside it as accounted-for. Their subagents were treated as parentless and
+  duplicated into the project's "Orphan subagents" bucket even after the fix
+  above attached them correctly inside the group. `collectTopLevelSessionIds(el)`
+  fixes this by walking into `el` for nested `[data-session-id]` session-items
+  (excluding subagent ones) when `el` itself isn't a session item.
+- **Coverage**: `test/dom-slug-group-subagent-nesting.test.js` seeds two
+  schedule-rerun-shaped sessions sharing a slug plus a subagent parented to
+  one of them, and pins both the caret-attachment fix and the
+  no-duplicate-orphan fix (failed on both before the fix, confirmed by
+  reverting it locally during development).
+
 ## If you change this, also check
 
 - `eslint.config.js` `rendererCrossFileGlobals` — must list any new renderer-global functions (e.g. `showSubagentTranscript`, `drainViewerWatches`) or lint fails on `no-undef`

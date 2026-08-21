@@ -226,7 +226,56 @@ function buildSubagentItem(session) {
   return item;
 }
 
-function buildSlugGroup(slug, sessions) {
+// Shared by buildSessionsList and buildSlugGroup — see .ai/contexts/subagent-observability.md
+function appendSubagentChildren(parentEl, parentSessionId, subagentIndex) {
+  const children = subagentIndex && subagentIndex.get(parentSessionId);
+  if (!children || children.length === 0) return;
+
+  const expandedSet = getExpandedSubagents();
+  const caretId = caretIdFor(parentSessionId);
+  const isExpanded = expandedSet.has(parentSessionId);
+
+  const caret = document.createElement('div');
+  caret.className = 'sidebar-children-caret js-stateful';
+  caret.id = caretId;
+  if (isExpanded) caret.classList.add('expanded');
+  if (parentHasActiveSubagent(parentSessionId)) caret.classList.add('has-running-child');
+  caret.innerHTML = `<span class="caret-arrow">&#9654;</span> ${children.length} subagent${children.length !== 1 ? 's' : ''}<span class="caret-running-dot"></span>`;
+
+  const childrenContainer = document.createElement('div');
+  childrenContainer.className = 'sidebar-subagents-container js-stateful';
+  childrenContainer.id = 'subc-' + parentSessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  childrenContainer.style.display = isExpanded ? '' : 'none';
+
+  for (const child of children) {
+    childrenContainer.appendChild(buildSubagentItem(child));
+  }
+
+  caret.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const open = childrenContainer.style.display !== 'none';
+    childrenContainer.style.display = open ? 'none' : '';
+    caret.classList.toggle('expanded', !open);
+    const set = getExpandedSubagents();
+    if (open) { set.delete(parentSessionId); } else { set.add(parentSessionId); }
+    saveExpandedSubagents(set);
+  });
+
+  parentEl.after(caret);
+  caret.after(childrenContainer);
+}
+
+// See .ai/contexts/subagent-observability.md (slug-group orphan-detection fix)
+function collectTopLevelSessionIds(el) {
+  const ids = [];
+  if (el.dataset && el.dataset.sessionId && !el.dataset.subagent) ids.push(el.dataset.sessionId);
+  el.querySelectorAll('[data-session-id]').forEach((child) => {
+    if (!child.dataset.subagent) ids.push(child.dataset.sessionId);
+  });
+  return ids;
+}
+
+function buildSlugGroup(slug, sessions, subagentIndex) {
   const group = document.createElement('div');
   const id = slugId(slug);
   const expanded = getExpandedSlugs().has(id);
@@ -290,7 +339,9 @@ function buildSlugGroup(slug, sessions) {
   if (promoted.length > 0) {
     group.classList.add('has-promoted');
     for (const session of promoted) {
-      sessionsContainer.appendChild(buildSessionItem(session));
+      const sessionEl = buildSessionItem(session);
+      sessionsContainer.appendChild(sessionEl);
+      appendSubagentChildren(sessionEl, session.sessionId, subagentIndex);
     }
     if (rest.length > 0) {
       const moreBtn = document.createElement('div');
@@ -302,7 +353,9 @@ function buildSlugGroup(slug, sessions) {
       olderDiv.className = 'slug-group-older js-stateful';
       olderDiv.id = 'sgo-' + id;
       for (const session of rest) {
-        olderDiv.appendChild(buildSessionItem(session));
+        const sessionEl = buildSessionItem(session);
+        olderDiv.appendChild(sessionEl);
+        appendSubagentChildren(sessionEl, session.sessionId, subagentIndex);
       }
 
       sessionsContainer.appendChild(moreBtn);
@@ -310,7 +363,9 @@ function buildSlugGroup(slug, sessions) {
     }
   } else {
     for (const session of sessions) {
-      sessionsContainer.appendChild(buildSessionItem(session));
+      const sessionEl = buildSessionItem(session);
+      sessionsContainer.appendChild(sessionEl);
+      appendSubagentChildren(sessionEl, session.sessionId, subagentIndex);
     }
   }
 
@@ -416,7 +471,7 @@ function renderProjects(projects, resort) {
       const mostRecentTime = Math.max(...sessions.map(s => new Date(s.modified).getTime()));
       const hasRunning = sessions.some(s => activePtyIds.has(s.sessionId) || pendingSessions.has(s.sessionId));
       const hasPinned = sessions.some(s => s.starred);
-      const element = sessions.length === 1 ? buildSessionItem(sessions[0]) : buildSlugGroup(slug, sessions);
+      const element = sessions.length === 1 ? buildSessionItem(sessions[0]) : buildSlugGroup(slug, sessions, subagentIndex);
       allItems.push({ sortTime: mostRecentTime, pinned: hasPinned, running: hasRunning, element });
     }
 
@@ -466,45 +521,6 @@ function renderProjects(projects, resort) {
     };
   }
 
-  // Append subagent children beneath a session item element.
-  function appendSubagentChildren(parentEl, parentSessionId, subagentIndex) {
-    const children = subagentIndex && subagentIndex.get(parentSessionId);
-    if (!children || children.length === 0) return;
-
-    const expandedSet = getExpandedSubagents();
-    const caretId = caretIdFor(parentSessionId);
-    const isExpanded = expandedSet.has(parentSessionId);
-
-    const caret = document.createElement('div');
-    caret.className = 'sidebar-children-caret js-stateful';
-    caret.id = caretId;
-    if (isExpanded) caret.classList.add('expanded');
-    if (parentHasActiveSubagent(parentSessionId)) caret.classList.add('has-running-child');
-    caret.innerHTML = `<span class="caret-arrow">&#9654;</span> ${children.length} subagent${children.length !== 1 ? 's' : ''}<span class="caret-running-dot"></span>`;
-
-    const childrenContainer = document.createElement('div');
-    childrenContainer.className = 'sidebar-subagents-container js-stateful';
-    childrenContainer.id = 'subc-' + parentSessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
-    childrenContainer.style.display = isExpanded ? '' : 'none';
-
-    for (const child of children) {
-      childrenContainer.appendChild(buildSubagentItem(child));
-    }
-
-    caret.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const open = childrenContainer.style.display !== 'none';
-      childrenContainer.style.display = open ? 'none' : '';
-      caret.classList.toggle('expanded', !open);
-      const set = getExpandedSubagents();
-      if (open) { set.delete(parentSessionId); } else { set.add(parentSessionId); }
-      saveExpandedSubagents(set);
-    });
-
-    parentEl.after(caret);
-    caret.after(childrenContainer);
-  }
-
   // Build the sessions list DOM (shared between projects and worktrees)
   function buildSessionsList(fId, visible, older, subagentIndex, projectPath) {
     const sessionsList = document.createElement('div');
@@ -534,9 +550,10 @@ function renderProjects(projects, resort) {
       sessionsList.appendChild(olderList);
     }
 
-    // Orphan subagents: children whose parentSessionId has no top-level session in this project
+    // Orphan subagents: children whose parentSessionId has no top-level session in this project.
+    // See .ai/contexts/subagent-observability.md for why collectTopLevelSessionIds is needed here.
     if (subagentIndex) {
-      const allTopLevelIds = new Set([...visible, ...older].map(i => i.element.dataset && i.element.dataset.sessionId).filter(Boolean));
+      const allTopLevelIds = new Set([...visible, ...older].flatMap(i => collectTopLevelSessionIds(i.element)));
       const orphans = [];
       for (const [parentId, kids] of subagentIndex) {
         if (!allTopLevelIds.has(parentId)) {
