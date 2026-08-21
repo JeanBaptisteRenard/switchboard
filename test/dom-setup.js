@@ -133,6 +133,7 @@ function setupSidebarDom() {
       buildSessionItem: window.buildSessionItem,
       buildSubagentItem: window.buildSubagentItem,
       folderId: window.folderId,
+      showDeleteSessionDialog: window.showDeleteSessionDialog,
     },
     // Simulate the main process emitting subagent-spawned/subagent-completed
     // (session-transitions.js) by invoking the callback sidebar.js registered

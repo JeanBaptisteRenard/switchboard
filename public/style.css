@@ -1068,6 +1068,7 @@ body { display: flex; flex-direction: column; }
 .session-launch-config-btn,
 .session-fork-btn,
 .session-jsonl-btn,
+.session-delete-btn,
 .session-archive-btn {
   cursor: pointer;
   background: none;
@@ -1079,6 +1080,13 @@ body { display: flex; flex-direction: column; }
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* Delete is the one irreversible action on a card, so it reads as danger on
+   hover rather than blending in with archive/fork. */
+.session-delete-btn:hover {
+  color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.12);
 }
 
 .session-stop-btn {
@@ -1096,6 +1104,10 @@ body { display: flex; flex-direction: column; }
 
 .session-archive-btn {
   color: #6068b0;
+}
+
+.session-delete-btn {
+  color: #7a5a5a;
 }
 
 .session-stop-btn:hover {

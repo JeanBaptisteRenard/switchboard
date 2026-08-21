@@ -378,6 +378,7 @@ function buildMenu() {
 // --- Session cache helpers ---
 
 const { deriveProjectPath, resolveSessionRealCwd, sessionTranscriptExists, isGitRepo } = require('./derive-project-path');
+const { resolveDeletionTargets } = require('./delete-session-target');
 
 // Session cache → session-cache.js
 const sessionCache = require('./session-cache');
@@ -1612,6 +1613,95 @@ ipcMain.handle('stop-subagent-watch', (_event, watchId) => {
   subagentWatchers.delete(watchId);
   log.info(`[subagent-watch] stop watchId=${watchId}`);
   return { ok: true };
+});
+
+// --- IPC: delete-session ---
+// Permanently removes a session's transcript from disk. This is the one action
+// in the app that destroys user history, so it is deliberately narrow:
+//
+//  - the id must look like a session id, and is used only as a filename
+//    component under PROJECTS_DIR — never joined with caller-supplied paths
+//  - the resolved file must still sit inside PROJECTS_DIR after realpath, so a
+//    symlinked transcript cannot be used to delete something elsewhere
+//  - a session with a live PTY is refused; killing the process and deleting its
+//    transcript underneath itself is not something to do implicitly
+//
+// Subagent transcripts live in a sibling <sessionId>/ directory and are part of
+// the same conversation, so they go too — leaving them orphans the tree.
+// --- IPC: delete-session-preview ---
+// What deleting `sessionId` would remove, so the confirmation dialog can state
+// it rather than asking the user to trust a generic warning.
+ipcMain.handle('delete-session-preview', (_event, sessionId) => {
+  const id = String(sessionId || '');
+  let folder = null;
+  try { folder = getCachedFolder(id); } catch {}
+  const resolved = resolveDeletionTargets(PROJECTS_DIR, id, folder);
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+  let subagents = 0;
+  try {
+    subagents = (getCachedByParent(id) || []).filter(r => r.sessionId && r.sessionId !== id).length;
+  } catch {}
+  const running = activeSessions.has(id) && !activeSessions.get(id).exited;
+  return { ok: true, transcripts: resolved.targets.length, subagents, running };
+});
+
+ipcMain.handle('delete-session', (_event, sessionId) => {
+  const id = String(sessionId || '');
+  if (activeSessions.has(id) && !activeSessions.get(id).exited) {
+    return { ok: false, error: 'session is still running — close it first' };
+  }
+
+  // Validation, symlink resolution and containment live in
+  // delete-session-target.js so they can be executed by tests against real
+  // paths and symlinks. getCachedFolder makes the common case an O(1) lookup
+  // instead of a readdir of every project; fall back to the scan when the row
+  // is missing (a placeholder session that was never indexed).
+  let folder = null;
+  try { folder = getCachedFolder(id); } catch {}
+  const resolved = resolveDeletionTargets(PROJECTS_DIR, id, folder);
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+  for (const r of resolved.refused) {
+    log.warn(`[delete-session] refusing ${r.path} — ${r.reason} (${r.real})`);
+  }
+
+  // Collect the subagents BEFORE removing anything: their transcripts sit inside
+  // the parent's directory and go with it, but they are indexed under their own
+  // composite `sub:<parent>:<agent>` ids, which nothing else here would clear.
+  // Left behind, the sidebar renders them as a phantom "Orphan subagents" group
+  // and search keeps returning hits pointing at deleted files.
+  let subagentIds = [];
+  try {
+    subagentIds = (getCachedByParent(id) || [])
+      .map(row => row.sessionId)
+      .filter(sid => sid && sid !== id);
+  } catch {}
+
+  const removed = [];
+  for (const target of resolved.targets) {
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      removed.push(target);
+    } catch (err) {
+      log.error(`[delete-session] failed to remove ${target}: ${err.message}`);
+      return { ok: false, error: `could not delete: ${err.message}` };
+    }
+  }
+
+  for (const sid of [id, ...subagentIds]) {
+    try { deleteCachedSession(sid); } catch {}
+    try { deleteSearchSession(sid); } catch {}
+  }
+
+  // A session with no transcript on disk is not an error case: launchNewSession
+  // shows a card before claude starts, so a launch that died leaves one with
+  // nothing behind it — and those are precisely the cards a user wants gone.
+  if (!removed.length) {
+    log.info(`[delete-session] ${id} had no transcript — cleared caches only`);
+    return { ok: true, removed: [], subagents: subagentIds.length, placeholder: true };
+  }
+
+  log.info(`[delete-session] ${id} removed ${removed.length} path(s), ${subagentIds.length} subagent row(s)`);
+  return { ok: true, removed, subagents: subagentIds.length };
 });
 
 ipcMain.handle('archive-session', (_event, sessionId, archived) => {
