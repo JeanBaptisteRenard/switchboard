@@ -195,6 +195,17 @@ process, not from mtime.
   one of them, and pins both the caret-attachment fix and the
   no-duplicate-orphan fix (failed on both before the fix, confirmed by
   reverting it locally during development).
+- **A second knock-on bug (PR #134 review F1)**: nesting the subagent's
+  caret/children as DOM siblings inside the group means every DOM query
+  scoped to `.slug-group` that matches on `.session-item` alone now also
+  matches the nested subagent item (`buildSubagentItem` includes
+  `session-item` in its className for shared styling). The "Archive all
+  sessions in group" handler (`rebindSidebarEvents`, `.slug-group-archive-btn`)
+  had exactly this query and, unguarded, called `archiveSession`/`stopSession`
+  on the subagent's id. Fixed with the same `:not([data-subagent])` guard
+  already used elsewhere in this file (e.g. the per-item click wiring). Any
+  *new* query scoped to a slug-group's subtree must apply this guard too —
+  it's not automatic.
 
 ## If you change this, also check
 

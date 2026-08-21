@@ -120,3 +120,38 @@ test('the slug-group dot lights up while one of the grouped, nested sessions has
     ctx.destroy();
   }
 });
+
+// PR #134 review F1 — nesting the subagent's caret/children as DOM siblings
+// inside the group (the fix above) means group.querySelectorAll('.session-item')
+// in the "Archive all sessions in group" handler now also matches the nested
+// subagent item (buildSubagentItem's className includes 'session-item' for
+// shared styling), so the handler must exclude it the same way every other
+// subagent-item consumer in this file does (:not([data-subagent])).
+test('"Archive all sessions in group" only archives the two top-level reruns, not the nested subagent', async () => {
+  const ctx = setupSidebarDom();
+  try {
+    ctx.window.activePtyIds.add('sched-run-2');
+    ctx.window.sessionMap.set('sched-run-1', { sessionId: 'sched-run-1', archived: 0 });
+    ctx.window.sessionMap.set('sched-run-2', { sessionId: 'sched-run-2', archived: 0 });
+    ctx.window.sessionMap.set('sub:sched-run-2:agent-1', { sessionId: 'sub:sched-run-2:agent-1', archived: 0 });
+
+    const archiveCalls = [];
+    const stopCalls = [];
+    ctx.window.api.archiveSession = (sid, val) => { archiveCalls.push([sid, val]); return Promise.resolve({ ok: true }); };
+    ctx.window.api.stopSession = (sid) => { stopCalls.push(sid); return Promise.resolve({ ok: true }); };
+
+    ctx.sidebar.renderProjects([scheduleRerunProject()], true);
+
+    const archiveBtn = ctx.document.querySelector('#slug-hn-top-articles .slug-group-archive-btn');
+    assert.ok(archiveBtn, 'slug-group-archive-btn must be rendered');
+    await archiveBtn.onclick({ stopPropagation: () => {} });
+
+    const archivedIds = archiveCalls.map(([sid]) => sid).sort();
+    assert.deepEqual(archivedIds, ['sched-run-1', 'sched-run-2'],
+      'only the two top-level reruns must be archived — the nested subagent must not reach archiveSession');
+    assert.ok(!stopCalls.includes('sub:sched-run-2:agent-1'),
+      'the nested subagent must not reach stopSession either');
+  } finally {
+    ctx.destroy();
+  }
+});

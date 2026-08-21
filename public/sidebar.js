@@ -909,7 +909,7 @@ function rebindSidebarEvents(projects) {
       archiveBtn.onclick = async (e) => {
         e.stopPropagation();
         const group = header.parentElement;
-        const sessionItems = group.querySelectorAll('.session-item');
+        const sessionItems = group.querySelectorAll('.session-item:not([data-subagent])');
         for (const item of sessionItems) {
           const sid = item.dataset.sessionId;
           const session = sessionMap.get(sid);
