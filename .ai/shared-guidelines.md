@@ -117,11 +117,17 @@ These exist on `devsuitup/switchboard` main but not on `doctly/switchboard` main
 
 ## When you finish work
 
-1. `task check` (lint + test). 0 errors. Pre-existing warnings are fine.
-2. Squash to clear commits. No `Co-Authored-By`. Imperative subject, brief why-body.
-3. `gh pr create` against `devsuitup/switchboard:main` (the fork's main, not upstream's). Title format: `(area): short imperative`.
-4. If the change is a port of an upstream PR, **credit the upstream author** in the body with a link. We want abasiri to see we're not stealing.
-5. **When the PR is ready to merge** (internal review loop converged to zero findings, or an external PR judged mergeable after review), **request the maintainer account `devsuitup` as reviewer**: `gh api -X POST repos/devsuitup/switchboard/pulls/<n>/requested_reviewers -f 'reviewers[]=devsuitup'`. The maintainer's review queue is the single list of what awaits approval — a ready PR that never requests review sits invisible.
+1. **Comment sweep.** Writing comments while coding is fine, but a second pass
+   must remove them before the PR: rationale, measurements, and design notes go
+   to context engineering (`.ai/contexts/*.md`) or an ADR (`docs/decisions/`),
+   never in the code. What may remain in code: at most a one-line pointer to
+   that doc (e.g. `// see .ai/contexts/subagent-observability.md`), and that's
+   the ceiling (maintainer rule, PRs #127/#130).
+2. `task check` (lint + test). 0 errors. Pre-existing warnings are fine.
+3. Squash to clear commits. No `Co-Authored-By`. Imperative subject, brief why-body.
+4. `gh pr create` against `devsuitup/switchboard:main` (the fork's main, not upstream's). Title format: `(area): short imperative`.
+5. If the change is a port of an upstream PR, **credit the upstream author** in the body with a link. We want abasiri to see we're not stealing.
+6. **When the PR is ready to merge** (internal review loop converged to zero findings, or an external PR judged mergeable after review), **request the maintainer account `devsuitup` as reviewer**: `gh api -X POST repos/devsuitup/switchboard/pulls/<n>/requested_reviewers -f 'reviewers[]=devsuitup'`. The maintainer's review queue is the single list of what awaits approval — a ready PR that never requests review sits invisible.
 
 ## Upstreaming work
 

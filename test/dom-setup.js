@@ -44,9 +44,18 @@ function setupSidebarDom() {
   const { window } = dom;
 
   // Stub Electron preload bridge — every IPC call resolves to a sensible
-  // default so user-event handlers don't throw when invoked.
-  window.api = new Proxy({}, {
-    get(_t, _prop) {
+  // default so user-event handlers don't throw when invoked. A couple of
+  // "onX" registrations are captured explicitly (rather than falling through
+  // to the generic stub below) so tests can simulate the main process firing
+  // that event — sidebar.js registers these listeners once at eval time via
+  // an IIFE, so we must capture the callback before the module evaluates.
+  const apiTarget = {
+    onSubagentSpawned: (cb) => { apiTarget._subagentSpawnedCb = cb; },
+    onSubagentCompleted: (cb) => { apiTarget._subagentCompletedCb = cb; },
+  };
+  window.api = new Proxy(apiTarget, {
+    get(target, prop) {
+      if (prop in target) return target[prop];
       return () => Promise.resolve({ ok: true });
     },
   });
@@ -124,6 +133,15 @@ function setupSidebarDom() {
       buildSessionItem: window.buildSessionItem,
       buildSubagentItem: window.buildSubagentItem,
       folderId: window.folderId,
+    },
+    // Simulate the main process emitting subagent-spawned/subagent-completed
+    // (session-transitions.js) by invoking the callback sidebar.js registered
+    // via window.api.onSubagentSpawned/onSubagentCompleted at eval time.
+    emitSubagentSpawned(payload) {
+      if (typeof apiTarget._subagentSpawnedCb === 'function') apiTarget._subagentSpawnedCb(payload);
+    },
+    emitSubagentCompleted(payload) {
+      if (typeof apiTarget._subagentCompletedCb === 'function') apiTarget._subagentCompletedCb(payload);
     },
     destroy() {
       window.close();

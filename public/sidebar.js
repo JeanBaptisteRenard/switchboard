@@ -63,11 +63,83 @@ function subagentTypeColor(type) {
   return SUBAGENT_TYPE_COLORS[key] || SUBAGENT_TYPE_COLORS.default;
 }
 
+// --- Live subagent tracking — see .ai/contexts/subagent-observability.md ---
+const activeSubagentsByParent = new Map();
+const SUBAGENT_LIVE_TTL_MS = 60000;
+
+function isSubagentActive(parentSessionId, agentId) {
+  const map = activeSubagentsByParent.get(parentSessionId);
+  return !!map && map.has(agentId);
+}
+
+function parentHasActiveSubagent(parentSessionId) {
+  const map = activeSubagentsByParent.get(parentSessionId);
+  return !!map && map.size > 0;
+}
+
+function pruneStaleSubagents() {
+  const cutoff = Date.now() - SUBAGENT_LIVE_TTL_MS;
+  for (const [parentId, map] of activeSubagentsByParent) {
+    for (const [agentId, spawnedAt] of map) {
+      if (spawnedAt < cutoff) map.delete(agentId);
+    }
+    if (map.size === 0) activeSubagentsByParent.delete(parentId);
+  }
+}
+
+function caretIdFor(parentSessionId) {
+  return 'sub-caret-' + parentSessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function subagentDomId(parentSessionId, agentId) {
+  return 'si-sub:' + parentSessionId + ':' + agentId;
+}
+
+function reflectSubagentRunningState(parentSessionId, agentId) {
+  const running = isSubagentActive(parentSessionId, agentId);
+  const el = document.getElementById(subagentDomId(parentSessionId, agentId));
+  if (el) {
+    el.classList.toggle('running', running);
+    const dot = el.querySelector('.session-status-dot');
+    if (dot) dot.classList.toggle('running', running);
+  }
+  const caret = document.getElementById(caretIdFor(parentSessionId));
+  if (caret) caret.classList.toggle('has-running-child', parentHasActiveSubagent(parentSessionId));
+}
+
+(function initSubagentLiveListeners() {
+  if (!window.api) return; // guard for test/non-Electron contexts without preload
+
+  if (typeof window.api.onSubagentSpawned === 'function') {
+    window.api.onSubagentSpawned((payload) => {
+      const { parentSessionId, agentId } = payload || {};
+      if (!parentSessionId || !agentId) return;
+      if (!activeSubagentsByParent.has(parentSessionId)) activeSubagentsByParent.set(parentSessionId, new Map());
+      activeSubagentsByParent.get(parentSessionId).set(agentId, Date.now());
+      reflectSubagentRunningState(parentSessionId, agentId);
+    });
+  }
+
+  if (typeof window.api.onSubagentCompleted === 'function') {
+    window.api.onSubagentCompleted((payload) => {
+      const { parentSessionId, agentId } = payload || {};
+      if (!parentSessionId || !agentId) return;
+      const map = activeSubagentsByParent.get(parentSessionId);
+      if (map) {
+        map.delete(agentId);
+        if (map.size === 0) activeSubagentsByParent.delete(parentSessionId);
+      }
+      reflectSubagentRunningState(parentSessionId, agentId);
+    });
+  }
+})();
+
 function buildSubagentItem(session) {
   const item = document.createElement('div');
   item.className = 'sidebar-subagent session-item js-stateful';
   item.id = 'si-' + session.sessionId;
-  if (activePtyIds.has(session.sessionId)) item.classList.add('has-running-pty');
+  const isRunning = isSubagentActive(session.parentSessionId, session.agentId);
+  if (isRunning) item.classList.add('running');
   if (attentionSessions.has(session.sessionId)) item.classList.add('needs-attention');
   if (responseReadySessions.has(session.sessionId)) item.classList.add('response-ready');
   if (sessionBusyState.get(session.sessionId)) item.classList.add('cli-busy');
@@ -87,7 +159,7 @@ function buildSubagentItem(session) {
   typePill.style.borderColor = border;
 
   const dot = document.createElement('span');
-  dot.className = 'session-status-dot' + (activePtyIds.has(session.sessionId) ? ' running' : '');
+  dot.className = 'session-status-dot' + (isRunning ? ' running' : '');
 
   const info = document.createElement('div');
   info.className = 'session-info';
@@ -205,6 +277,7 @@ function buildSlugGroup(slug, sessions) {
 }
 
 function renderProjects(projects, resort) {
+  pruneStaleSubagents();
   const newSidebar = document.createElement('div');
 
   // Sort project groups using sortedOrder as source of truth
@@ -356,15 +429,15 @@ function renderProjects(projects, resort) {
     if (!children || children.length === 0) return;
 
     const expandedSet = getExpandedSubagents();
-    const caretId = 'sub-caret-' + parentSessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const caretId = caretIdFor(parentSessionId);
     const isExpanded = expandedSet.has(parentSessionId);
 
-    // Caret/toggle row attached to parent item
     const caret = document.createElement('div');
     caret.className = 'sidebar-children-caret js-stateful';
     caret.id = caretId;
     if (isExpanded) caret.classList.add('expanded');
-    caret.innerHTML = `<span class="caret-arrow">&#9654;</span> ${children.length} subagent${children.length !== 1 ? 's' : ''}`;
+    if (parentHasActiveSubagent(parentSessionId)) caret.classList.add('has-running-child');
+    caret.innerHTML = `<span class="caret-arrow">&#9654;</span> ${children.length} subagent${children.length !== 1 ? 's' : ''}<span class="caret-running-dot"></span>`;
 
     const childrenContainer = document.createElement('div');
     childrenContainer.className = 'sidebar-subagents-container js-stateful';

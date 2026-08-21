@@ -798,6 +798,8 @@ function updateRunningIndicators() {
     // Each call hits every .session-item and every .slug-group in the sidebar
     // which can be expensive on large projects; skip when nothing moved.
     document.querySelectorAll('.session-item').forEach(item => {
+      // Subagents have no PTY — see .ai/contexts/subagent-observability.md
+      if (item.dataset.subagent) return;
       const id = item.dataset.sessionId;
       const running = activePtyIds.has(id);
       item.classList.toggle('has-running-pty', running);
