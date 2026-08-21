@@ -63,27 +63,7 @@ function subagentTypeColor(type) {
   return SUBAGENT_TYPE_COLORS[key] || SUBAGENT_TYPE_COLORS.default;
 }
 
-// --- Live subagent tracking ---
-// A subagent runs inside its parent's process and never owns a PTY, so
-// activePtyIds.has(session.sessionId) is structurally always false for it
-// (the bug this section fixes — see issue #129). The real liveness signal is
-// the subagent-spawned/subagent-completed IPC pair emitted by
-// session-transitions.js:detectSubagentTransitions() — already consumed by
-// grid-view.js (`activeSubagents`) and jsonl-viewer.js (`liveSubagents`).
-//
-// parentSessionId → Map<agentId, spawnedAt (ms)> currently
-// spawned-but-not-completed. buildSubagentItem() and appendSubagentChildren()
-// re-derive `.running` from this Map on every render (renderProjects →
-// morphdom), so the state survives a full sidebar rebuild — the IPC handlers
-// below only fast-path the visual toggle for the window before the next
-// rebuild lands.
-//
-// detectSubagentTransitions() (session-transitions.js) only polls subagents
-// of sessions that are still !exited — once a parent's PTY exits, a subagent
-// that hadn't yet gone 30s quiet never gets its matching subagent-completed
-// event, so without a TTL this entry (and the resulting .running /
-// has-running-child badge) would be stuck forever. pruneStaleSubagents()
-// mirrors grid-view.js's own 60s TTL for the same IPC pair.
+// --- Live subagent tracking — see .ai/contexts/subagent-observability.md ---
 const activeSubagentsByParent = new Map();
 const SUBAGENT_LIVE_TTL_MS = 60000;
 
@@ -97,8 +77,6 @@ function parentHasActiveSubagent(parentSessionId) {
   return !!map && map.size > 0;
 }
 
-// Called at the top of every renderProjects() — a render-time prune, not a
-// standalone poll timer (ADR 0002: no added steady-state cost).
 function pruneStaleSubagents() {
   const cutoff = Date.now() - SUBAGENT_LIVE_TTL_MS;
   for (const [parentId, map] of activeSubagentsByParent) {
@@ -113,16 +91,10 @@ function caretIdFor(parentSessionId) {
   return 'sub-caret-' + parentSessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
-// Mirrors subagentSessionId() in read-session-file.js (main process; not
-// require()-able from the renderer, which loads sidebar.js as a plain script).
 function subagentDomId(parentSessionId, agentId) {
   return 'si-sub:' + parentSessionId + ':' + agentId;
 }
 
-// Fast-path DOM toggle for whatever is on screen right now. buildSubagentItem
-// and appendSubagentChildren re-derive the same state from
-// activeSubagentsByParent on the next rebuild regardless, so this is purely
-// for responsiveness between rebuilds.
 function reflectSubagentRunningState(parentSessionId, agentId) {
   const running = isSubagentActive(parentSessionId, agentId);
   const el = document.getElementById(subagentDomId(parentSessionId, agentId));
@@ -460,10 +432,6 @@ function renderProjects(projects, resort) {
     const caretId = caretIdFor(parentSessionId);
     const isExpanded = expandedSet.has(parentSessionId);
 
-    // Caret/toggle row attached to parent item. When collapsed, a running
-    // child subagent is otherwise invisible (its own .running dot is hidden
-    // inside childrenContainer) — has-running-child + .caret-running-dot
-    // surface that at the caret level instead (see style.css).
     const caret = document.createElement('div');
     caret.className = 'sidebar-children-caret js-stateful';
     caret.id = caretId;

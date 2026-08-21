@@ -52,6 +52,38 @@ This is the **#1 fork-specific feature** (upstream PR #47 still pending). It per
 - **Subagent status badges**: derived from the most recent JSONL line — `isSidechain: true` means active, completion is inferred from mtime stability (see PR #48 observability follow-up).
 - **The "Resume in terminal anyway" button** in the transcript view bypasses the routing and calls the original `openSession` opener. This is intentional — for the rare debugging case where a user genuinely wants to re-enter the subagent's session.
 
+## Live "running" indicator in the sidebar (PR #130, fixes #129)
+
+- **Why `activePtyIds` can't work for subagents**: a subagent runs inside its
+  parent's process and never owns a PTY, so `activePtyIds.has(sessionId)` is
+  structurally always false for it. The real liveness signal is the
+  `subagent-spawned` / `subagent-completed` IPC pair emitted by
+  `session-transitions.js:detectSubagentTransitions()` (also consumed by
+  `grid-view.js` and `jsonl-viewer.js`).
+- **State**: `activeSubagentsByParent` in `public/sidebar.js` —
+  `parentSessionId → Map<agentId, spawnedAt(ms)>` of spawned-but-not-completed
+  subagents. `buildSubagentItem()` / `appendSubagentChildren()` re-derive
+  `.running` from this Map on every render, so the state survives a full
+  sidebar rebuild; the IPC handlers only fast-path the visual toggle between
+  rebuilds (`reflectSubagentRunningState`).
+- **Why a TTL** (`SUBAGENT_LIVE_TTL_MS` = 60s, mirroring grid-view's):
+  `detectSubagentTransitions()` only polls subagents of `!exited` sessions —
+  if the parent's PTY dies before a subagent goes 30s quiet, the matching
+  `subagent-completed` never fires and the entry would be stuck forever.
+  `pruneStaleSubagents()` runs at the top of every `renderProjects()` — a
+  render-time prune, not a standalone timer (ADR 0002: no added steady-state
+  cost).
+- **Collapsed parents**: a running child's own dot is hidden inside the
+  collapsed `childrenContainer`, so `appendSubagentChildren` also toggles
+  `has-running-child` on the caret row (`.caret-running-dot` in style.css) to
+  surface liveness at the caret level.
+- **The `updateRunningIndicators` guard** (`public/app.js`): the periodic PTY
+  poll must skip `dataset.subagent` items, or it would clear the `.running`
+  state within one cycle of the IPC setting it.
+- **`subagentDomId()`** mirrors `subagentSessionId()` in
+  `read-session-file.js` — that file is main-process and not `require()`-able
+  from the renderer (sidebar.js loads as a plain script), hence the local copy.
+
 ## If you change this, also check
 
 - `eslint.config.js` `rendererCrossFileGlobals` — must list any new renderer-global functions (e.g. `showSubagentTranscript`, `drainViewerWatches`) or lint fails on `no-undef`

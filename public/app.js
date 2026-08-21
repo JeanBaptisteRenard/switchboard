@@ -798,11 +798,7 @@ function updateRunningIndicators() {
     // Each call hits every .session-item and every .slug-group in the sidebar
     // which can be expensive on large projects; skip when nothing moved.
     document.querySelectorAll('.session-item').forEach(item => {
-      // Subagents never own a PTY (dataset.subagent, set by sidebar.js's
-      // buildSubagentItem) — their .running state comes from the
-      // subagent-spawned/completed IPC pair (activeSubagentsByParent in
-      // sidebar.js), not activePtyIds. Without this guard, every poll here
-      // would immediately clear the dot this fix just set (issue #129).
+      // Subagents have no PTY — see .ai/contexts/subagent-observability.md
       if (item.dataset.subagent) return;
       const id = item.dataset.sessionId;
       const running = activePtyIds.has(id);
