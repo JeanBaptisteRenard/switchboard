@@ -13,7 +13,7 @@ Switchboard is an **Electron desktop app**: renderer + main-process, no Domain/A
 | Change SQLite, indexing, watcher, FTS, heatmap | [contexts/session-cache.md](contexts/session-cache.md) |
 | Change schedule cron / `.md` files / schedule spawn | [contexts/schedule-runner.md](contexts/schedule-runner.md) |
 | Change subagent grouping, transcript view, parent→child | [contexts/subagent-observability.md](contexts/subagent-observability.md) |
-| Change Plans/Memory/.work-files panels (CodeMirror) | [contexts/viewer-panel.md](contexts/viewer-panel.md) |
+| Change Memory/.work-files panels (CodeMirror) | [contexts/viewer-panel.md](contexts/viewer-panel.md) |
 | Change the renderer (sidebar, terminal, app.js) | `public/*.js` — entry is `app.js` |
 | Write a test | `test/*.test.js` — node:test + jsdom for renderer files |
 | Working practices for AI agents (HANDOFF format, shell pitfalls, review loop) | [agent-practices.md](agent-practices.md) |

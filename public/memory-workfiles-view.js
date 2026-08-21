@@ -1,6 +1,6 @@
 // --- Memory & Work Files viewers ---
 // Depends on globals: memoryContent, memoryPanel, memoryViewer, placeholder,
-// terminalArea, statsViewer, settingsViewer, jsonlViewer (app.js)
+// terminalArea, statsViewer, settingsViewer, jsonlViewer, workFilesViewer (app.js)
 // Depends on: formatDate (utils.js)
 
 let cachedMemoryData = { global: { files: [] }, projects: [] };

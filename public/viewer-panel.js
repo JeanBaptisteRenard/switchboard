@@ -1,7 +1,7 @@
 /**
  * viewer-panel.js — Unified viewer component for CodeMirror-based panels.
  *
- * A single component used by memory viewer and file panel.
+ * A single component used by memory viewer, work files viewer, and file panel.
  * Manages toolbar, editor, preview area, and all interactions.
  * Watches files for external changes and reloads automatically.
  *

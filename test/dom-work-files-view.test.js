@@ -1,6 +1,6 @@
-// Smoke tests for the Work Files tab renderer (plans-memory-view.js work-files section).
+// Smoke tests for the Work Files tab renderer (memory-workfiles-view.js work-files section).
 //
-// Strategy: load icons.js + utils.js + plans-memory-view.js into a jsdom window
+// Strategy: load icons.js + utils.js + memory-workfiles-view.js into a jsdom window
 // that stubs the minimal globals those scripts need (DOM refs, window.api).
 // Then call loadWorkFiles / renderWorkFiles / openWorkFile and assert the
 // resulting DOM matches expectations.
@@ -14,7 +14,7 @@ const { JSDOM } = require('jsdom');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 
-// Minimal HTML that plans-memory-view.js references via globals set in app.js.
+// Minimal HTML that memory-workfiles-view.js references via globals set in app.js.
 const INDEX_HTML = `<!DOCTYPE html>
 <html>
   <body>
@@ -36,7 +36,7 @@ function evalInWindow(dom, file) {
   vm.runInContext(src, dom.getInternalVMContext(), { filename: file });
 }
 
-// A minimal ViewerPanel stub — plans-memory-view.js calls workFilesPanel.open(...)
+// A minimal ViewerPanel stub — memory-workfiles-view.js calls workFilesPanel.open(...)
 function makeViewerPanelStub() {
   return { open: () => {}, close: () => {} };
 }
@@ -50,7 +50,7 @@ function setupWorkFilesDom() {
   const { window } = dom;
 
   // jsdom doesn't expose CSS.escape — polyfill it.
-  // plans-memory-view.js uses CSS.escape() in openMemory / openWorkFile.
+  // memory-workfiles-view.js uses CSS.escape() in openMemory / openWorkFile.
   if (!window.CSS) {
     Object.defineProperty(window, 'CSS', {
       value: {
@@ -69,7 +69,7 @@ function setupWorkFilesDom() {
     runScheduleNow: () => Promise.resolve({ ok: true }),
   };
 
-  // DOM handles that plans-memory-view.js reads as globals (set by app.js normally)
+  // DOM handles that memory-workfiles-view.js reads as globals (set by app.js normally)
   const stubGlobals = {
     memoryContent:     window.document.getElementById('memory-content'),
     workFilesContent:  window.document.getElementById('work-files-content'),
@@ -94,7 +94,7 @@ function setupWorkFilesDom() {
   // Load dependencies
   evalInWindow(dom, path.join(PUBLIC_DIR, 'utils.js'));
   evalInWindow(dom, path.join(PUBLIC_DIR, 'icons.js'));
-  evalInWindow(dom, path.join(PUBLIC_DIR, 'plans-memory-view.js'));
+  evalInWindow(dom, path.join(PUBLIC_DIR, 'memory-workfiles-view.js'));
 
   return {
     window,

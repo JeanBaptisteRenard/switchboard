@@ -61,7 +61,7 @@ cli:
 ## If you change this, also check
 
 - `public/dialogs.js` (`launchScheduleCreator`) — UI entry point for the schedule creator flow
-- `public/plans-memory-view.js` brain tab — lists existing `schedule-*.md` files, surfaces the "run now" play button
+- `public/memory-workfiles-view.js` brain tab — lists existing `schedule-*.md` files, surfaces the "run now" play button
 - `public/sidebar.js` — `.project-schedule-btn` clock icon wiring per project
 - `schedule-ipc.js` `SCHEDULE_CREATOR_TEMPLATE` — if you change the schedule file format, update the template's instructions
 - `main.js:1618` (or wherever `startScheduler(log, runScheduleCommand)` is invoked at app boot)

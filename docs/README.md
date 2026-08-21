@@ -14,7 +14,7 @@ This is the documentation for the [devsuitup/switchboard](https://github.com/dev
 - [Session Restore](session-restore.md) — persist open sessions and restore them on restart
 - [Keyboard Shortcuts](keyboard-shortcuts.md) — editor/terminal shortcuts and rebindable session-nav keys
 - [Notifications](notifications.md) — sidebar status badges: waiting for input, permission approval, activity
-- [Memory and Work Files](plans-memory-workfiles.md) — edit CLAUDE.md and `.work-files/` in CodeMirror panels
+- [Memory and Work Files](memory-workfiles.md) — edit CLAUDE.md and `.work-files/` in CodeMirror panels
 - [Activity Stats](activity-stats.md) — coding activity heatmap
 - [Settings Reference](settings.md) — every field in Global and Project Settings
 - [Automation](automation.md) — scheduled Claude tasks (cron) and the file-based trigger API

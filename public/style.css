@@ -1902,7 +1902,7 @@ body { display: flex; flex-direction: column; }
   font-size: 13px;
 }
 
-/* Shared viewer toolbar (memory, file panel) */
+/* Shared viewer toolbar (memory, work files, file panel) */
 .viewer-toolbar {
   display: flex;
   align-items: center;
@@ -1970,7 +1970,7 @@ body { display: flex; flex-direction: column; }
   background: rgba(120,130,255,0.1);
 }
 
-/* Plan CodeMirror editor */
+/* Viewer panel CodeMirror editor */
 .viewer-panel-editor {
   flex: 1;
   overflow: hidden;

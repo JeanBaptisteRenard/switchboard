@@ -267,3 +267,17 @@ test('search: "  a  " (1 trimmed char) does NOT call api.search and preserves in
   assert.equal(inputEl.value, '  a  ', 'input value must be preserved (not cleared)');
 });
 
+// ---------------------------------------------------------------------------
+// Cross-tab: non-sessions tabs route correctly under 3-char threshold
+// ---------------------------------------------------------------------------
+
+test('search: 2-char query on memory tab calls renderMemories (not api.search)', async () => {
+  const { state, inputEl, runSearchQuery } = makeSearchState();
+  state.activeTab = 'memory';
+  inputEl.value = 'me';
+  let apiCalled = false;
+  await runSearchQuery(() => { apiCalled = true; });
+
+  assert.equal(apiCalled, false, 'api.search not called for 2-char on memory tab');
+  assert.equal(state.renderMemoriesCalls.length, 1, 'renderMemories called to show unfiltered list');
+});

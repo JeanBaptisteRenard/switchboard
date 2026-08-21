@@ -131,7 +131,7 @@ function setupDom({ readSubagentJsonlResult = { entries: SAMPLE_ENTRIES }, readS
     loadProjects: () => {},
     launchScheduleCreator: () => {},
     setActiveSession: () => {},
-    // hideAllViewers is defined in plans-memory-view.js in the real app; stub it here.
+    // hideAllViewers is defined in memory-workfiles-view.js in the real app; stub it here.
     hideAllViewers: () => {},
     // openSession is stubbed after eval; we pre-stub it so it's present during eval
     openSession: () => {},
