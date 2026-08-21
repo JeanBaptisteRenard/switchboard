@@ -124,6 +124,10 @@ const {
   DB_PATH,
 } = require('./db');
 
+// One-shot cleanup: the Plans tab was removed, so nothing indexes or clears
+// FTS rows of type 'plan' anymore. Purge any left behind by earlier versions.
+try { deleteSearchType('plan'); } catch {}
+
 // --- Search query worker ---
 // Routes 'search' IPC off the main thread so that a slow FTS5 phrase query
 // (e.g. a 60-char pasted URL) never blocks the Electron event loop.
@@ -159,7 +163,6 @@ searchClient.startWorker();
 const searchViaWorker = searchClient.searchViaWorker;
 
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
-const PLANS_DIR = path.join(os.homedir(), '.claude', 'plans');
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const STATS_CACHE_PATH = path.join(CLAUDE_DIR, 'stats-cache.json');
 // MAX_BUFFER_SIZE imported from output-buffer.js (single source of truth)
@@ -169,7 +172,7 @@ const activeSessions = new Map();
 let mainWindow = null;
 
 // Wrapper that plumbs the set of known project roots into isAllowedMemoryPath.
-// The Plans/Memory panel (get-memories) surfaces CLAUDE.md / agents.md and
+// The Memory panel (get-memories) surfaces CLAUDE.md / agents.md and
 // .claude/*.md from EVERY indexed project — not just ones with a live session —
 // so the allowlist must cover every known project root, otherwise reading a
 // memory file for a project without an open session would be rejected.
@@ -837,70 +840,6 @@ ipcMain.handle('get-projects', async (_event, showArchived) => {
   }
 });
 
-// --- IPC: get-plans ---
-ipcMain.handle('get-plans', () => {
-  try {
-    if (!fs.existsSync(PLANS_DIR)) return [];
-    const files = fs.readdirSync(PLANS_DIR).filter(f => f.endsWith('.md'));
-    const plans = [];
-    for (const file of files) {
-      const filePath = path.join(PLANS_DIR, file);
-      try {
-        const stat = fs.statSync(filePath);
-        const content = fs.readFileSync(filePath, 'utf8');
-        const firstLine = content.split('\n').find(l => l.trim());
-        const title = firstLine && firstLine.startsWith('# ')
-          ? firstLine.slice(2).trim()
-          : file.replace(/\.md$/, '');
-        plans.push({ filename: file, title, modified: stat.mtime.toISOString() });
-      } catch {}
-    }
-    plans.sort((a, b) => new Date(b.modified) - new Date(a.modified));
-
-    // Index plans for FTS
-    try {
-      deleteSearchType('plan');
-      upsertSearchEntries(plans.map(p => ({
-        id: p.filename, type: 'plan', folder: null,
-        title: p.title,
-        body: fs.readFileSync(path.join(PLANS_DIR, p.filename), 'utf8'),
-      })));
-    } catch {}
-
-    return plans;
-  } catch (err) {
-    console.error('Error reading plans:', err);
-    return [];
-  }
-});
-
-// --- IPC: read-plan ---
-ipcMain.handle('read-plan', (_event, filename) => {
-  try {
-    const filePath = path.join(PLANS_DIR, path.basename(filename));
-    const content = fs.readFileSync(filePath, 'utf8');
-    return { content, filePath };
-  } catch (err) {
-    console.error('Error reading plan:', err);
-    return { content: '', filePath: '' };
-  }
-});
-
-// --- IPC: save-plan ---
-ipcMain.handle('save-plan', (_event, filePath, content) => {
-  try {
-    const resolved = path.resolve(filePath);
-    if (!resolved.startsWith(PLANS_DIR)) {
-      return { ok: false, error: 'path outside plans directory' };
-    }
-    fs.writeFileSync(resolved, content, 'utf8');
-    return { ok: true };
-  } catch (err) {
-    console.error('Error saving plan:', err);
-    return { ok: false, error: err.message };
-  }
-});
-
 // --- IPC: get-stats ---
 ipcMain.handle('get-stats', () => {
   try {
@@ -1013,7 +952,7 @@ function computeIndexSignature(files) {
 /**
  * Returns true when the file set for the given FTS type has changed since
  * the last reindex (or was never indexed), and updates the stored signature.
- * @param {string} type - FTS type key ('memory' | 'work-file' | 'plan')
+ * @param {string} type - FTS type key ('memory' | 'work-file')
  * @param {string} sig  - result of computeIndexSignature()
  * @returns {boolean}
  */

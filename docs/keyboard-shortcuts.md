@@ -8,7 +8,7 @@ These shortcuts are built-in and not rebindable:
 |----------|--------|
 | `Cmd+F` / `Ctrl+F` | Find in file (also works in terminal) |
 | `Cmd+G` / `Ctrl+G` | Go to line (editor) / next match (terminal find) |
-| `Cmd+S` / `Ctrl+S` | Save current file (in Plans / Memory / Work Files panels) |
+| `Cmd+S` / `Ctrl+S` | Save current file (in Memory / Work Files panels) |
 | `Shift+Enter` | Insert literal newline in terminal without submitting |
 
 ## Rebindable session-navigation shortcuts

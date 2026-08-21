@@ -4,7 +4,6 @@ const indexingBanner = document.getElementById('indexing-banner');
 const indexingBannerText = document.getElementById('indexing-banner-text');
 const terminalsEl = document.getElementById('terminals');
 const sidebarContent = document.getElementById('sidebar-content');
-const plansContent = document.getElementById('plans-content');
 const placeholder = document.getElementById('placeholder');
 const archiveToggle = document.getElementById('archive-toggle');
 const starToggle = document.getElementById('star-toggle');
@@ -21,14 +20,6 @@ function setSessionSandboxed(sessionId, on) { sandboxedSessions.set(sessionId, !
 const terminalStopBtn = document.getElementById('terminal-stop-btn');
 const runningToggle = document.getElementById('running-toggle');
 const todayToggle = document.getElementById('today-toggle');
-const planViewer = document.getElementById('plan-viewer');
-const planPanel = new ViewerPanel(planViewer, {
-  copyPath: true, copyContent: true,
-  language: 'markdown', storageKey: 'markdownPreviewMode',
-  onSave: (filePath, content) => window.api.savePlan(filePath, content),
-});
-
-// currentPlanContent, currentPlanFilePath, currentPlanFilename → plans-memory-view.js
 const loadingStatus = document.getElementById('loading-status');
 const sessionFilters = document.getElementById('session-filters');
 const searchBar = document.getElementById('search-bar');
@@ -105,7 +96,6 @@ let cachedAllProjects = [];
 let activePtyIds = new Set();
 let sortedOrder = []; // [{ projectPath, itemIds: [itemId, ...] }, ...] — single source of truth for sidebar order
 let activeTab = 'sessions';
-let cachedPlans = [];
 let visibleSessionCount = 10;
 let sessionMaxAgeDays = 3;
 const pendingSessions = new Map(); // sessionId → { session, projectPath, folder }
@@ -596,8 +586,6 @@ function clearSearch() {
     // Cancel any pending clear-render frame so rapid clears only trigger one rebuild.
     if (clearRenderRaf) cancelAnimationFrame(clearRenderRaf);
     clearRenderRaf = requestAnimationFrame(() => { clearRenderRaf = null; refreshSidebar({ resort: true }); });
-  } else if (activeTab === 'plans') {
-    renderPlans(cachedPlans);
   } else if (activeTab === 'memory') {
     renderMemories();
   } else if (activeTab === 'work-files') {
@@ -620,8 +608,6 @@ function resetSearchFilter() {
     // boundary crossings (e.g. typing 3→2→1 chars before a frame fires).
     if (clearRenderRaf) cancelAnimationFrame(clearRenderRaf);
     clearRenderRaf = requestAnimationFrame(() => { clearRenderRaf = null; refreshSidebar({ resort: true }); });
-  } else if (activeTab === 'plans') {
-    renderPlans(cachedPlans);
   } else if (activeTab === 'memory') {
     renderMemories();
   } else if (activeTab === 'work-files') {
@@ -666,10 +652,6 @@ async function runSearchQuery() {
         }
       }
       refreshSidebar({ resort: true });
-    } else if (activeTab === 'plans') {
-      const results = await window.api.search('plan', query, searchTitlesOnly);
-      const matchIds = new Set(results.map(r => r.id));
-      renderPlans(cachedPlans.filter(p => matchIds.has(p.filename)));
     } else if (activeTab === 'memory') {
       const results = await window.api.search('memory', query, searchTitlesOnly);
       const matchIds = new Set(results.map(r => r.id));
@@ -1110,7 +1092,6 @@ document.querySelectorAll('.sidebar-tab').forEach(tab => {
 
     // Hide all sidebar content areas
     sidebarContent.style.display = 'none';
-    plansContent.style.display = 'none';
     statsContent.style.display = 'none';
     memoryContent.style.display = 'none';
     workFilesContent.style.display = 'none';
@@ -1142,17 +1123,11 @@ document.querySelectorAll('.sidebar-tab').forEach(tab => {
         projectsChangedWhileAway = false;
         loadProjects();
       }
-    } else if (tabName === 'plans') {
-      searchBar.style.display = '';
-      searchInput.placeholder = 'Search plans...';
-      plansContent.style.display = '';
-      loadPlans();
     } else if (tabName === 'stats') {
       statsContent.style.display = '';
       // Immediately show stats viewer in main area
       placeholder.style.display = 'none';
       terminalArea.style.display = 'none';
-      planViewer.style.display = 'none';
       memoryViewer.style.display = 'none';
       settingsViewer.style.display = 'none';
       statsViewer.style.display = 'flex';

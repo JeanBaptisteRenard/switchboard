@@ -1,24 +1,18 @@
-# Plans, Memory, and Work Files
+# Memory and Work Files
 
-Three sidebar tabs give you access to the markdown and structured files that Claude Code reads and writes as part of its workflow. All three open in an embedded CodeMirror editor panel.
+Two sidebar tabs give you access to the markdown and structured files that Claude Code reads and writes as part of its workflow. Both open in an embedded CodeMirror editor panel.
 
-## Plans
+## Memory (CLAUDE.md)
 
-The **Plans** tab lists the plan files from `~/.claude/plans/`. These are markdown files Claude uses to track multi-step work.
+The **Memory** tab shows your `CLAUDE.md` files — the global one at `~/.claude/CLAUDE.md` and any per-project ones found in your indexed projects. These files contain persistent instructions Claude reads at the start of every session.
 
-Click a plan file to open it in the editor panel. You can read, edit, and save changes directly from Switchboard. The editor supports:
+Click a memory file to open it in the editor panel. The editor supports:
 
 - Syntax highlighting for Markdown
 - A markdown preview toggle (render the document as formatted HTML)
 - Copy path and copy content buttons
 - `Cmd+S` / `Ctrl+S` to save
 - Word-wrap toggle
-
-## Memory (CLAUDE.md)
-
-The **Memory** tab shows your `CLAUDE.md` files — the global one at `~/.claude/CLAUDE.md` and any per-project ones found in your indexed projects. These files contain persistent instructions Claude reads at the start of every session.
-
-Click a memory file to open it in the editor panel. Editing and saving works the same as Plans.
 
 ## Work Files (`.work-files/`)
 

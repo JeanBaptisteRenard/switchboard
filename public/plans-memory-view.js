@@ -1,98 +1,14 @@
-// --- Plans & Memory viewers ---
-// Depends on globals: cachedPlans, plansContent, planPanel, planViewer,
-// memoryContent, memoryPanel, memoryViewer, placeholder, terminalArea,
-// statsViewer, settingsViewer, jsonlViewer (app.js)
+// --- Memory & Work Files viewers ---
+// Depends on globals: memoryContent, memoryPanel, memoryViewer, placeholder,
+// terminalArea, statsViewer, settingsViewer, jsonlViewer (app.js)
 // Depends on: formatDate (utils.js)
 
-let currentPlanContent = "";
-let currentPlanFilePath = "";
-let currentPlanFilename = "";
 let cachedMemoryData = { global: { files: [] }, projects: [] };
 let currentMemoryFilePath = null;
 let currentMemoryContent = "";
 const memoryCollapsedState = new Map();
 
-// --- Plans ---
-async function loadPlans() {
-  cachedPlans = await window.api.getPlans();
-  renderPlans();
-}
-
-function renderPlans(plans) {
-  plans = plans || cachedPlans;
-  plansContent.innerHTML = '';
-  if (plans.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'plans-empty';
-    empty.textContent = 'No plans found in ~/.claude/plans/';
-    plansContent.appendChild(empty);
-    return;
-  }
-  for (const plan of plans) {
-    plansContent.appendChild(buildPlanItem(plan));
-  }
-}
-
-function buildPlanItem(plan) {
-  const item = document.createElement('div');
-  item.className = 'session-item plan-item';
-
-  const row = document.createElement('div');
-  row.className = 'session-row';
-
-  const info = document.createElement('div');
-  info.className = 'session-info';
-
-  const titleEl = document.createElement('div');
-  titleEl.className = 'session-summary';
-  titleEl.textContent = plan.title;
-
-  const filenameEl = document.createElement('div');
-  filenameEl.className = 'session-id';
-  filenameEl.textContent = plan.filename;
-
-  const metaEl = document.createElement('div');
-  metaEl.className = 'session-meta';
-  metaEl.textContent = formatDate(new Date(plan.modified));
-
-  info.appendChild(titleEl);
-  info.appendChild(filenameEl);
-  info.appendChild(metaEl);
-  row.appendChild(info);
-  item.appendChild(row);
-
-  item.addEventListener('click', () => openPlan(plan));
-  return item;
-}
-
-async function openPlan(plan) {
-  // Mark active in sidebar
-  plansContent.querySelectorAll('.plan-item.active').forEach(el => el.classList.remove('active'));
-  const items = plansContent.querySelectorAll('.plan-item');
-  items.forEach(el => {
-    if (el.querySelector('.session-id')?.textContent === plan.filename) {
-      el.classList.add('active');
-    }
-  });
-
-  const result = await window.api.readPlan(plan.filename);
-  currentPlanContent = result.content;
-  currentPlanFilePath = result.filePath;
-  currentPlanFilename = plan.filename;
-
-  // Hide terminal area and placeholder, show plan viewer
-  placeholder.style.display = 'none';
-  terminalArea.style.display = 'none';
-  statsViewer.style.display = 'none';
-  memoryViewer.style.display = 'none';
-  settingsViewer.style.display = 'none';
-  planViewer.style.display = 'flex';
-
-  planPanel.open(plan.title, currentPlanFilePath, currentPlanContent);
-}
-
 function hideAllViewers() {
-  planViewer.style.display = 'none';
   statsViewer.style.display = 'none';
   memoryViewer.style.display = 'none';
   workFilesViewer.style.display = 'none';
@@ -104,10 +20,6 @@ function hideAllViewers() {
   // `drainViewerWatches` lives in jsonl-viewer.js; we reach it via window
   // because top-level function declarations in classic scripts attach there.
   if (typeof window.drainViewerWatches === 'function') window.drainViewerWatches();
-}
-
-function hidePlanViewer() {
-  hideAllViewers();
 }
 
 // --- Memory ---
@@ -276,7 +188,6 @@ async function openMemory(file) {
   // Show memory viewer in main area
   placeholder.style.display = 'none';
   terminalArea.style.display = 'none';
-  planViewer.style.display = 'none';
   statsViewer.style.display = 'none';
   settingsViewer.style.display = 'none';
   memoryViewer.style.display = 'flex';
@@ -428,7 +339,6 @@ async function openWorkFile(file) {
 
   placeholder.style.display = 'none';
   terminalArea.style.display = 'none';
-  planViewer.style.display = 'none';
   statsViewer.style.display = 'none';
   settingsViewer.style.display = 'none';
   memoryViewer.style.display = 'none';

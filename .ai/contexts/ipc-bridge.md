@@ -42,12 +42,10 @@ This file is the **canonical inventory** of the IPC surface. When you add a new 
 | `delete-worktree` | `(worktreePath)` | `git worktree remove` |
 | `worktree-status` | `(worktreePath)` | Dirty-file count |
 
-### Tabs (Plans / Memory / .work-files / Stats)
+### Tabs (Memory / .work-files / Stats)
 
 | IPC | Returns |
 |---|---|
-| `get-plans` | `Plan[]` (reads `~/.claude/plans/*.md`) |
-| `read-plan` / `save-plan` | content / `{ok}` |
 | `get-memories` | `{global, projects}` |
 | `read-memory` / `save-memory` | content / `{ok}` |
 | `get-work-files` | `{projects: WorkFilesProject[]}` — **dedupes by projectPath** since PR #15. Walks `<projectPath>/.work-files/` recursively, capped at 200 files per project. |
@@ -61,7 +59,7 @@ This file is the **canonical inventory** of the IPC surface. When you add a new 
 
 | IPC | Args | Returns |
 |---|---|---|
-| `search` | `(type, query, titleOnly)` | FTS5 result rows. `type ∈ {session, subagent, plan, memory, work-file, null}` |
+| `search` | `(type, query, titleOnly)` | FTS5 result rows. `type ∈ {session, subagent, memory, work-file, null}` |
 | `rebuild-cache` | — | Force a full re-index (heavy) |
 
 ### Settings

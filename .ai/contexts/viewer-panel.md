@@ -1,6 +1,6 @@
 # Context: viewer-panel
 
-**Purpose**: Reusable CodeMirror-based file viewer with a configurable toolbar. Used by **3 callsites** in `public/app.js`: `planPanel` (Plans tab), `memoryPanel` (Memory tab), `workFilesPanel` (.work-files tab). Optionally read-only or savable. Watches the file on disk and auto-reloads on external changes.
+**Purpose**: Reusable CodeMirror-based file viewer with a configurable toolbar. Used by **2 callsites** in `public/app.js`: `memoryPanel` (Memory tab), `workFilesPanel` (.work-files tab). Optionally read-only or savable. Watches the file on disk and auto-reloads on external changes.
 
 ## Key files
 
@@ -58,7 +58,7 @@ The toolbar factory builds all configured buttons up front; `open()` toggles vis
 
 ## Non-obvious behaviors
 
-- **Markdown preview mode is persisted per-storageKey** in `localStorage`. Plans + Memory share `'markdownPreviewMode'`; .work-files uses `'workFilesPreviewMode'`.
+- **Markdown preview mode is persisted per-storageKey** in `localStorage`. Memory uses `'markdownPreviewMode'`; .work-files uses `'workFilesPreviewMode'`.
 - **Line-wrap default depends on file type**: markdown wraps, code doesn't. Wrap state is NOT persisted — resets per file.
 - **`format` for `.jsonl` is intentionally non-standard**: each line is pretty-printed and joined with `\n---\n`. This produces human-readable output but is no longer valid JSON. The button is for *viewing*, not for converting files to a different format.
 - **Cmd/Ctrl+S keybinding**: CodeMirror dispatches a `cm-save` custom event which the ViewerPanel listens for. Chromium's "Save Page" default is blocked globally in `viewer-toolbar.js:230` (`keydown` listener with `preventDefault`).
@@ -66,7 +66,7 @@ The toolbar factory builds all configured buttons up front; `open()` toggles vis
 
 ## If you change this, also check
 
-- `public/app.js` panel constructors (3 callsites) — adding a new opt may need wiring there
+- `public/app.js` panel constructors (2 callsites) — adding a new opt may need wiring there
 - `eslint.config.js` if you expose a new cross-file global (e.g. `flashButtonText`, `toggleMarkdownPreview` are already declared)
 - `test/dom-work-files-view.test.js` — covers the panel render path for the .work-files tab
 - `public/file-panel.js` — has its own `fpViewerPanel = new ViewerPanel(...)` for the file-diff side panel; might need same opt

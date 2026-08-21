@@ -29,7 +29,7 @@ When the cron expression matches, Switchboard pre-seeds a new session with the p
 
 Click the **clock icon** on a project in the sidebar. This opens an interactive Claude session pre-loaded with a schedule-creator command: describe what you want scheduled, and Claude writes the `schedule-*.md` file for you. You can also write the file by hand — the scheduler rescans every minute, so changes take effect within 60 seconds, no restart needed.
 
-Existing schedules are listed in the project's brain tab (Plans/Memory panel), each with a **run now** button that fires it immediately, bypassing the cron match.
+Existing schedules are listed in the project's brain tab (Memory panel), each with a **run now** button that fires it immediately, bypassing the cron match.
 
 ### Behavior and limits
 
