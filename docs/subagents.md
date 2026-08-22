@@ -28,6 +28,8 @@ Because subagents are ephemeral, clicking one does **not** launch `claude --resu
 
 ## Live status
 
+In the sidebar, while at least one subagent is running, the parent session's status dot becomes a static violet ⠿ glyph — distinct from the light-blue braille spinner, which means the session *itself* is working. The session's own states (needs-attention, response-ready, cli-busy) take precedence; the glyph shows on a parent that is otherwise idle at the prompt, whether the subagent group is expanded or collapsed.
+
 The grid view shows active subagents as colored pills on the parent session's card. Each pill represents one running sub-agent, color-coded by type:
 
 | Type | Color |

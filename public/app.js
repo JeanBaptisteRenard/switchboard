@@ -786,10 +786,14 @@ function updateRunningIndicators() {
       const running = activePtyIds.has(id);
       item.classList.toggle('has-running-pty', running);
       if (!running) {
-        item.classList.remove('needs-attention', 'response-ready', 'cli-busy');
+        item.classList.remove('needs-attention', 'response-ready', 'cli-busy', 'has-busy-agents');
         attentionSessions.delete(id);
         responseReadySessions.delete(id);
         sessionBusyState.delete(id);
+        // A stopped PTY can never emit subagent-completed (stop-session kills
+        // the process; detectSubagentTransitions skips exited sessions), so
+        // drop the live-subagent state now instead of waiting for the TTL.
+        clearActiveSubagentsFor(id);
       }
       const dot = item.querySelector('.session-status-dot');
       if (dot) dot.classList.toggle('running', running);
