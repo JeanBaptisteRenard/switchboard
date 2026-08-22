@@ -111,6 +111,9 @@
   <script src="../node_modules/@xterm/addon-webgl/lib/addon-webgl.js"></script>
   <script src="../node_modules/morphdom/dist/morphdom-umd.js"></script>
   <script src="../node_modules/dompurify/dist/purify.min.js"></script>
+  <!-- activity-trace.js defines window.ATRACE / window.atrace, read by probe
+       sites in session-activity, sidebar and app — must load before them. -->
+  <script src="activity-trace.js"></script>
   <script src="icons.js"></script>
   <script src="viewer-toolbar.js"></script>
   <script src="viewer-panel.js"></script>

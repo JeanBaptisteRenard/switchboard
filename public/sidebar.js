@@ -89,6 +89,7 @@ function pruneStaleSubagents() {
     }
     if (map.size === 0) activeSubagentsByParent.delete(parentId);
   }
+  if (window.ATRACE) window.atrace('subagents.prune', null, { map: 'activeSubagentsByParent', cutoff, parents: activeSubagentsByParent.size, agents: [...activeSubagentsByParent.values()].reduce((n, m) => n + m.size, 0), fn: 'pruneStaleSubagents' });
 }
 
 // Drop all live-subagent state for a parent whose PTY just stopped, and sync
@@ -101,6 +102,7 @@ function clearActiveSubagentsFor(parentSessionId) {
   const map = activeSubagentsByParent.get(parentSessionId);
   if (!map) return;
   const agentIds = [...map.keys()];
+  if (window.ATRACE) window.atrace('store.mutate', parentSessionId, { map: 'activeSubagentsByParent', op: 'delete-parent', from: map.size, to: 0, agentIds, fn: 'clearActiveSubagentsFor' });
   activeSubagentsByParent.delete(parentSessionId);
   for (const agentId of agentIds) {
     reflectSubagentRunningState(parentSessionId, agentId);
@@ -132,6 +134,7 @@ function reflectSubagentRunningState(parentSessionId, agentId) {
   // precedence over it.
   const parentEl = document.getElementById('si-' + parentSessionId);
   if (parentEl) parentEl.classList.toggle('has-busy-agents', parentHasActiveSubagent(parentSessionId));
+  if (window.ATRACE) window.atrace('class.subagent', parentSessionId, { agentId, running, childEl: el ? el.id : null, caretEl: caret ? caret.id : null, parentEl: parentEl ? parentEl.id : null, 'has-busy-agents': parentHasActiveSubagent(parentSessionId), fn: 'reflectSubagentRunningState' });
 }
 
 (function initSubagentLiveListeners() {
@@ -144,11 +147,15 @@ function reflectSubagentRunningState(parentSessionId, agentId) {
       let map = activeSubagentsByParent.get(parentSessionId);
       // A heartbeat means "still alive", never "started": it must not create
       // an entry for an agent we are not tracking.
-      if (_heartbeat && !(map && map.has(agentId))) return;
+      if (_heartbeat && !(map && map.has(agentId))) {
+        if (window.ATRACE) window.atrace('recv.subagent-spawned', parentSessionId, { map: 'activeSubagentsByParent', op: 'ignore', agentId, heartbeat: true, applied: false, reason: 'heartbeat-for-untracked-agent', fn: 'onSubagentSpawned' });
+        return;
+      }
       if (!map) {
         map = new Map();
         activeSubagentsByParent.set(parentSessionId, map);
       }
+      if (window.ATRACE) window.atrace('recv.subagent-spawned', parentSessionId, { map: 'activeSubagentsByParent', op: 'set', agentId, from: map.get(agentId) ?? null, applied: true, bootstrap: !!payload._bootstrap, heartbeat: !!_heartbeat, fn: 'onSubagentSpawned' });
       map.set(agentId, Date.now());
       reflectSubagentRunningState(parentSessionId, agentId);
     });
@@ -159,6 +166,7 @@ function reflectSubagentRunningState(parentSessionId, agentId) {
       const { parentSessionId, agentId } = payload || {};
       if (!parentSessionId || !agentId) return;
       const map = activeSubagentsByParent.get(parentSessionId);
+      if (window.ATRACE) window.atrace('recv.subagent-completed', parentSessionId, { map: 'activeSubagentsByParent', op: 'delete', agentId, from: map ? (map.get(agentId) ?? null) : null, to: null, fn: 'onSubagentCompleted' });
       if (map) {
         map.delete(agentId);
         if (map.size === 0) activeSubagentsByParent.delete(parentSessionId);
@@ -177,6 +185,7 @@ function buildSubagentItem(session) {
   if (attentionSessions.has(session.sessionId)) item.classList.add('needs-attention');
   if (responseReadySessions.has(session.sessionId)) item.classList.add('response-ready');
   if (sessionBusyState.get(session.sessionId)) item.classList.add('cli-busy');
+  if (window.ATRACE) window.atrace('class.render', session.sessionId, { el: item.id, cls: item.className, parent: session.parentSessionId || null, agentId: session.agentId || null, fn: 'buildSubagentItem' });
   item.dataset.sessionId = session.sessionId;
   item.dataset.subagent = '1';
 
@@ -1074,6 +1083,7 @@ function buildSessionItem(session) {
   if (responseReadySessions.has(session.sessionId)) item.classList.add('response-ready');
   if (sessionBusyState.get(session.sessionId)) item.classList.add('cli-busy');
   if (parentHasActiveSubagent(session.sessionId)) item.classList.add('has-busy-agents');
+  if (window.ATRACE && item.className !== 'session-item js-stateful') window.atrace('class.render', session.sessionId, { el: item.id, cls: item.className, fn: 'buildSessionItem' });
   item.dataset.sessionId = session.sessionId;
 
   const modified = new Date(session.modified);

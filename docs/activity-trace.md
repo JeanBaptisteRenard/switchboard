@@ -1,0 +1,245 @@
+# Activity Trace
+
+A diagnostic trace for the sidebar's activity indicators — the blue braille
+spinner, the blue "response ready" dot, the orange attention LED, the purple
+subagent glyph, and the green running dot.
+
+Those indicators are driven by two processes with two clocks: the main process
+parses OSC sequences off the PTY and watches the filesystem, the renderer keeps
+four independent state stores and paints classes. When one of them is wrong,
+`main.log` cannot say why — most of the OSC handling logs at `debug`, which a
+packaged build never writes, and nothing at all records the renderer side.
+
+The activity trace records **both processes into one ordered file**, so the
+question "what did the CLI actually put in the title, and what did the UI do
+about it" has a single answer you can read.
+
+**It is off by default and costs nothing when off.** Turn it on only while
+investigating.
+
+## Turning it on
+
+```bash
+SWITCHBOARD_ACTIVITY_TRACE=1 task dev
+```
+
+Accepted values: `1`, `true`, `yes`, `on` (case-insensitive). Anything else —
+including unset — leaves the trace off. The variable is read **once**, by the
+main process (`activity-trace.js`); the renderer never parses it, it is told
+the answer through a launch argument, so the two halves cannot disagree.
+
+The file lands in the app's data directory, next to `switchboard.db`:
+
+| Run | Directory |
+|---|---|
+| `task dev` / any dev run | `~/.switchboard-dev/` |
+| `task test-pr PR=<n>` | `~/.switchboard-dev-pr<n>/` |
+| Explicit `SWITCHBOARD_DATA_DIR=...` | that directory |
+| Packaged app, no env var | `~/.switchboard/` |
+
+The directory is not re-derived: it is `path.dirname(DB_PATH)`, the single
+resolution `db.js` performs, so the trace always lands beside the database it
+belongs to. The name is stamped with the launch time — `activity-trace-20260822-141530.jsonl` —
+so a new run never overwrites the previous investigation. The main log prints
+the full path at startup (`[activity-trace] enabled → ...`).
+
+Nothing is written into the repository.
+
+## Reading a line
+
+One JSON object per line. The first six fields are the envelope, always in this
+order, always present; the rest is the probe's payload.
+
+```json
+{"seq":417,"t":38214.912,"wall":"2026-08-22T14:20:09.118Z","src":"main","cat":"osc.title","sid":"6f1c…","cp":"U+25D0 U+0020 U+0043","title":"◐ Claude","busy":false,"idle":false,"was":true,"decision":"ignored:no-match"}
+```
+
+| Field | Meaning |
+|---|---|
+| `seq` | Monotonic sequence number. **The only reliable ordering.** |
+| `t` | Milliseconds since the trace opened, from the main process's monotonic clock. |
+| `wall` | Wall-clock ISO timestamp, for correlating with `main.log` and screenshots. |
+| `src` | `main` or `renderer` — where the event was observed. |
+| `cat` | Probe category (table below). |
+| `sid` | The session id the entry is about, or `null`. |
+
+**The main process is the only writer.** The renderer sends its probes over a
+fire-and-forget IPC (`activity-trace`) and the main process stamps `seq`, `t`
+and `wall` on arrival. That is deliberate: two files with two clocks cannot be
+interleaved after the fact, and the ordering is the whole point. The cost is
+that a renderer entry's timestamp is its *arrival* time in main, not its
+emission time — sub-millisecond in practice, but do not read `t` as renderer
+latency.
+
+If a payload field collides with an envelope name, it is stored with a leading
+underscore (`_seq`), so `seq` always means the sequence number.
+
+Any probe that names an emission carries **`sent`**: every `webContents.send`
+in the app is guarded by `mainWindow && !mainWindow.isDestroyed()`, so a line
+saying an event was produced would otherwise be claiming a delivery it never
+checked. `sent:false` means the state changed but the renderer was already
+gone — normal during shutdown, a real finding at any other time. Probes that
+only record an observation (`osc.title`, `osc.progress`, `pty.exit`,
+`poll.snapshot`, `subagent.assumed-finished`) make no delivery claim and carry
+no `sent`.
+
+## Probe categories
+
+### Main process
+
+| `cat` | Fires when | Key fields |
+|---|---|---|
+| `osc.title` | Every OSC 0 title with a payload | `cp`, `title`, `busy`, `idle`, `was`, `decision` |
+| `osc.progress` | Every OSC 9;4 progress level (except `4;0`) | `level`, `payload`, `was`, `decision` |
+| `osc.notify` | Every non-progress OSC 9 | `message`, `sent` |
+| `busy.emit` | A `cli-busy-state` event leaves main | `busy`, `via` (`osc0` / `osc9.4`), `sent` |
+| `subagent.spawned` | `subagent-spawned` is sent | `agentId`, `kind` (`spawn` / `bootstrap` / `heartbeat`), `subagentType`, `ageMs`, `sent` |
+| `subagent.assumed-finished` | An unknown transcript is recorded as already finished, **silently** — no IPC | `agentId`, `ageMs`, `bootstrap`, `recheck` |
+| `subagent.rehabilitated` | An assumed-finished entry grew inside its recheck window: the withheld spawn is released | `agentId`, `withheldForMs`, `subagentType`, `sent` |
+| `subagent.completed` | `subagent-completed` is sent | `agentId`, `stableForMs`, `reason`, `sent` |
+| `session.forked` | A fork re-keys a live session | `newId`, `wasBusy`, `sent` |
+| `pty.exit` | The PTY exits | `exitCode`, `alsoUnder`, `wasBusy` |
+| `poll.snapshot` | `get-active-sessions` answers | `count`, `entries` |
+| `app.quit` | Last line of a clean shutdown | — |
+
+### Renderer
+
+| `cat` | Fires when | Key fields |
+|---|---|---|
+| `recv.*` | An IPC event arrives (`cli-busy-state`, `terminal-notification`, `session-forked`, `session-detected`, `process-exited`, `subagent-spawned`, `subagent-completed`) | per event |
+| `recv.subagent-spawned` | …with `applied` telling whether it changed anything. `applied:false` + `reason:"heartbeat-for-untracked-agent"` is a heartbeat deliberately dropped | `agentId`, `applied`, `bootstrap`, `heartbeat`, `from` |
+| `store.mutate` | A state store changes | `map`, `op`, `from`, `to`, `fn`, `via` |
+| `store.skip` | A write was **refused** by a guard | `map`, `reason`, `fn` |
+| `store.purge` | State dropped because the PTY is gone | `reason`, `busy`, `ready`, `attention` |
+| `store.rekey` | Activity state carried across a fork | `from`, `busy`, `ready`, `attention` |
+| `subagents.prune` | The 60 s TTL sweep ran | `parents`, `agents` |
+| `class.apply` | `cli-busy` / `response-ready` written | `el`, both class states |
+| `class.toggle` | `needs-attention` / `has-running-pty` written | `el`, `cls`, `on` |
+| `class.subagent` | Subagent `running` / `has-running-child` / `has-busy-agents` written | `el` ids, `running` |
+| `class.render` | A full sidebar render reconstructed an item's classes from the stores | `el`, `cls` |
+| `poll.recv` | The poll reply reaches the renderer | `sinceSeq`, `entries` |
+| `reconcile.apply` / `reconcile.skip` / `reconcile.noop` | Per session in the poll reply | `backend`, `local`, `reason`, `sinceSeq`, `sessionSeq` |
+
+`store.mutate` carries `fn` (the function that wrote) and, for `setActivity`,
+`via` (the caller that asked). `setActivity`'s third argument exists only for
+this — it is inert when the trace is off.
+
+## What the trace is for
+
+Three questions it answers that nothing else can:
+
+**Does the CLI's title still match the busy test?** `main.js` calls a title
+busy when its first character is in the braille block `U+2800..U+28FF`. Grep
+`osc.title` and look at `cp`. If it reads `U+25D0` / `U+25D1` and `decision` is
+`ignored:no-match`, the title path can no longer turn the spinner *on* — only
+`busy.emit` with `via:"osc9.4"` can, which means the indicator depends on the
+CLI's progress-bar setting rather than on its title.
+
+**Was an event suppressed, or never sent?** `osc.title` records the verdict
+(`emit:*` vs `suppressed:*`) and `busy.emit` records the actual send. A
+`decision` of `emit:busy` with no `busy.emit` right after it is a bug in the
+emitting branch; `suppressed:already-busy` is working as intended.
+
+> **Expect a burst at startup.** The first scan of a session emits one
+> `subagent.assumed-finished` line per historical transcript — a project with a
+> thousand of them produces a thousand lines in a single pass, before anything
+> interesting has happened. They all carry `bootstrap:true`, and later scans
+> produce none (the directory-mtime cache skips known files), so filter them
+> out when you are reading a startup problem:
+> `jq -c 'select(.bootstrap != true)' $TRACE`.
+
+**Is a subagent's state the truth or an assumption?** A transcript first seen
+already stale is recorded as finished without any event — `subagent.assumed-finished`
+is the only record that it happened. When `recheck` is `true` that verdict is a
+guess (the sighting may simply have been late), and a later
+`subagent.rehabilitated` line is the guess being retracted, with `withheldForMs`
+saying how long the spawn was suppressed. A parent whose indicator is wrong
+usually has one of these two lines behind it.
+
+**Did the UI receive it and act?** Follow the `seq` numbers: `busy.emit` →
+`recv.cli-busy-state` → `store.mutate` → `class.apply`. A chain that stops
+early localises the fault to one process. `store.skip` and `reconcile.skip`
+name the guard that dropped the value.
+
+### Useful filters
+
+```bash
+TRACE=~/.switchboard-dev/activity-trace-*.jsonl
+
+# Which code points does the CLI actually send, and what does the test say?
+jq -r 'select(.cat=="osc.title") | "\(.cp)\t\(.decision)"' $TRACE | sort | uniq -c
+
+# Everything about one session, in order
+jq -c 'select(.sid=="6f1c…")' $TRACE
+
+# Every state write that was refused, and by which guard
+jq -c 'select(.cat=="store.skip" or .cat=="reconcile.skip")' $TRACE
+
+# Everything the subagent detector decided, in order, minus the startup burst
+jq -c 'select((.cat | startswith("subagent.")) and .bootstrap != true)' $TRACE
+
+# Events the app produced but never delivered (renderer already gone)
+jq -c 'select(.sent == false)' $TRACE
+
+# Subagent events the renderer received but deliberately dropped
+jq -c 'select(.cat=="recv.subagent-spawned" and .applied==false)' $TRACE
+
+# Emission vs reception, side by side
+jq -c 'select(.cat=="busy.emit" or .cat=="recv.cli-busy-state")' $TRACE
+```
+
+## Cost when disabled
+
+Nothing is built, sent, or written.
+
+- **Main process** — `SWITCHBOARD_ACTIVITY_TRACE` is read once at require time
+  into a `const TRACE`. Every probe is `if (TRACE) trace(...)`, so with the
+  trace off the payload literal is never evaluated. The `activity-trace` IPC
+  handler is not even registered.
+- **Renderer** — `preload.js` resolves the same flag and exposes it as
+  `window.api.activityTraceEnabled`; `public/activity-trace.js` reduces it to
+  `window.ATRACE`. Probes are `if (window.ATRACE) window.atrace(...)`: one
+  property load, no allocation, no IPC.
+- The trace function also short-circuits on its own first line, so a stray
+  call from anywhere is inert.
+
+`test/activity-trace.test.js` and `test/activity-trace-renderer.test.js` pin
+this: a disabled trace never advances its sequence counter, never opens a file,
+and never reads a payload property (the tests hand it an object with a
+throwing/counting getter).
+
+This matters because of
+[ADR 0002](decisions/0002-discrete-steps-sidebar-animations.md) — the
+indicators were rebuilt to stop burning CPU at idle, and a diagnostic that
+allocated on every render would undo that. Even when the trace is **on**, no
+probe sits on the terminal render path: the busiest is `osc.title`, which fires
+only for chunks containing an OSC introducer.
+
+## Disk use
+
+Bounded. The trace writes to at most 4 rotating segments of 16 MB each — a
+64 MB ceiling by default, so it can be left on overnight. When the cap is
+reached the oldest segment is deleted; the tail is what you read.
+
+If that deletion fails — most plausibly because you have a `tail` or an editor
+open on the segment, which is exactly what an investigation looks like — the
+file stays queued and is retried at the next rotation, and a
+`trace.prune-failed` line records it. So the ceiling can be temporarily
+exceeded, but never silently: grep the trace for `prune-failed` if disk use
+surprises you.
+
+```bash
+# 256 MB ceiling instead of 64
+SWITCHBOARD_ACTIVITY_TRACE=1 SWITCHBOARD_ACTIVITY_TRACE_MAX_MB=256 task dev
+```
+
+Writes go through an append-only stream and are never read back. The stream
+buffers, so a slow disk delays the trace instead of blocking the main thread —
+the trade is that the last few lines may be lost on a hard crash. A clean quit
+flushes and closes (`app.quit` is the last line).
+
+## Related
+
+- [Notifications](notifications.md) — what each indicator means to a user
+- [`.ai/contexts/ipc-bridge.md`](../.ai/contexts/ipc-bridge.md) — busy-state reconciliation
+- [`.ai/contexts/subagent-observability.md`](../.ai/contexts/subagent-observability.md) — subagent spawn/complete detection

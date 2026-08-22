@@ -315,6 +315,7 @@ module.exports = [
     files: [
       'main.js',
       'preload.js',
+      'activity-trace.js',
       'db.js',
       'session-cache.js',
       'session-transitions.js',

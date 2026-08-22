@@ -19,6 +19,7 @@ This is the documentation for the [devsuitup/switchboard](https://github.com/dev
 - [Settings Reference](settings.md) — every field in Global and Project Settings
 - [Automation](automation.md) — scheduled Claude tasks (cron) and the file-based trigger API
 - [Testing a PR Live](testing-a-pr.md) — `task test-pr` to run a PR from source alongside a running AppImage
+- [Activity Trace](activity-trace.md) — opt-in single-file diagnostic trace behind the sidebar's activity indicators
 - [Customizing Colors](customizing-colors.md) — community guide (in French) to theming via `app.asar`
 
 ## Download / Install

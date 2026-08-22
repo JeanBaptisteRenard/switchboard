@@ -1,6 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const { readSubagentMeta } = require('./read-session-file');
+const { enabled: TRACE, trace } = require('./activity-trace');
 
 /**
  * Fork detection for active PTY sessions.
@@ -128,6 +129,7 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
           _lastHeartbeatAt: now,
           _recheckStart: isBootstrap ? null : now,
         });
+        if (TRACE) trace('subagent.assumed-finished', sessionId, { agentId, ageMs: now - mtimeMs, bootstrap: isBootstrap, recheck: !isBootstrap });
         continue;
       }
 
@@ -143,6 +145,7 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
         _lastHeartbeatAt: now,
       });
       log.info(`[subagent-spawn${isBootstrap ? '-bootstrap' : ''}] parent=${sessionId} agentId=${agentId} type=${meta.agentType || 'unknown'}`);
+      if (TRACE) trace('subagent.spawned', sessionId, { agentId, kind: isBootstrap ? 'bootstrap' : 'spawn', subagentType: meta.agentType || null, ageMs: now - mtimeMs, sent: !!(mainWindow && !mainWindow.isDestroyed()) });
       if (mainWindow && !mainWindow.isDestroyed()) {
         const payload = {
           parentSessionId: sessionId,
@@ -158,6 +161,7 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
       // grows is alive: undo the assumption and emit the withheld spawn.
       if (mtimeMs !== known.mtimeMs) {
         const meta = readSubagentMeta(filePath) || {};
+        if (TRACE) trace('subagent.rehabilitated', sessionId, { agentId, withheldForMs: now - known._recheckStart, subagentType: meta.agentType || null, sent: !!(mainWindow && !mainWindow.isDestroyed()) });
         known.mtimeMs = mtimeMs;
         known.completed = false;
         known._completedAt = null;
@@ -188,6 +192,7 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
         if (now - (known._lastHeartbeatAt || 0) >= HEARTBEAT_MS
             && mainWindow && !mainWindow.isDestroyed()) {
           known._lastHeartbeatAt = now;
+          if (TRACE) trace('subagent.spawned', sessionId, { agentId, kind: 'heartbeat', subagentType: known.subagentType || null, sent: true });
           mainWindow.webContents.send('subagent-spawned', {
             parentSessionId: sessionId,
             agentId,
@@ -204,6 +209,7 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
           known.completed = true;
           known._completedAt = now;
           log.info(`[subagent-complete] parent=${sessionId} agentId=${agentId}`);
+          if (TRACE) trace('subagent.completed', sessionId, { agentId, stableForMs: now - known._stableStart, reason: 'mtime-stable', sent: !!(mainWindow && !mainWindow.isDestroyed()) });
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('subagent-completed', {
               parentSessionId: sessionId,
@@ -360,6 +366,7 @@ function detectSessionTransitions(folder) {
         // Re-key MCP server to match new session ID
         rekeyMcpServer(sessionId, newId);
         const mainWindow = getMainWindow();
+        if (TRACE) trace('session.forked', sessionId, { newId, wasBusy: !!session._cliBusy, sent: !!(mainWindow && !mainWindow.isDestroyed()) });
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('session-forked', sessionId, newId);
         }

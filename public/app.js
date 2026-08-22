@@ -253,6 +253,7 @@ function trackActivity(sessionId, data) {
 
 function clearNotifications(sessionId) {
   clearUnread(sessionId);
+  if (window.ATRACE && attentionSessions.has(sessionId)) window.atrace('store.mutate', sessionId, { map: 'attentionSessions', op: 'delete', from: true, to: false, fn: 'clearNotifications' });
   attentionSessions.delete(sessionId);
   const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
   if (item) item.classList.remove('needs-attention');
@@ -270,6 +271,7 @@ function clearNotifications(sessionId) {
 window.api.onTerminalData((sessionId, data) => handleTerminalData(sessionId, data));
 
 window.api.onSessionDetected((tempId, realId) => {
+  if (window.ATRACE) window.atrace('recv.session-detected', realId, { tempId });
   const entry = openSessions.get(tempId);
   if (!entry) return;
 
@@ -297,6 +299,7 @@ window.api.onSessionDetected((tempId, realId) => {
 });
 
 window.api.onSessionForked((oldId, newId) => {
+  if (window.ATRACE) window.atrace('recv.session-forked', newId, { oldId, known: openSessions.has(oldId) });
   const entry = openSessions.get(oldId);
   if (!entry) return;
 
@@ -337,6 +340,7 @@ window.api.onSessionForked((oldId, newId) => {
 });
 
 window.api.onProcessExited((sessionId, exitCode) => {
+  if (window.ATRACE) window.atrace('recv.process-exited', sessionId, { exitCode });
   const entry = openSessions.get(sessionId);
   const session = sessionMap.get(sessionId);
   if (entry) {
@@ -396,6 +400,7 @@ window.api.onProcessExited((sessionId, exitCode) => {
 
 // --- Terminal notifications (iTerm2 OSC 9 — "needs attention") ---
 window.api.onTerminalNotification((sessionId, message) => {
+  if (window.ATRACE) window.atrace('recv.terminal-notification', sessionId, { message: String(message).slice(0, 120), active: sessionId === activeSessionId });
   // Only mark as needing attention for "attention" messages, not "waiting for input"
   // Matches all four CLI notification types:
   // 1. "Claude Code needs your attention"         → attention
@@ -403,12 +408,14 @@ window.api.onTerminalNotification((sessionId, message) => {
   // 3. "Claude needs your permission to use {tool}"   → permission, needs your
   // 4. "Claude Code wants to enter plan mode"         → wants to enter
   if (/attention|approval|permission|needs your|wants to enter/i.test(message) && sessionId !== activeSessionId) {
+    if (window.ATRACE) window.atrace('store.mutate', sessionId, { map: 'attentionSessions', op: 'add', from: attentionSessions.has(sessionId), to: true, fn: 'onTerminalNotification' });
     attentionSessions.add(sessionId);
     const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
+    if (window.ATRACE) window.atrace('class.toggle', sessionId, { el: item ? item.id : null, cls: 'needs-attention', on: true, fn: 'onTerminalNotification' });
     if (item) item.classList.add('needs-attention');
   } else if (/waiting for your input/i.test(message)) {
     // "Claude is waiting for your input" — delayed idle notification, mark response-ready
-    setActivity(sessionId, false);
+    setActivity(sessionId, false, 'onTerminalNotification');
   }
 
   // Show in header if active
@@ -420,7 +427,8 @@ window.api.onTerminalNotification((sessionId, message) => {
 
 // --- CLI busy state (OSC 0 title spinner detection) ---
 window.api.onCliBusyState((sessionId, busy) => {
-  setActivity(sessionId, busy);
+  if (window.ATRACE) window.atrace('recv.cli-busy-state', sessionId, { busy });
+  setActivity(sessionId, busy, 'onCliBusyState');
 });
 
 // --- Single entry point for all sidebar renders ---
@@ -713,6 +721,7 @@ async function pollActiveSessions() {
   try {
     const seq = currentActivitySeq();
     const entries = await window.api.getActiveSessions();
+    if (window.ATRACE) window.atrace('poll.recv', null, { sinceSeq: seq, entries });
     activePtyIds = new Set(entries.map(e => e.sessionId));
     reconcileBusyState(entries, seq);
     updateRunningIndicators();
@@ -746,6 +755,7 @@ function updateRunningIndicators() {
       const running = activePtyIds.has(id);
       item.classList.toggle('has-running-pty', running);
       if (!running) {
+        if (window.ATRACE) window.atrace('store.purge', id, { reason: 'pty-gone', busy: sessionBusyState.get(id) ?? null, ready: responseReadySessions.has(id), attention: attentionSessions.has(id), fn: 'updateRunningIndicators' });
         item.classList.remove('needs-attention', 'response-ready', 'cli-busy', 'has-busy-agents');
         attentionSessions.delete(id);
         responseReadySessions.delete(id);
@@ -758,6 +768,7 @@ function updateRunningIndicators() {
       }
       const dot = item.querySelector('.session-status-dot');
       if (dot) dot.classList.toggle('running', running);
+      if (window.ATRACE) window.atrace('class.toggle', id, { el: item.id || null, cls: 'has-running-pty', on: running, dot: !!dot, fn: 'updateRunningIndicators' });
     });
     // Update slug group running dots
     document.querySelectorAll('.slug-group').forEach(group => {

@@ -95,6 +95,7 @@ This file is the **canonical inventory** of the IPC surface. When you add a new 
 | `terminal-resize` | Resize PTY columns/rows |
 | `close-terminal` | Renderer signals tab closed |
 | `mcp-diff-response` | Diff accept/reject from MCP IDE mode |
+| `activity-trace` | Renderer probe → the trace file. Registered **only** when `SWITCHBOARD_ACTIVITY_TRACE` is set (see below) |
 
 ### Events (main → renderer)
 
@@ -128,6 +129,71 @@ Three things make that safe:
 - **The response-ready lock only blocks idle.** `setActivity(id, true)` always writes, and drops the session from `responseReadySessions` — a session that resumed generating has no unread answer left to announce. `setActivity(id, false)` on a response-ready session is still ignored, so an unread marker survives duplicate idle signals. Before that split, a session that finished a turn off-screen and restarted without a click (cron, trigger-watcher, resume) had *every* subsequent busy event swallowed.
 - **`cli-busy` and `response-ready` are mutually exclusive.** `applyActivityClasses()` is the only writer of either class. The cascade would in fact favour the spinner anyway (`.session-item.cli-busy:not(.needs-attention) .session-status-dot` carries `!important` and one more class than the response-ready rule that follows it in `style.css`), but the state, not the cascade, is what decides.
 - **A poll reply cannot overwrite a fresher event.** `setActivity` bumps a monotonic counter per session; the poll snapshots it via `currentActivitySeq()` *before* the IPC round-trip and `reconcileBusyState` skips any session that moved in between.
+
+### Activity trace: why the main process is the only writer
+
+`activity-trace.js` + `public/activity-trace.js`, off unless
+`SWITCHBOARD_ACTIVITY_TRACE` is set. User-facing docs:
+[docs/activity-trace.md](../../docs/activity-trace.md).
+
+The indicators above are produced by two processes with two clocks, and the
+bugs in them are **ordering** bugs — a front that was emitted but not received,
+a poll reply that overwrote a fresher event, a fork that re-keyed halfway. Two
+log files cannot be interleaved after the fact with any confidence, so the
+trace has a single writer: the renderer sends probes fire-and-forget over
+`activity-trace`, and main stamps the sequence number and both timestamps on
+arrival. Renderer entries therefore carry their *arrival* time in main, which
+is the correct trade — `seq` is the ordering, `t` is only for eyeballing gaps.
+
+Why not `log.debug`: `main.js` sets the file transport to `info` when packaged,
+so the existing OSC 0 debug lines never reach disk in a build the user runs —
+which is exactly why the question "what code point does the CLI put in the
+title" was unanswerable from a production log and had to be settled by reading
+the CLI binary. The trace has its own file and its own level, so it is readable
+from a packaged build, and it records the renderer half that `log` never saw.
+
+Two constraints shaped the API:
+
+- **The off path must allocate nothing.** `enabled` is resolved once at require
+  time and re-exported, so probes are `if (TRACE) trace(...)` /
+  `if (window.ATRACE) window.atrace(...)` — the payload literal is never
+  evaluated when the trace is off, and the IPC handler is not registered at
+  all. The renderer probes go through `window.*` rather than bare globals so
+  `session-activity.js` and `sidebar.js` stay loadable in the jsdom tests,
+  which evaluate them without the trace file. This is the same discipline as
+  [ADR 0002](../../docs/decisions/0002-discrete-steps-sidebar-animations.md):
+  nothing that runs per render may do work.
+- **The flag is parsed once.** `activity-trace.js` resolves
+  `SWITCHBOARD_ACTIVITY_TRACE`; the preload is sandboxed and cannot require it,
+  so main passes `--switchboard-activity-trace` via `additionalArguments` and
+  the preload only checks `process.argv`. Re-parsing the env var in the preload
+  would let the two halves disagree silently — a trace file with no
+  `src:"renderer"` lines and no error. Likewise the output directory is
+  `path.dirname(DB_PATH)`, never a second derivation of the env var (`db.js`
+  documents that anti-pattern where it exports `DB_PATH`).
+- **The probes must stay one line each.** The interesting sites live in files
+  that other branches touch (`session-transitions.js`, `public/sidebar.js`),
+  so every probe is a single inserted statement and all the logic —
+  formatting, code-point rendering, the decision helpers that mirror the OSC
+  branches — lives in the trace module where it is unit-tested.
+
+Subagent probes follow the detector's own vocabulary rather than the IPC's: a
+transcript first seen already stale produces `subagent.assumed-finished` and no
+event at all, and if that assumption is later retracted inside the recheck
+window the withheld spawn shows up as `subagent.rehabilitated`. Both are silent
+in every other channel — see `.ai/contexts/subagent-observability.md` for the
+mechanism they instrument. On the renderer side `recv.subagent-spawned` carries
+`applied`, because a heartbeat for an agent the sidebar is not tracking is
+dropped on purpose and that non-effect is the diagnostic.
+
+`busyDecision` / `progressDecision` duplicate the conditions in `main.js` on
+purpose: the trace also records the emissions themselves, so a divergence
+between the predicted verdict and the `busy.emit` that follows shows up in the
+file instead of being invisible.
+
+`setActivity(sessionId, active, via)` — the third argument is trace-only
+attribution (which caller asked for the write) and is inert when the trace is
+off.
 
 ## If you change this, also check
 
