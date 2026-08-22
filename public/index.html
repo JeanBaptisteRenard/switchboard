@@ -120,6 +120,9 @@
   <!-- shortcuts.js defines matchShortcut/appShortcuts helpers used by terminal-manager,
        grid-view, app and settings-panel — must load before those consumers. -->
   <script src="shortcuts.js"></script>
+  <!-- session-activity.js owns the busy/response-ready/attention state read by
+       terminal-manager, grid-view, sidebar and app — must load before them. -->
+  <script src="session-activity.js"></script>
   <script src="terminal-themes.js"></script>
   <script src="terminal-context-menu.js"></script>
   <script src="terminal-manager.js"></script>

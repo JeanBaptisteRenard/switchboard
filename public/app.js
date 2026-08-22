@@ -230,18 +230,8 @@ let searchMatchProjectPaths = null; // Set<string> of project paths matched by n
 
 // --- Activity tracking ---
 //
-// Activity is determined by two signals:
-//   1. OSC 0 braille spinner (authoritative: Claude CLI sets title to spinner chars)
-//   2. Noise-filtered terminal output (fallback: non-noise, non-TUI-repaint data)
+// Busy / response-ready / attention state lives in public/session-activity.js.
 //
-// Both feed into setActivity(sessionId, active):
-//   active=true  → cli-busy (spinner dot)
-//   active=false → response-ready if not focused (terminal state until user clicks)
-// OSC 0 idle signal is the authoritative source for marking sessions as idle.
-//
-const attentionSessions = new Set(); // sessions needing user action (OSC 9)
-const responseReadySessions = new Set(); // Claude finished, user hasn't looked (terminal state)
-const sessionBusyState = new Map(); // sessionId → boolean (currently active)
 // sessionId → Date of last terminal output.
 //
 // Upstream removed this map (and trackActivity below) when it made
@@ -255,46 +245,10 @@ const lastActivityTime = new Map();
 // Noise patterns — these don't count as activity
 const activityNoiseRe = /file-history-snapshot|^\s*$/;
 
-// Central activity dispatcher
-function setActivity(sessionId, active) {
-  if (responseReadySessions.has(sessionId)) {
-    return;
-  }
-
-  const wasActive = sessionBusyState.get(sessionId) || false;
-  sessionBusyState.set(sessionId, active);
-
-  if (wasActive && !active) {
-    // Activity ended → response-ready if user isn't looking at this session
-    if (sessionId !== activeSessionId) {
-      responseReadySessions.add(sessionId);
-      const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
-      if (item) {
-        item.classList.remove('cli-busy');
-        item.classList.add('response-ready');
-      }
-    }
-  }
-
-  // Sync cli-busy class (only if not response-ready)
-  if (!responseReadySessions.has(sessionId)) {
-    const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
-    if (item) item.classList.toggle('cli-busy', active);
-  }
-}
-
 // Terminal output activity — updates lastActivityTime only, busy state driven by backend
 function trackActivity(sessionId, data) {
   if (activityNoiseRe.test(data)) return;
   lastActivityTime.set(sessionId, new Date());
-}
-
-function clearUnread(sessionId) {
-  responseReadySessions.delete(sessionId);
-  const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
-  if (item) {
-    item.classList.remove('response-ready');
-  }
 }
 
 function clearNotifications(sessionId) {
@@ -326,6 +280,8 @@ window.api.onSessionDetected((tempId, realId) => {
   openSessions.delete(tempId);
   openSessions.set(realId, entry);
 
+  rekeyActivityState(tempId, realId);
+
   terminalHeaderId.textContent = realId;
   terminalHeaderName.textContent = 'New session';
 
@@ -352,6 +308,8 @@ window.api.onSessionForked((oldId, newId) => {
 
   // Re-key file panel state for the new session ID
   if (typeof rekeyFilePanelState === 'function') rekeyFilePanelState(oldId, newId);
+
+  rekeyActivityState(oldId, newId);
 
   // Re-key pending session to newId so sidebar item persists until DB has real data
   const pendingEntry = pendingSessions.get(oldId);
@@ -753,8 +711,10 @@ function scheduleActiveSessionsPoll() {
 
 async function pollActiveSessions() {
   try {
-    const ids = await window.api.getActiveSessions();
-    activePtyIds = new Set(ids);
+    const seq = currentActivitySeq();
+    const entries = await window.api.getActiveSessions();
+    activePtyIds = new Set(entries.map(e => e.sessionId));
+    reconcileBusyState(entries, seq);
     updateRunningIndicators();
     updateTerminalHeader();
   } catch {}
@@ -790,6 +750,7 @@ function updateRunningIndicators() {
         attentionSessions.delete(id);
         responseReadySessions.delete(id);
         sessionBusyState.delete(id);
+        forgetActivitySeq(id);
         // A stopped PTY can never emit subagent-completed (stop-session kills
         // the process; detectSubagentTransitions skips exited sessions), so
         // drop the live-subagent state now instead of waiting for the TTL.

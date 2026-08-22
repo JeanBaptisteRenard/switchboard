@@ -136,6 +136,11 @@ const rendererCrossFileGlobals = {
   saveExpandedSlugs: 'readonly',
   setActivity: 'readonly',
   trackActivity: 'readonly',
+  applyActivityClasses: 'readonly',
+  rekeyActivityState: 'readonly',
+  reconcileBusyState: 'readonly',
+  currentActivitySeq: 'readonly',
+  forgetActivitySeq: 'readonly',
 
   // Third-party renderer libs loaded as <script>
   morphdom: 'readonly',
@@ -188,6 +193,7 @@ const rendererCrossFileGlobals = {
   removeWorkFileFromCache: 'readonly',
   openWorkFile: 'readonly',
   clearNotifications: 'readonly',
+  clearUnread: 'readonly',
   setSessionMcpActive: 'readonly',
   setSessionSandboxed: 'readonly',
   destroySession: 'readonly',
