@@ -980,6 +980,32 @@ body { display: flex; flex-direction: column; }
   color: #7fd4f9;
 }
 
+/* ---- Subagents running under this session (has-busy-agents) ---- */
+/* Parent is at the prompt while spawned subagents still work in the
+   background. The session's own states win: needs-attention,
+   response-ready and the cli-busy braille spinner all take precedence,
+   so this only shows on an otherwise-idle parent item.
+   Static full braille cell in violet — deliberately no animation
+   (docs/decisions/0002: new indicators default to static), and both hue
+   and stillness distinguish it from the light-blue animated cli-busy
+   spinner. */
+.session-item.has-busy-agents:not(.cli-busy):not(.needs-attention):not(.response-ready) .session-status-dot,
+.session-item.has-busy-agents:not(.cli-busy):not(.needs-attention):not(.response-ready) .session-status-dot.running {
+  background: transparent !important;
+  box-shadow: none !important;
+  position: relative;
+}
+
+.session-item.has-busy-agents:not(.cli-busy):not(.needs-attention):not(.response-ready) .session-status-dot::before {
+  content: "\283F"; /* ⠿ — all dots lit: agents at work */
+  color: #8088ff;
+  font-size: 11px;
+  line-height: 6px;
+  position: absolute;
+  left: -2px;
+  top: 0;
+}
+
 /* ---- Session info ---- */
 .session-info {
   flex: 1;

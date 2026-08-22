@@ -129,6 +129,7 @@ const rendererCrossFileGlobals = {
   buildSubagentIndex: 'readonly',
   buildSubagentItem: 'readonly',
   appendSubagentChildren: 'readonly',
+  clearActiveSubagentsFor: 'readonly',
   buildSessionItem: 'readonly',
   buildSlugGroup: 'readonly',
   folderId: 'readonly',

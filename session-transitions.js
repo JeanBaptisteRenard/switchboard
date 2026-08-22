@@ -80,6 +80,16 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
   const now = Date.now();
   const STABLE_MS = 30000; // 30 seconds of no mtime advance → completed
   const BOOTSTRAP_LIVE_MS = 60000; // file modified in last 60s = still alive at boot
+  // Re-emit subagent-spawned (idempotent on the renderer side — it just
+  // refreshes the entry's last-seen timestamp) at most every HEARTBEAT_MS
+  // while an agent's file keeps growing. Without this, the renderer's 60s
+  // liveness TTL evicts any subagent that runs longer than a minute — the
+  // common case — and the parent's indicator goes dark while the agent is
+  // still working. A file that stops growing needs no heartbeat: it either
+  // completes via the 30s stability timer (subagent-completed) or, if the
+  // parent PTY died first, the renderer TTL prunes it — both under 60s of
+  // silence, so the orphan behavior is unchanged.
+  const HEARTBEAT_MS = 20000;
 
   for (const file of files) {
     // agent-<agentId>.jsonl
@@ -106,17 +116,20 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
         // Treat recently-modified files as still-active so they can complete
         // through the normal lifecycle; treat older ones as already done.
         const looksAlive = (now - mtimeMs) < BOOTSTRAP_LIVE_MS;
+        const meta = looksAlive ? (readSubagentMeta(filePath) || {}) : {};
         session.knownSubagents.set(agentId, {
           mtimeMs,
           completed: !looksAlive,
           _completedAt: looksAlive ? null : now,
+          subagentType: meta.agentType || null,
+          description: meta.description || null,
+          _lastHeartbeatAt: now,
         });
         // Fix 2: emit a synthetic spawn for live bootstrap files so the
         // renderer's liveSubagents / activeSubagents Maps have an entry and
         // can correctly handle the subsequent subagent-completed event.
         // The _bootstrap flag lets the renderer dedupe if it already has state.
         if (looksAlive && mainWindow && !mainWindow.isDestroyed()) {
-          const meta = readSubagentMeta(filePath) || {};
           log.info(`[subagent-spawn-bootstrap] parent=${sessionId} agentId=${agentId}`);
           mainWindow.webContents.send('subagent-spawned', {
             parentSessionId: sessionId,
@@ -130,7 +143,13 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
       }
       // First sighting post-bootstrap — real spawn event
       const meta = readSubagentMeta(filePath) || {};
-      session.knownSubagents.set(agentId, { mtimeMs, completed: false });
+      session.knownSubagents.set(agentId, {
+        mtimeMs,
+        completed: false,
+        subagentType: meta.agentType || null,
+        description: meta.description || null,
+        _lastHeartbeatAt: now,
+      });
       log.info(`[subagent-spawn] parent=${sessionId} agentId=${agentId} type=${meta.agentType || 'unknown'}`);
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('subagent-spawned', {
@@ -145,6 +164,18 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
         // File is still being written — update mtime, reset stability clock
         known.mtimeMs = mtimeMs;
         known._stableStart = null;
+        // Still-alive heartbeat (throttled) — see HEARTBEAT_MS above.
+        if (now - (known._lastHeartbeatAt || 0) >= HEARTBEAT_MS
+            && mainWindow && !mainWindow.isDestroyed()) {
+          known._lastHeartbeatAt = now;
+          mainWindow.webContents.send('subagent-spawned', {
+            parentSessionId: sessionId,
+            agentId,
+            subagentType: known.subagentType || null,
+            description: known.description || null,
+            _heartbeat: true,
+          });
+        }
       } else {
         // mtime stable — start or continue stability timer
         if (!known._stableStart) {

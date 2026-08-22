@@ -72,10 +72,14 @@ function makeIndicatorFn(doc, state) {
         const running = state.activePtyIds.has(id);
         item.classList.toggle('has-running-pty', running);
         if (!running) {
-          item.classList.remove('needs-attention', 'response-ready', 'cli-busy');
+          item.classList.remove('needs-attention', 'response-ready', 'cli-busy', 'has-busy-agents');
           state.attentionSessions.delete(id);
           state.responseReadySessions.delete(id);
           state.sessionBusyState.delete(id);
+          // Mirrors app.js: a stopped PTY can never emit subagent-completed,
+          // so the live-subagent state is dropped immediately (sidebar.js's
+          // clearActiveSubagentsFor) instead of waiting for the 60s TTL.
+          if (state.clearActiveSubagentsFor) state.clearActiveSubagentsFor(id);
         }
         const dot = item.querySelector('.session-status-dot');
         if (dot) dot.classList.toggle('running', running);
@@ -185,23 +189,26 @@ test('updateRunningIndicators: stale attention/response-ready/cli-busy cleared w
   const attentionSessions = new Set(['s1']);
   const responseReadySessions = new Set(['s1']);
   const sessionBusyState = new Map([['s1', true]]);
+  const clearedSubagentParents = [];
   const state = {
     activePtyIds: new Set(['s1']),
     attentionSessions,
     responseReadySessions,
     sessionBusyState,
     gridCards: new Map(),
+    clearActiveSubagentsFor: (id) => clearedSubagentParents.push(id),
   };
   const update = makeIndicatorFn(document, state);
 
   // First call: s1 running — no cleanup.
   update();
   assert.ok(state.attentionSessions.has('s1'), 's1 attention preserved while running');
+  assert.ok(!clearedSubagentParents.includes('s1'), 'subagent state untouched while s1 runs');
 
   // s1 stops.
   state.activePtyIds = new Set();
   const item1 = document.querySelector('[data-session-id="s1"]');
-  item1.classList.add('needs-attention', 'response-ready', 'cli-busy');
+  item1.classList.add('needs-attention', 'response-ready', 'cli-busy', 'has-busy-agents');
   update();
 
   assert.ok(!state.attentionSessions.has('s1'), 'attentionSessions cleared when pty stops');
@@ -210,6 +217,8 @@ test('updateRunningIndicators: stale attention/response-ready/cli-busy cleared w
   assert.ok(!item1.classList.contains('needs-attention'), '.needs-attention removed');
   assert.ok(!item1.classList.contains('response-ready'), '.response-ready removed');
   assert.ok(!item1.classList.contains('cli-busy'), '.cli-busy removed');
+  assert.ok(!item1.classList.contains('has-busy-agents'), '.has-busy-agents removed — a killed PTY never emits subagent-completed');
+  assert.ok(clearedSubagentParents.includes('s1'), 'clearActiveSubagentsFor called so the sidebar state cannot resurrect the indicator');
 
   window.close();
 });
@@ -356,4 +365,21 @@ test('public/app.js: updateRunningIndicators still guards subagent items before 
 
   assert.notEqual(guardIdx, -1, 'public/app.js must still contain `if (item.dataset.subagent) return;` in the pty-set scan');
   assert.ok(guardIdx < sessionIdIdx, 'the subagent guard must run before the item is treated as a PTY-backed session');
+});
+
+test('public/app.js: pty-stop cleanup removes has-busy-agents and purges the sidebar subagent state', () => {
+  // Same source-level pin technique as above (app.js cannot be eval-ed in
+  // jsdom). stop-session kills the PTY without a subagent-completed event and
+  // detectSubagentTransitions skips exited sessions, so this cleanup is the
+  // only thing standing between a stopped session and a ghost violet glyph
+  // that lingers until the 60s TTL prune.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const scanStart = src.indexOf("document.querySelectorAll('.session-item').forEach(item => {");
+  assert.notEqual(scanStart, -1, 'the .session-item pty-set scan must still exist in public/app.js');
+
+  const body = src.slice(scanStart, scanStart + 1200);
+  assert.match(body, /classList\.remove\([^)]*'has-busy-agents'[^)]*\)/,
+    "the !running cleanup must remove 'has-busy-agents' along with the other per-session state classes");
+  assert.match(body, /clearActiveSubagentsFor\(id\)/,
+    'the !running cleanup must purge activeSubagentsByParent via clearActiveSubagentsFor so a re-render cannot resurrect the indicator');
 });

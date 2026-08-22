@@ -64,6 +64,12 @@ function subagentTypeColor(type) {
 }
 
 // --- Live subagent tracking — see .ai/contexts/subagent-observability.md ---
+// parentSessionId → Map<agentId, lastSeenAtMs>. The timestamp is refreshed by
+// every subagent-spawned event — including the throttled still-alive
+// heartbeats the main process re-emits while an agent's transcript keeps
+// growing (session-transitions.js) — so the TTL below only evicts agents
+// that went silent (e.g. parent PTY died before a completion event could
+// fire), not agents that simply run longer than a minute.
 const activeSubagentsByParent = new Map();
 const SUBAGENT_LIVE_TTL_MS = 60000;
 
@@ -80,10 +86,26 @@ function parentHasActiveSubagent(parentSessionId) {
 function pruneStaleSubagents() {
   const cutoff = Date.now() - SUBAGENT_LIVE_TTL_MS;
   for (const [parentId, map] of activeSubagentsByParent) {
-    for (const [agentId, spawnedAt] of map) {
-      if (spawnedAt < cutoff) map.delete(agentId);
+    for (const [agentId, lastSeenAt] of map) {
+      if (lastSeenAt < cutoff) map.delete(agentId);
     }
     if (map.size === 0) activeSubagentsByParent.delete(parentId);
+  }
+}
+
+// Drop all live-subagent state for a parent whose PTY just stopped, and sync
+// the DOM immediately. Called from app.js's updateRunningIndicators():
+// stop-session kills the PTY without emitting subagent-completed, and
+// detectSubagentTransitions skips exited sessions, so no completion event
+// will ever arrive — without this the parent's has-busy-agents indicator
+// (and the children's .running) would linger until the TTL prune.
+function clearActiveSubagentsFor(parentSessionId) {
+  const map = activeSubagentsByParent.get(parentSessionId);
+  if (!map) return;
+  const agentIds = [...map.keys()];
+  activeSubagentsByParent.delete(parentSessionId);
+  for (const agentId of agentIds) {
+    reflectSubagentRunningState(parentSessionId, agentId);
   }
 }
 
@@ -105,6 +127,13 @@ function reflectSubagentRunningState(parentSessionId, agentId) {
   }
   const caret = document.getElementById(caretIdFor(parentSessionId));
   if (caret) caret.classList.toggle('has-running-child', parentHasActiveSubagent(parentSessionId));
+  // Parent session item: "subagents are working under this session" indicator.
+  // Unlike the caret badge, the parent item is always visible, so this shows
+  // whether the subagent group is expanded or collapsed. CSS gives the
+  // session's own states (needs-attention, response-ready, cli-busy)
+  // precedence over it.
+  const parentEl = document.getElementById('si-' + parentSessionId);
+  if (parentEl) parentEl.classList.toggle('has-busy-agents', parentHasActiveSubagent(parentSessionId));
 }
 
 (function initSubagentLiveListeners() {
@@ -1039,6 +1068,7 @@ function buildSessionItem(session) {
   if (attentionSessions.has(session.sessionId)) item.classList.add('needs-attention');
   if (responseReadySessions.has(session.sessionId)) item.classList.add('response-ready');
   if (sessionBusyState.get(session.sessionId)) item.classList.add('cli-busy');
+  if (parentHasActiveSubagent(session.sessionId)) item.classList.add('has-busy-agents');
   item.dataset.sessionId = session.sessionId;
 
   const modified = new Date(session.modified);

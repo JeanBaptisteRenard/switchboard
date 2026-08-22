@@ -236,6 +236,71 @@ test('completion: agent with stable mtime for >30s emits subagent-completed (dri
   }
 });
 
+test('heartbeat: a subagent whose file keeps growing re-emits subagent-spawned (throttled to 20s), so the renderer TTL never evicts a live agent', (t) => {
+  // The renderer keeps a 60s liveness TTL per agent (sidebar.js
+  // pruneStaleSubagents). Before the heartbeat, that timestamp was only ever
+  // set at spawn — any agent running longer than a minute was evicted and
+  // the parent's has-busy-agents indicator went dark while the agent still
+  // worked. Now every mtime advance re-emits an idempotent subagent-spawned
+  // (payload._heartbeat) at most every HEARTBEAT_MS (20s), which the
+  // renderer's existing spawn handler turns into a fresh last-seen stamp.
+  const events = setupModule();
+  const tmp = mkTmp();
+  try {
+    const sessionId = 'parent';
+    const subDir = seedAgents(tmp, sessionId, [{ id: 'longrun', ageMs: 0 }]);
+    const filePath = path.join(subDir, 'agent-longrun.jsonl');
+    const realBaseMs = fs.statSync(filePath).mtimeMs;
+    let bump = 0;
+    const bumpMtime = () => {
+      bump += 1;
+      const d = new Date(realBaseMs + bump * 2000);
+      fs.utimesSync(filePath, d, d);
+    };
+    const heartbeats = () => events.filter(e => e.channel === 'subagent-spawned' && e.payload._heartbeat);
+
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+
+    // Call 1: bootstrap — synthetic spawn, heartbeat clock starts.
+    const session = {};
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(heartbeats().length, 0, 'no heartbeat at bootstrap');
+
+    // 25s later the file has grown → past the 20s throttle → heartbeat.
+    t.mock.timers.tick(25_000);
+    bumpMtime();
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(heartbeats().length, 1, 'file grew 25s after spawn — one heartbeat');
+    assert.equal(heartbeats()[0].payload.parentSessionId, sessionId);
+    assert.equal(heartbeats()[0].payload.agentId, 'longrun');
+
+    // Only 5s later, another write — still inside the 20s throttle window.
+    t.mock.timers.tick(5_000);
+    bumpMtime();
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(heartbeats().length, 1, 'writes within 20s of the last heartbeat are throttled');
+
+    // 20s more → next write heartbeats again.
+    t.mock.timers.tick(20_000);
+    bumpMtime();
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(heartbeats().length, 2, 'throttle window elapsed — second heartbeat');
+
+    // File stops growing: NO heartbeat on the stable path (the orphan safety
+    // net is unchanged — silence leads to completion or renderer TTL prune).
+    detectSubagentTransitions(sessionId, session, tmp); // stable call — arms _stableStart
+    t.mock.timers.tick(31_000);
+    detectSubagentTransitions(sessionId, session, tmp); // stability elapsed — completes
+    assert.equal(heartbeats().length, 2, 'a stable (non-growing) file must not heartbeat');
+    const completions = events.filter(e => e.channel === 'subagent-completed');
+    assert.equal(completions.length, 1, 'the normal 30s-stability completion still fires');
+    assert.equal(session.knownSubagents.get('longrun').completed, true);
+  } finally {
+    t.mock.timers.reset();
+    cleanup(tmp);
+  }
+});
+
 // BT6 — concurrent session monitoring: 2 sessions no cross-contamination
 test('concurrent monitoring: detectSubagentTransitions for 2 distinct sessions emits independent events with no cross-contamination', () => {
   const events = setupModule();
