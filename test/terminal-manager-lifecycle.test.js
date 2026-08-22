@@ -512,7 +512,7 @@ test('safeFit: clamps rows to content box when cell height is available via _cor
     openFileInPanel: () => {},
     setActiveSession: () => {},
     clearNotifications: () => {},
-    hidePlanViewer: () => {},
+    hideAllViewers: () => {},
     showTerminalHeader: () => {},
     placeholder: window.document.createElement('div'),
     terminalHeader: window.document.createElement('div'),

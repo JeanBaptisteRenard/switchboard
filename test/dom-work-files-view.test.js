@@ -19,11 +19,9 @@ const INDEX_HTML = `<!DOCTYPE html>
 <html>
   <body>
     <div id="sidebar-content"></div>
-    <div id="plans-content"></div>
     <div id="memory-content"></div>
     <div id="work-files-content"></div>
     <div id="placeholder"></div>
-    <div id="plan-viewer"></div>
     <div id="memory-viewer"></div>
     <div id="work-files-viewer"></div>
     <div id="stats-viewer"></div>
@@ -73,11 +71,9 @@ function setupWorkFilesDom() {
 
   // DOM handles that plans-memory-view.js reads as globals (set by app.js normally)
   const stubGlobals = {
-    plansContent:      window.document.getElementById('plans-content'),
     memoryContent:     window.document.getElementById('memory-content'),
     workFilesContent:  window.document.getElementById('work-files-content'),
     placeholder:       window.document.getElementById('placeholder'),
-    planViewer:        window.document.getElementById('plan-viewer'),
     memoryViewer:      window.document.getElementById('memory-viewer'),
     workFilesViewer:   window.document.getElementById('work-files-viewer'),
     statsViewer:       window.document.getElementById('stats-viewer'),
@@ -85,11 +81,9 @@ function setupWorkFilesDom() {
     jsonlViewer:       window.document.getElementById('jsonl-viewer'),
     terminalArea:      window.document.getElementById('terminal-area'),
     // ViewerPanel stubs
-    planPanel:         makeViewerPanelStub(),
     memoryPanel:       makeViewerPanelStub(),
     workFilesPanel:    makeViewerPanelStub(),
     // State stubs
-    cachedPlans:       [],
     cachedMemoryData:  { global: { files: [] }, projects: [] },
   };
 

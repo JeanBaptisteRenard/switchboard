@@ -30,9 +30,9 @@ Filters combine: enabling "Running" and "Today" together shows only sessions tha
 
 ## Full-text search
 
-The search bar at the top searches across session content — not just titles. Switchboard uses an FTS5 full-text index over session transcripts, plan files, memory files, and work files. Results update as you type (minimum 3 characters).
+The search bar at the top searches across session content — not just titles. Switchboard uses an FTS5 full-text index over session transcripts, memory files, and work files. Results update as you type (minimum 3 characters).
 
-To scope a search to a specific content type, use the type selector next to the search bar (Sessions, Subagents, Plans, Memory, Work Files).
+To scope a search to a specific content type, use the type selector next to the search bar (Sessions, Subagents, Memory, Work Files).
 
 ## Delete a session
 

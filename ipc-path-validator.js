@@ -7,7 +7,7 @@
 //      hyperlinks from terminal output). Blocking a static denylist is lighter
 //      than allowlisting because the legitimate surface is unbounded.
 //
-//   2. isAllowedMemoryPath — strict allowlist for memory/plan handlers
+//   2. isAllowedMemoryPath — strict allowlist for memory handlers
 //      (read-memory, save-memory) that should only touch ~/.claude/ or active
 //      project directories.
 //
@@ -46,7 +46,7 @@ function isSensitivePath(filePath) {
 }
 
 /**
- * Returns true when `filePath` is allowed for memory/plan read-write operations.
+ * Returns true when `filePath` is allowed for memory read-write operations.
  *
  * Allowed roots:
  *   - ~/.claude/  (and ~/.claude itself)

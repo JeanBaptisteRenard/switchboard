@@ -2,9 +2,6 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
   // Invoke (request-response)
-  getPlans: () => ipcRenderer.invoke('get-plans'),
-  readPlan: (filename) => ipcRenderer.invoke('read-plan', filename),
-  savePlan: (filePath, content) => ipcRenderer.invoke('save-plan', filePath, content),
   getStats: () => ipcRenderer.invoke('get-stats'),
   getStatsFromDb: () => ipcRenderer.invoke('get-stats-from-db'),
   refreshStats: () => ipcRenderer.invoke('refresh-stats'),

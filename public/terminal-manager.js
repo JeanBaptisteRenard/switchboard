@@ -1124,7 +1124,7 @@ function showSession(sessionId) {
     // Single terminal view
     document.querySelectorAll('.terminal-container').forEach(el => el.classList.remove('visible'));
     placeholder.style.display = 'none';
-    hidePlanViewer();
+    hideAllViewers();
     if (session) showTerminalHeader(session);
     // Only one terminal is ever visible in single view — suspend the WebGL
     // context of whatever we're switching away from. This is the single-view

@@ -39,7 +39,6 @@
     // Show settings viewer, hide others
     document.getElementById('placeholder').style.display = 'none';
     document.getElementById('terminal-area').style.display = 'none';
-    document.getElementById('plan-viewer').style.display = 'none';
     document.getElementById('stats-viewer').style.display = 'none';
     document.getElementById('memory-viewer').style.display = 'none';
     document.getElementById('jsonl-viewer').style.display = 'none';

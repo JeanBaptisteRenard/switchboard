@@ -169,7 +169,6 @@ function setupSettingsPanelDom(platform) {
     <div id="terminal-area"></div>
     <div id="terminal-header"></div>
     <div id="placeholder"></div>
-    <div id="plan-viewer"></div>
     <div id="stats-viewer"></div>
     <div id="memory-viewer"></div>
     <div id="jsonl-viewer"></div>

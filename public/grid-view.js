@@ -4,7 +4,7 @@
 //
 // Depends on globals from app.js: openSessions, activeSessionId, sessionMap, activePtyIds,
 // sortedOrder, sidebarContent, terminalsEl, gridViewActive, gridViewer, gridViewerCount,
-// placeholder, terminalHeader, planViewer, statsViewer, memoryViewer, settingsViewer,
+// placeholder, terminalHeader, statsViewer, memoryViewer, settingsViewer,
 // jsonlViewer, terminalArea, cachedProjects, isMac
 // Depends on: cleanDisplayName, formatDate (utils.js), fitAndScroll, showSession (terminal-manager.js)
 
@@ -292,7 +292,6 @@ function showGridView() {
   terminalHeader.style.display = 'none';
 
   // Hide other viewers but keep terminal-area visible
-  planViewer.style.display = 'none';
   statsViewer.style.display = 'none';
   memoryViewer.style.display = 'none';
   settingsViewer.style.display = 'none';

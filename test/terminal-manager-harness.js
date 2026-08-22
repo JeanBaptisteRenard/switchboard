@@ -143,7 +143,7 @@ function setupTerminalDom(opts = {}) {
     openFileInPanel: () => {},
     setActiveSession: () => {},
     clearNotifications: () => {},
-    hidePlanViewer: () => {},
+    hideAllViewers: () => {},
     showTerminalHeader: () => {},
     updateRunningIndicators: () => {},
     placeholder: window.document.createElement('div'),

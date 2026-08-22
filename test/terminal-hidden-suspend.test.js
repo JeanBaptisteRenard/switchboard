@@ -609,7 +609,7 @@ function installGridViewGlobals(window, sessionIds) {
   // jsdom does not implement scrollIntoView; showGridView's deferred
   // focusGridCard rAF callback calls it on the focused card.
   window.HTMLElement.prototype.scrollIntoView = () => {};
-  for (const name of ['planViewer', 'statsViewer', 'memoryViewer', 'settingsViewer', 'jsonlViewer', 'terminalArea']) {
+  for (const name of ['statsViewer', 'memoryViewer', 'settingsViewer', 'jsonlViewer', 'terminalArea']) {
     if (!window[name]) window[name] = doc.createElement('div');
   }
   const sidebarContent = doc.createElement('div');

@@ -32,11 +32,9 @@ function makeSearchState() {
     searchMatchIds: null,
     searchMatchProjectPaths: null,
     cachedAllProjects: [],
-    cachedPlans: [],
     searchTitlesOnly: false,
     // Spies
     refreshSidebarCalls: [],
-    renderPlansCalls: [],
     renderMemoriesCalls: [],
     renderWorkFilesCalls: [],
     apiSearchCalls: [],
@@ -49,9 +47,6 @@ function makeSearchState() {
 
   function refreshSidebar(opts) {
     state.refreshSidebarCalls.push(opts);
-  }
-  function renderPlans(plans) {
-    state.renderPlansCalls.push(plans);
   }
   function renderMemories(ids) {
     state.renderMemoriesCalls.push(ids);
@@ -68,8 +63,6 @@ function makeSearchState() {
       state.searchMatchIds = null;
       state.searchMatchProjectPaths = null;
       refreshSidebar({ resort: true }); // resort:true required — sortedOrder is stale after search
-    } else if (state.activeTab === 'plans') {
-      renderPlans(state.cachedPlans);
     } else if (state.activeTab === 'memory') {
       renderMemories();
     } else if (state.activeTab === 'work-files') {
@@ -83,8 +76,6 @@ function makeSearchState() {
       state.searchMatchIds = null;
       state.searchMatchProjectPaths = null;
       refreshSidebar({ resort: true }); // resort:true required — same stale-sortedOrder reason
-    } else if (state.activeTab === 'plans') {
-      renderPlans(state.cachedPlans);
     } else if (state.activeTab === 'memory') {
       renderMemories();
     } else if (state.activeTab === 'work-files') {
@@ -276,19 +267,3 @@ test('search: "  a  " (1 trimmed char) does NOT call api.search and preserves in
   assert.equal(inputEl.value, '  a  ', 'input value must be preserved (not cleared)');
 });
 
-// ---------------------------------------------------------------------------
-// Cross-tab: non-sessions tabs route correctly under 3-char threshold
-// ---------------------------------------------------------------------------
-
-test('search: 2-char query on plans tab calls renderPlans (not api.search)', async () => {
-  const { state, inputEl, runSearchQuery } = makeSearchState();
-  state.activeTab = 'plans';
-  state.cachedPlans = [{ filename: 'plan-a.md' }];
-  inputEl.value = 'pl';
-  let apiCalled = false;
-  await runSearchQuery(() => { apiCalled = true; });
-
-  assert.equal(apiCalled, false, 'api.search not called for 2-char on plans tab');
-  assert.equal(state.renderPlansCalls.length, 1, 'renderPlans called to show unfiltered list');
-  assert.deepEqual(state.renderPlansCalls[0], state.cachedPlans);
-});

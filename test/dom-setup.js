@@ -27,7 +27,6 @@ const INDEX_HTML = `<!DOCTYPE html>
 <html>
   <body>
     <div id="sidebar-content"></div>
-    <div id="plans-content"></div>
     <div id="stats-content"></div>
     <div id="memory-content"></div>
     <div id="placeholder"></div>
@@ -65,7 +64,6 @@ function setupSidebarDom() {
   const stubGlobals = {
     // DOM handles normally set up by app.js
     sidebarContent: window.document.getElementById('sidebar-content'),
-    plansContent: window.document.getElementById('plans-content'),
     statsContent: window.document.getElementById('stats-content'),
     memoryContent: window.document.getElementById('memory-content'),
 

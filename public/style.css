@@ -1858,17 +1858,10 @@ body { display: flex; flex-direction: column; }
 }
 
 /* ========== SCROLLBAR ========== */
-#sidebar-content::-webkit-scrollbar, #plans-content::-webkit-scrollbar { width: 5px; }
-#sidebar-content::-webkit-scrollbar-track, #plans-content::-webkit-scrollbar-track { background: transparent; }
-#sidebar-content::-webkit-scrollbar-thumb, #plans-content::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.06); border-radius: 3px; }
-#sidebar-content::-webkit-scrollbar-thumb:hover, #plans-content::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.1); }
-
-/* ========== PLANS ========== */
-#plans-content {
-  flex: 1;
-  overflow-y: auto;
-  padding: 4px 0 16px;
-}
+#sidebar-content::-webkit-scrollbar { width: 5px; }
+#sidebar-content::-webkit-scrollbar-track { background: transparent; }
+#sidebar-content::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.06); border-radius: 3px; }
+#sidebar-content::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.1); }
 
 .plans-empty {
   padding: 40px 20px;
@@ -1877,16 +1870,7 @@ body { display: flex; flex-direction: column; }
   font-size: 13px;
 }
 
-/* ---- Plan viewer ---- */
-#plan-viewer {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  flex-direction: column;
-  background: #111118;
-}
-
-/* Shared viewer toolbar (plan, memory, file panel) */
+/* Shared viewer toolbar (memory, file panel) */
 .viewer-toolbar {
   display: flex;
   align-items: center;
