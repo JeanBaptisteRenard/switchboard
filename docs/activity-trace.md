@@ -93,7 +93,7 @@ no `sent`.
 | `osc.progress` | Every OSC 9;4 progress level (except `4;0`) | `level`, `payload`, `was`, `decision` |
 | `osc.notify` | Every non-progress OSC 9 | `message`, `sent` |
 | `busy.emit` | A `cli-busy-state` event leaves main | `busy`, `via` (`osc0` / `osc9.4`), `sent` |
-| `subagent.spawned` | `subagent-spawned` is sent | `agentId`, `kind` (`spawn` / `bootstrap` / `heartbeat`), `subagentType`, `ageMs`, `sent` |
+| `subagent.spawned` | `subagent-spawned` is sent | `agentId`, `kind` (`spawn` / `heartbeat`), `subagentType`, `ageMs`, `sent` |
 | `subagent.assumed-finished` | An unknown transcript is recorded as already finished, **silently** — no IPC | `agentId`, `ageMs`, `bootstrap`, `recheck` |
 | `subagent.rehabilitated` | An assumed-finished entry grew inside its recheck window: the withheld spawn is released | `agentId`, `withheldForMs`, `subagentType`, `sent` |
 | `subagent.completed` | `subagent-completed` is sent | `agentId`, `stableForMs`, `reason`, `sent` |
