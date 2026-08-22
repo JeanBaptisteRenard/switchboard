@@ -51,7 +51,7 @@ One JSON object per line. The first six fields are the envelope, always in this
 order, always present; the rest is the probe's payload.
 
 ```json
-{"seq":417,"t":38214.912,"wall":"2026-08-22T14:20:09.118Z","src":"main","cat":"osc.title","sid":"6f1c…","cp":"U+25D0 U+0020 U+0043","title":"◐ Claude","busy":false,"idle":false,"was":true,"decision":"ignored:no-match"}
+{"seq":417,"t":38214.912,"wall":"2026-08-22T14:20:09.118Z","src":"main","cat":"osc.title","sid":"6f1c…","cp":"U+25D0 U+0020 U+0043","title":"◐ Claude","busy":true,"idle":false,"rule":"glyph","was":false,"decision":"emit:busy"}
 ```
 
 | Field | Meaning |
@@ -89,7 +89,7 @@ no `sent`.
 
 | `cat` | Fires when | Key fields |
 |---|---|---|
-| `osc.title` | Every OSC 0 title with a payload | `cp`, `title`, `busy`, `idle`, `was`, `decision` |
+| `osc.title` | Every OSC 0 title with a payload | `cp`, `title`, `busy`, `idle`, `rule` (`glyph` / `idle-glyph` / `fallback` / `null`), `was`, `decision` |
 | `osc.progress` | Every OSC 9;4 progress level (except `4;0`) | `level`, `payload`, `was`, `decision` |
 | `osc.notify` | Every non-progress OSC 9 | `message`, `sent` |
 | `busy.emit` | A `cli-busy-state` event leaves main | `busy`, `via` (`osc0` / `osc9.4`), `sent` |
@@ -128,12 +128,31 @@ this — it is inert when the trace is off.
 
 Three questions it answers that nothing else can:
 
-**Does the CLI's title still match the busy test?** `main.js` calls a title
-busy when its first character is in the braille block `U+2800..U+28FF`. Grep
-`osc.title` and look at `cp`. If it reads `U+25D0` / `U+25D1` and `decision` is
-`ignored:no-match`, the title path can no longer turn the spinner *on* — only
-`busy.emit` with `via:"osc9.4"` can, which means the indicator depends on the
-CLI's progress-bar setting rather than on its title.
+**Does the CLI's title still match the busy test?** This is the question the
+trace was built for, and the first run of it (2026-08-22) found the test broken:
+over the first ten minutes of that trace, 623 of 628 OSC 0 titles started with
+`U+25D0` / `U+25D1` and were marked `ignored:no-match`, and every busy transition
+was attributed to `via:"osc9.4"` — the title could only turn the spinner *off*.
+Quote a window, not a total, if you cite your own run: the file grows for as long
+as the variable is set. Recheck after a
+CLI upgrade, because the glyphs are the CLI's private business and it has
+changed them before:
+
+```bash
+# Leading code points, and what the detector made of them
+jq -r 'select(.cat=="osc.title") | "\(.cp | split(" ")[0])\t\(.rule)\t\(.decision)"' $TRACE | sort | uniq -c
+
+# Where busy transitions actually came from — `osc0` must appear
+jq -r 'select(.cat=="busy.emit" and .busy==true) | .via' $TRACE | sort | uniq -c
+```
+
+Spinner frames reading `rule:"fallback"` mean the CLI moved to glyphs the range
+table in `classify-title-activity.js` does not list yet — still detected, worth
+adding. `ignored:no-match` on a title that visibly carries a prefix means the
+fallback itself regressed. No `osc0` in the second count means the title channel
+is dead again and the indicator is riding on the progress-bar setting alone. The
+full argument is in [`.ai/contexts/ipc-bridge.md`](../.ai/contexts/ipc-bridge.md),
+"The OSC 0 title is the primary busy channel".
 
 **Was an event suppressed, or never sent?** `osc.title` records the verdict
 (`emit:*` vs `suppressed:*`) and `busy.emit` records the actual send. A
@@ -166,8 +185,8 @@ name the guard that dropped the value.
 ```bash
 TRACE=~/.switchboard-dev/activity-trace-*.jsonl
 
-# Which code points does the CLI actually send, and what does the test say?
-jq -r 'select(.cat=="osc.title") | "\(.cp)\t\(.decision)"' $TRACE | sort | uniq -c
+# Which code points does the CLI actually send, and what did the detector decide?
+jq -r 'select(.cat=="osc.title") | "\(.cp)\t\(.rule)\t\(.decision)"' $TRACE | sort | uniq -c
 
 # Everything about one session, in order
 jq -c 'select(.sid=="6f1c…")' $TRACE

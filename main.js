@@ -35,6 +35,8 @@ log.transports.console.level = app.isPackaged ? 'info' : 'debug';
 const activityTrace = require('./activity-trace');
 const { enabled: TRACE, trace, codePoints, busyDecision, progressDecision } = activityTrace;
 
+const { classifyTitleActivity } = require('./classify-title-activity');
+
 try { require('electron-reloader')(module, { watchRenderer: true }); } catch {};
 
 // Clean env for child processes — strip Electron internals that cause nested
@@ -2020,13 +2022,11 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       for (const m of oscMatches) {
         const code = m[1];
         const payload = m[2].slice(0, 120);
-        // Detect Claude CLI busy state from OSC 0 title (spinner chars = busy, ✳ = idle)
+        // Detect Claude CLI busy state from the OSC 0 title — see .ai/contexts/ipc-bridge.md
         if (code === '0') {
-          const firstChar = payload.charAt(0);
-          const isBusy = firstChar.charCodeAt(0) >= 0x2800 && firstChar.charCodeAt(0) <= 0x28FF;
-          const isIdle = firstChar === '\u2733'; // ✳
-          log.debug(`[OSC 0] session=${currentId} char=U+${firstChar.charCodeAt(0).toString(16).toUpperCase()} busy=${isBusy} idle=${isIdle} wasBusy=${!!session._cliBusy}`);
-          if (TRACE) trace('osc.title', currentId, { cp: codePoints(payload, 3), title: payload.slice(0, 60), busy: isBusy, idle: isIdle, was: !!session._cliBusy, decision: busyDecision(isBusy, isIdle, !!session._cliBusy) });
+          const { busy: isBusy, idle: isIdle, via } = classifyTitleActivity(payload, { allowFallback: !session.isPlainTerminal });
+          log.debug(`[OSC 0] session=${currentId} cp=${codePoints(payload, 1)} rule=${via} busy=${isBusy} idle=${isIdle} wasBusy=${!!session._cliBusy}`);
+          if (TRACE) trace('osc.title', currentId, { cp: codePoints(payload, 3), title: payload.slice(0, 60), busy: isBusy, idle: isIdle, rule: via, was: !!session._cliBusy, decision: busyDecision(isBusy, isIdle, !!session._cliBusy) });
           if (isBusy && !session._cliBusy) {
             session._cliBusy = true;
             session._oscIdle = false;
