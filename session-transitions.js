@@ -100,8 +100,10 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
 
     const known = session.knownSubagents.get(agentId);
 
-    // Already completed — nothing more to do, skip statSync.
-    if (known && known.completed) continue;
+    // Completed and settled — nothing more to do, skip statSync. An entry
+    // still carrying a recheck window is the exception: it was only assumed
+    // finished, and growth would disprove that.
+    if (known && known.completed && !known._recheckStart) continue;
 
     // Dir unchanged → no new entries can exist; skip statSync for unknown files.
     if (!known && !dirChanged) continue;
@@ -111,55 +113,73 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
     const mtimeMs = stat.mtimeMs;
 
     if (!known) {
-      if (isBootstrap) {
-        // Cold-start initialization — record silently without firing IPC.
-        // Treat recently-modified files as still-active so they can complete
-        // through the normal lifecycle; treat older ones as already done.
-        const looksAlive = (now - mtimeMs) < BOOTSTRAP_LIVE_MS;
-        const meta = looksAlive ? (readSubagentMeta(filePath) || {}) : {};
+      // A stale file is assumed finished and recorded silently. At bootstrap
+      // that is certain; afterwards the sighting may simply be late, so the
+      // entry keeps a recheck window instead of being frozen.
+      // See .ai/contexts/subagent-observability.md
+      const looksAlive = (now - mtimeMs) < BOOTSTRAP_LIVE_MS;
+      if (!looksAlive) {
         session.knownSubagents.set(agentId, {
           mtimeMs,
-          completed: !looksAlive,
-          _completedAt: looksAlive ? null : now,
+          completed: true,
+          _completedAt: now,
+          subagentType: null,
+          description: null,
+          _lastHeartbeatAt: now,
+          _recheckStart: isBootstrap ? null : now,
+        });
+        continue;
+      }
+
+      // First sighting of a live file: a synthetic spawn at bootstrap
+      // (_bootstrap), a genuine one afterwards.
+      const meta = readSubagentMeta(filePath) || {};
+      session.knownSubagents.set(agentId, {
+        mtimeMs,
+        completed: false,
+        _completedAt: null,
+        subagentType: meta.agentType || null,
+        description: meta.description || null,
+        _lastHeartbeatAt: now,
+      });
+      log.info(`[subagent-spawn${isBootstrap ? '-bootstrap' : ''}] parent=${sessionId} agentId=${agentId} type=${meta.agentType || 'unknown'}`);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        const payload = {
+          parentSessionId: sessionId,
+          agentId,
           subagentType: meta.agentType || null,
           description: meta.description || null,
-          _lastHeartbeatAt: now,
-        });
-        // Fix 2: emit a synthetic spawn for live bootstrap files so the
-        // renderer's liveSubagents / activeSubagents Maps have an entry and
-        // can correctly handle the subsequent subagent-completed event.
-        // The _bootstrap flag lets the renderer dedupe if it already has state.
-        if (looksAlive && mainWindow && !mainWindow.isDestroyed()) {
-          log.info(`[subagent-spawn-bootstrap] parent=${sessionId} agentId=${agentId}`);
+        };
+        if (isBootstrap) payload._bootstrap = true;
+        mainWindow.webContents.send('subagent-spawned', payload);
+      }
+    } else if (known.completed) {
+      // Inside the recheck window of an assumed-finished entry. A file that
+      // grows is alive: undo the assumption and emit the withheld spawn.
+      if (mtimeMs !== known.mtimeMs) {
+        const meta = readSubagentMeta(filePath) || {};
+        known.mtimeMs = mtimeMs;
+        known.completed = false;
+        known._completedAt = null;
+        known._recheckStart = null;
+        known._stableStart = null;
+        known.subagentType = meta.agentType || null;
+        known.description = meta.description || null;
+        known._lastHeartbeatAt = now;
+        log.info(`[subagent-spawn-late] parent=${sessionId} agentId=${agentId} type=${meta.agentType || 'unknown'}`);
+        if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('subagent-spawned', {
             parentSessionId: sessionId,
             agentId,
             subagentType: meta.agentType || null,
             description: meta.description || null,
-            _bootstrap: true,
           });
         }
-        continue;
+      } else if (now - known._recheckStart >= STABLE_MS) {
+        // Observed motionless for a full stability window — settled.
+        known._recheckStart = null;
       }
-      // First sighting post-bootstrap — real spawn event
-      const meta = readSubagentMeta(filePath) || {};
-      session.knownSubagents.set(agentId, {
-        mtimeMs,
-        completed: false,
-        subagentType: meta.agentType || null,
-        description: meta.description || null,
-        _lastHeartbeatAt: now,
-      });
-      log.info(`[subagent-spawn] parent=${sessionId} agentId=${agentId} type=${meta.agentType || 'unknown'}`);
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('subagent-spawned', {
-          parentSessionId: sessionId,
-          agentId,
-          subagentType: meta.agentType || null,
-          description: meta.description || null,
-        });
-      }
-    } else if (!known.completed) {
+    } else {
       if (mtimeMs !== known.mtimeMs) {
         // File is still being written — update mtime, reset stability clock
         known.mtimeMs = mtimeMs;
@@ -182,6 +202,7 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
           known._stableStart = now;
         } else if (now - known._stableStart >= STABLE_MS) {
           known.completed = true;
+          known._completedAt = now;
           log.info(`[subagent-complete] parent=${sessionId} agentId=${agentId}`);
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('subagent-completed', {
@@ -194,14 +215,16 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
     }
   }
 
-  // GC: remove completed entries after 5 minutes to avoid unbounded growth
-  const GC_TTL = 5 * 60 * 1000;
-  for (const [agentId, state] of session.knownSubagents) {
-    if (state.completed && state._completedAt && now - state._completedAt > GC_TTL) {
-      session.knownSubagents.delete(agentId);
+  // GC: forget an entry only once its file has left the disk, which bounds the
+  // map by the directory's own size. See .ai/contexts/subagent-observability.md
+  if (dirChanged && session.knownSubagents.size > files.length) {
+    const onDisk = new Set();
+    for (const file of files) {
+      const m = file.match(/^agent-(.+)\.jsonl$/);
+      if (m) onDisk.add(m[1]);
     }
-    if (state.completed && !state._completedAt) {
-      state._completedAt = now;
+    for (const agentId of session.knownSubagents.keys()) {
+      if (!onDisk.has(agentId)) session.knownSubagents.delete(agentId);
     }
   }
 }
@@ -327,6 +350,11 @@ function detectSessionTransitions(folder) {
         log.info(`[session-transition] ${sessionId} → ${newId} (fork)`);
         session.knownJsonlFiles = new Set(currentFiles);
         session.realSessionId = newId;
+        // Subagent scanning follows realSessionId into a different directory —
+        // drop the state keyed to the old one so the new one bootstraps.
+        session.knownSubagents = null;
+        session._prevDirMtime = undefined;
+        session._subFileList = null;
         activeSessions.delete(sessionId);
         activeSessions.set(newId, session);
         // Re-key MCP server to match new session ID

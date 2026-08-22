@@ -333,11 +333,10 @@ test('concurrent monitoring: detectSubagentTransitions for 2 distinct sessions e
     assert.ok(!sessB.knownSubagents.has('a-worker-2'), 'sessB must not know about a-worker-2');
 
     // Add a new agent to session A only — should NOT appear in session B.
-    // Busy-wait a few ms to ensure the filesystem mtime of the subagents dir
-    // advances past the value cached during bootstrap, so dirChanged=true.
-    const waitUntil = Date.now() + 5;
-    while (Date.now() < waitUntil) { /* spin */ }
-    seedAgents(tmp, sessionA, [{ id: 'a-worker-new' }]);
+    // Force the subagents dir mtime past the value cached during bootstrap so
+    // dirChanged=true: waiting on filesystem timestamp granularity is flaky.
+    const subDirA = seedAgents(tmp, sessionA, [{ id: 'a-worker-new' }]);
+    setMtime(subDirA, Date.now() + 1000);
     detectSubagentTransitions(sessionA, sessA, tmp);
     detectSubagentTransitions(sessionB, sessB, tmp);
 
@@ -360,6 +359,265 @@ test('concurrent monitoring: detectSubagentTransitions for 2 distinct sessions e
     // Fresh workers from bootstrap emit with _bootstrap:true; the new post-bootstrap
     // agent for sessA must NOT carry _bootstrap:true
     assert.ok(!newWorkerEvent.payload._bootstrap, 'post-bootstrap spawn must not carry _bootstrap flag');
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+// --- Resurrection guard ---
+// A finished subagent's agent-<id>.jsonl stays on disk forever, but its
+// knownSubagents entry used to be GC'd 5 minutes after completion. The next
+// time the subagents dir mtime moved (i.e. every time a NEW subagent starts)
+// the whole directory was rescanned, every GC'd file came back as "unknown",
+// and the post-bootstrap branch announced it as a fresh spawn — lighting the
+// running dot on every historical subagent except the one that had just
+// finished (still in the map, still flagged completed).
+
+/** Force a path's mtime to an exact epoch value — deterministic, unlike
+ *  relying on filesystem timestamp granularity to advance on its own. */
+function setMtime(p, ms) {
+  const d = new Date(ms);
+  fs.utimesSync(p, d, d);
+}
+
+test('post-GC: a long-finished agent whose file is still on disk is never re-announced as a spawn', (t) => {
+  const events = setupModule();
+  const tmp = mkTmp();
+  const spawns = () => events.filter(e => e.channel === 'subagent-spawned');
+  try {
+    const sessionId = 'parent';
+    const subDir = path.join(tmp, sessionId, 'subagents');
+    fs.mkdirSync(subDir, { recursive: true });
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+
+    // Bootstrap on an empty dir, then a genuine spawn.
+    const session = {};
+    detectSubagentTransitions(sessionId, session, tmp);
+    seedAgents(tmp, sessionId, [{ id: 'old' }]);
+    setMtime(path.join(subDir, 'agent-old.jsonl'), Date.now());
+    setMtime(subDir, Date.now());
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(spawns().length, 1, 'the genuine spawn is announced once');
+
+    // It goes quiet and completes through the 30s stability window.
+    detectSubagentTransitions(sessionId, session, tmp); // arms _stableStart
+    t.mock.timers.tick(31_000);
+    detectSubagentTransitions(sessionId, session, tmp); // completion fires
+    assert.equal(events.filter(e => e.channel === 'subagent-completed').length, 1);
+
+    // Six minutes later the GC pass at the end of a flush drops the entry
+    // even though agent-old.jsonl is still sitting in the directory.
+    t.mock.timers.tick(6 * 60_000);
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    // Now a brand-new agent starts: the directory mtime moves and every file
+    // in it is rescanned.
+    seedAgents(tmp, sessionId, [{ id: 'fresh' }]);
+    setMtime(path.join(subDir, 'agent-fresh.jsonl'), Date.now());
+    setMtime(subDir, Date.now());
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    const late = spawns().slice(1);
+    assert.equal(late.length, 1, `expected exactly 1 new spawn, got ${late.length}: ${JSON.stringify(late.map(e => e.payload.agentId))}`);
+    assert.equal(late[0].payload.agentId, 'fresh', 'only the genuinely new agent is announced');
+  } finally {
+    t.mock.timers.reset();
+    cleanup(tmp);
+  }
+});
+
+test('post-GC volume: 30 historical agent files plus 1 new one emit exactly one spawn', (t) => {
+  const events = setupModule();
+  const tmp = mkTmp();
+  try {
+    const sessionId = 'parent';
+    const olds = Array.from({ length: 30 }, (_, i) => ({ id: `old-${i}`, ageMs: 120_000 }));
+    const subDir = seedAgents(tmp, sessionId, olds);
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+
+    // Bootstrap absorbs all 30 silently (all older than BOOTSTRAP_LIVE_MS).
+    const session = {};
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(events.length, 0, 'bootstrap of old files must be silent');
+
+    // Six minutes on, a flush runs its GC pass over those completed entries.
+    t.mock.timers.tick(6 * 60_000);
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    seedAgents(tmp, sessionId, [{ id: 'fresh' }]);
+    setMtime(path.join(subDir, 'agent-fresh.jsonl'), Date.now());
+    setMtime(subDir, Date.now());
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    const spawns = events.filter(e => e.channel === 'subagent-spawned');
+    assert.equal(spawns.length, 1, `expected 1 spawn, got ${spawns.length}: ${JSON.stringify(spawns.map(e => e.payload.agentId))}`);
+    assert.equal(spawns[0].payload.agentId, 'fresh');
+  } finally {
+    t.mock.timers.reset();
+    cleanup(tmp);
+  }
+});
+
+test('post-bootstrap: an unknown file with an old mtime is recorded as finished, not announced as live', () => {
+  const events = setupModule();
+  const tmp = mkTmp();
+  try {
+    const sessionId = 'parent';
+    const subDir = path.join(tmp, sessionId, 'subagents');
+    fs.mkdirSync(subDir, { recursive: true });
+
+    const session = {};
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(session.knownSubagents.size, 0);
+
+    // A file this session has never seen, already 5 minutes stale — it cannot
+    // be a live spawn, whatever made the directory mtime move.
+    seedAgents(tmp, sessionId, [{ id: 'stale', ageMs: 300_000 }]);
+    setMtime(subDir, Date.now());
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    assert.equal(events.length, 0, 'a stale unknown file must not emit subagent-spawned');
+    const entry = session.knownSubagents.get('stale');
+    assert.ok(entry, 'it is still recorded so it is not rediscovered on the next scan');
+    assert.equal(entry.completed, true);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('late sighting: a stale file that then grows is a live agent — the withheld spawn is emitted', (t) => {
+  // detectSubagentTransitions only runs from flushChanges, whose debounce is
+  // shared across PROJECTS_DIR and has no maxWait: a burst of parallel
+  // subagent writes can push the first flush past BOOTSTRAP_LIVE_MS. The age
+  // filter must be reversible, or a genuinely live agent discovered late would
+  // be silently written off for the rest of the session.
+  const events = setupModule();
+  const tmp = mkTmp();
+  try {
+    const sessionId = 'parent';
+    const subDir = path.join(tmp, sessionId, 'subagents');
+    fs.mkdirSync(subDir, { recursive: true });
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+
+    const session = {};
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    // The agent started 90s ago and its file is only being seen now.
+    seedAgents(tmp, sessionId, [{ id: 'late' }]);
+    const filePath = path.join(subDir, 'agent-late.jsonl');
+    setMtime(filePath, Date.now() - 90_000);
+    setMtime(subDir, Date.now());
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(events.length, 0, 'nothing announced on the stale first sighting');
+    assert.equal(session.knownSubagents.get('late').completed, true, 'assumed finished for now');
+
+    // It is still working: the file grows.
+    t.mock.timers.tick(1_000);
+    setMtime(filePath, Date.now());
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    const spawns = events.filter(e => e.channel === 'subagent-spawned');
+    assert.equal(spawns.length, 1, `growth must produce exactly one spawn, got ${spawns.length}`);
+    assert.equal(spawns[0].payload.agentId, 'late');
+    assert.ok(!spawns[0].payload._heartbeat, 'it is a spawn, not a heartbeat');
+    assert.equal(session.knownSubagents.get('late').completed, false, 'the assumption is undone');
+
+    // From there the normal lifecycle applies: it completes on stability.
+    detectSubagentTransitions(sessionId, session, tmp);
+    t.mock.timers.tick(31_000);
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(events.filter(e => e.channel === 'subagent-completed').length, 1);
+  } finally {
+    t.mock.timers.reset();
+    cleanup(tmp);
+  }
+});
+
+test('the recheck window closes: a stale file that never moves settles and is not re-announced', (t) => {
+  const events = setupModule();
+  const tmp = mkTmp();
+  try {
+    const sessionId = 'parent';
+    const subDir = path.join(tmp, sessionId, 'subagents');
+    fs.mkdirSync(subDir, { recursive: true });
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+
+    const session = {};
+    detectSubagentTransitions(sessionId, session, tmp);
+    seedAgents(tmp, sessionId, [{ id: 'history', ageMs: 300_000 }]);
+    setMtime(subDir, Date.now());
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    // Motionless across a full stability window → settled, no more statSync.
+    detectSubagentTransitions(sessionId, session, tmp);
+    t.mock.timers.tick(31_000);
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.ok(!session.knownSubagents.get('history')._recheckStart, 'recheck window closed');
+
+    // Even a late touch of a settled entry stays silent — it is history.
+    t.mock.timers.tick(1_000);
+    setMtime(path.join(subDir, 'agent-history.jsonl'), Date.now());
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(events.length, 0, 'a settled entry is never re-announced');
+  } finally {
+    t.mock.timers.reset();
+    cleanup(tmp);
+  }
+});
+
+test('the recheck window does not reopen the mass-spawn: 30 motionless history files stay silent across flushes', (t) => {
+  const events = setupModule();
+  const tmp = mkTmp();
+  try {
+    const sessionId = 'parent';
+    const olds = Array.from({ length: 30 }, (_, i) => ({ id: `old-${i}`, ageMs: 120_000 }));
+    const subDir = seedAgents(tmp, sessionId, olds);
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+
+    const session = {};
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    // A new agent starts and keeps writing over the next couple of minutes.
+    seedAgents(tmp, sessionId, [{ id: 'fresh' }]);
+    const freshPath = path.join(subDir, 'agent-fresh.jsonl');
+    setMtime(freshPath, Date.now());
+    setMtime(subDir, Date.now());
+    for (let i = 0; i < 8; i += 1) {
+      detectSubagentTransitions(sessionId, session, tmp);
+      t.mock.timers.tick(15_000);
+      setMtime(freshPath, Date.now());
+    }
+
+    const spawns = events.filter(e => e.channel === 'subagent-spawned' && !e.payload._heartbeat);
+    assert.equal(spawns.length, 1, `expected 1 spawn across every flush, got ${spawns.length}: ${JSON.stringify(spawns.map(e => e.payload.agentId))}`);
+    assert.equal(spawns[0].payload.agentId, 'fresh');
+  } finally {
+    t.mock.timers.reset();
+    cleanup(tmp);
+  }
+});
+
+test('a completed agent whose file is deleted is forgotten (knownSubagents stays bounded by the disk)', () => {
+  const events = setupModule();
+  const tmp = mkTmp();
+  try {
+    const sessionId = 'parent';
+    const subDir = seedAgents(tmp, sessionId, [
+      { id: 'gone', ageMs: 120_000 },
+      { id: 'stays', ageMs: 120_000 },
+    ]);
+
+    const session = {};
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(session.knownSubagents.size, 2);
+
+    fs.rmSync(path.join(subDir, 'agent-gone.jsonl'));
+    setMtime(subDir, Date.now());
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    assert.ok(!session.knownSubagents.has('gone'), 'entry dropped once its file left the disk');
+    assert.ok(session.knownSubagents.has('stays'), 'entries whose file still exists are kept');
+    assert.equal(events.length, 0);
   } finally {
     cleanup(tmp);
   }
@@ -456,6 +714,44 @@ test('fork detection: an unreadable .jsonl entry is treated as signal-less and r
       !activeSessions.get('pty-id').knownJsonlFiles.has('weird.jsonl'),
       'signal-less file excluded from known set so it is rechecked next cycle'
     );
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('fork detection: the re-key drops the subagent scan state, so the new session\'s history is not announced as spawns', () => {
+  const tmp = mkTmp();
+  try {
+    const folder = 'proj';
+    const folderPath = path.join(tmp, folder);
+    fs.mkdirSync(folderPath, { recursive: true });
+    const { events, activeSessions } = setupForkDetection(tmp);
+
+    // The pre-fork session has been scanning its own subagents dir.
+    seedAgents(folderPath, 'old-id', [{ id: 'a-old', ageMs: 120_000 }]);
+    const session = makePtySession(folder);
+    activeSessions.set('old-id', session);
+    fs.writeFileSync(
+      path.join(folderPath, 'new-id.jsonl'),
+      JSON.stringify({ forkedFrom: { sessionId: 'old-id' }, type: 'user' }) + '\n',
+      'utf8'
+    );
+    // The forked-to session already has a subagents history of its own.
+    seedAgents(folderPath, 'new-id', [
+      { id: 'b-1', ageMs: 120_000 },
+      { id: 'b-2', ageMs: 120_000 },
+    ]);
+
+    sessionTransitions.detectSessionTransitions(folder);
+    assert.equal(session.realSessionId, 'new-id', 'the re-key happened');
+    assert.ok(!session.knownSubagents, 'scan state dropped — the next walk targets a different directory');
+    assert.equal(session._prevDirMtime, undefined);
+
+    // Next flush: the new directory bootstraps cleanly.
+    sessionTransitions.detectSessionTransitions(folder);
+    const spawns = events.filter(e => e.channel === 'subagent-spawned');
+    assert.equal(spawns.length, 0, `the forked session's old subagents must stay silent, got ${JSON.stringify(spawns.map(e => e.payload.agentId))}`);
+    assert.equal(session.knownSubagents.size, 2, 'and they are recorded so a later rescan does not rediscover them');
   } finally {
     cleanup(tmp);
   }

@@ -84,11 +84,72 @@ This is the **#1 fork-specific feature** (upstream PR #47 still pending). It per
   `read-session-file.js` — that file is main-process and not `require()`-able
   from the renderer (sidebar.js loads as a plain script), hence the local copy.
 
+## Not resurrecting finished subagents
+
+A subagent's `agent-<id>.jsonl` is never deleted, so **every directory rescan
+re-sees the entire history of the session**. `detectSubagentTransitions()` only
+rescans when the `subagents/` dir mtime moves — which is exactly what happens
+when a *new* subagent starts. Two rules keep that rescan quiet:
+
+- **A first sighting is only a spawn if the file is fresh.** An unknown file
+  whose mtime is already older than `BOOTSTRAP_LIVE_MS` (60 s) is recorded
+  silently as `completed: true`, with no `readSubagentMeta()` and no IPC.
+- **That verdict is an assumption, and it is reversible.** A stale first
+  sighting is *not* proof the agent finished. `detectSubagentTransitions()`
+  runs only from `flushChanges()`, whose debounce (`main.js`) is shared across
+  the whole of `PROJECTS_DIR`, has no `maxWait` and no fallback poll — a burst
+  of parallel subagents can push the first flush past 60 s, and a live agent is
+  then seen late. So post-bootstrap such an entry keeps a `_recheckStart`
+  window: it is still `statSync`'d on each flush, and **if its mtime advances
+  it is rehabilitated** — `completed` returns to false and the withheld
+  `subagent-spawned` is emitted (logged `[subagent-spawn-late]`). The window
+  closes once the file has been seen motionless for a full `STABLE_MS`, after
+  which the entry is frozen and costs nothing. At bootstrap no window is
+  opened: the PTY belongs to Switchboard, so nothing it spawned can be
+  mid-flight before that session's first flush.
+- **`knownSubagents` forgets an agent only when its file leaves the disk.** The
+  earlier GC dropped completed entries after 5 minutes; because the file stayed,
+  the next rescan rediscovered it as unknown and announced a spawn. That was the
+  observed bug: starting one subagent lit the running dot on *every* historical
+  subagent except the one that had just finished (still in the map, still
+  flagged completed). Dropping the entry was never a saving either — the rescan
+  re-added it, at the cost of a `statSync` and a `readSubagentMeta()` each.
+  The map is now bounded by the directory's own file count.
+
+Renderer side, `subagent-spawned` doubles as the still-alive heartbeat
+(`payload._heartbeat`). **A heartbeat refreshes an agent already tracked; it
+never creates an entry** — in `public/sidebar.js` and `public/grid-view.js`
+alike. Without that, a stray heartbeat could revive an agent that had completed,
+been TTL-pruned, or been dropped by `clearActiveSubagentsFor()`.
+
+A fork/resume re-key (`detectSessionTransitions`) switches `realSessionId`, and
+subagent scanning follows it into a *different* directory — so the re-key also
+clears `knownSubagents`, `_prevDirMtime` and `_subFileList`, letting the new
+directory bootstrap instead of being read through the old one's cache.
+
+### What is guaranteed, and what is not
+
+Guaranteed: a static historical file never produces a spawn (it does not move,
+so it never enters the rehabilitation branch), and an agent still writing is
+always picked up — late at worst, never lost.
+
+Not guaranteed: an agent that goes quiet for longer than `STABLE_MS` mid-run —
+a long tool call, say — can be declared finished while it is still alive. That
+is not new and not specific to the age filter: the 30 s stability window has
+always been the module's only completion signal, and it applies identically to
+an agent tracked from its first line. The renderer's 60 s TTL has the same
+shape. Anything that needs true liveness would have to come from the parent
+process, not from mtime.
+
 ## If you change this, also check
 
 - `eslint.config.js` `rendererCrossFileGlobals` — must list any new renderer-global functions (e.g. `showSubagentTranscript`, `drainViewerWatches`) or lint fails on `no-undef`
 - `test/dom-subagent-transcript.test.js` — 4 tests covering the routing branch + transcript render
 - `test/dom-sidebar.test.js` — covers orphan group rendering
+- `test/session-transitions.test.js` — spawn/complete/heartbeat lifecycle plus
+  the resurrection guards above
+- `test/dom-grid-subagent-pills.test.js` — pins the grid-view IPC handler arity
+  (`preload.js` passes the payload as the callback's only argument)
 - `public/sidebar.js:771` (the routing branch) — the one-line decision that makes the whole feature work
 - IPC handler security: `read-subagent-jsonl` MUST validate that `agentId` and `parentSessionId` are filename-safe (see `resolveJsonlPath` calls in main.js — fixed in PR #8 hardening)
 
