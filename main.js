@@ -31,6 +31,10 @@ if (process.env.SWITCHBOARD_DATA_DIR) {
 log.transports.file.level = app.isPackaged ? 'info' : 'debug';
 log.transports.console.level = app.isPackaged ? 'info' : 'debug';
 
+// Opt-in activity trace — see docs/activity-trace.md.
+const activityTrace = require('./activity-trace');
+const { enabled: TRACE, trace, codePoints, busyDecision, progressDecision } = activityTrace;
+
 try { require('electron-reloader')(module, { watchRenderer: true }); } catch {};
 
 // Clean env for child processes — strip Electron internals that cause nested
@@ -123,6 +127,13 @@ const {
   closeDb,
   DB_PATH,
 } = require('./db');
+
+// The trace file sits next to switchboard.db — DB_PATH is the one resolution
+// of SWITCHBOARD_DATA_DIR, never re-derived here.
+if (TRACE) {
+  const traceFile = activityTrace.init(path.dirname(DB_PATH));
+  log.info(`[activity-trace] enabled → ${traceFile || '(failed to open)'}`);
+}
 
 // One-shot cleanup: the Plans tab was removed, so nothing indexes or clears
 // FTS rows of type 'plan' anymore. Purge any left behind by earlier versions.
@@ -235,6 +246,9 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
+      // The sandboxed preload cannot require activity-trace.js, so main's
+      // resolution of the flag is handed to it instead of parsed twice.
+      additionalArguments: TRACE ? ['--switchboard-activity-trace'] : [],
     },
   });
 
@@ -1403,6 +1417,7 @@ ipcMain.handle('get-active-sessions', () => {
   for (const [sessionId, session] of activeSessions) {
     if (!session.exited) active.push({ sessionId, busy: !!session._cliBusy });
   }
+  if (TRACE) trace('poll.snapshot', null, { count: active.length, entries: active });
   return active;
 });
 
@@ -2011,10 +2026,12 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
           const isBusy = firstChar.charCodeAt(0) >= 0x2800 && firstChar.charCodeAt(0) <= 0x28FF;
           const isIdle = firstChar === '\u2733'; // ✳
           log.debug(`[OSC 0] session=${currentId} char=U+${firstChar.charCodeAt(0).toString(16).toUpperCase()} busy=${isBusy} idle=${isIdle} wasBusy=${!!session._cliBusy}`);
+          if (TRACE) trace('osc.title', currentId, { cp: codePoints(payload, 3), title: payload.slice(0, 60), busy: isBusy, idle: isIdle, was: !!session._cliBusy, decision: busyDecision(isBusy, isIdle, !!session._cliBusy) });
           if (isBusy && !session._cliBusy) {
             session._cliBusy = true;
             session._oscIdle = false;
             log.debug(`[OSC 0] session=${currentId} → BUSY`);
+            if (TRACE) trace('busy.emit', currentId, { busy: true, via: 'osc0', sent: !!(mainWindow && !mainWindow.isDestroyed()) });
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('cli-busy-state', currentId, true);
             }
@@ -2022,6 +2039,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
             session._cliBusy = false;
             session._oscIdle = true;
             log.debug(`[OSC 0] session=${currentId} → IDLE`);
+            if (TRACE) trace('busy.emit', currentId, { busy: false, via: 'osc0', sent: !!(mainWindow && !mainWindow.isDestroyed()) });
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('cli-busy-state', currentId, false);
             }
@@ -2037,10 +2055,12 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
           const level = payload.split(';')[1];
           if (level === '0') continue; // 4;0 is also used for clearing, making it unreliable as an idle signal
           log.debug(`[OSC 9;4] session=${currentId} level=${level} payload="${payload}" wasBusy=${!!session._cliBusy}`);
+          if (TRACE) trace('osc.progress', currentId, { level, payload: payload.slice(0, 60), was: !!session._cliBusy, decision: progressDecision(level, !!session._cliBusy) });
           if ((level === '1' || level === '2' || level === '3') && !session._cliBusy) {
             session._cliBusy = true;
             session._oscIdle = false;
             log.debug(`[OSC 9;4] session=${currentId} → BUSY`);
+            if (TRACE) trace('busy.emit', currentId, { busy: true, via: 'osc9.4', sent: !!(mainWindow && !mainWindow.isDestroyed()) });
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('cli-busy-state', currentId, true);
             }
@@ -2048,6 +2068,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         } else {
           // Regular notification (attention, permission, etc.)
           log.info(`[OSC 9] session=${currentId} message="${payload}"`);
+          if (TRACE) trace('osc.notify', currentId, { message: payload.slice(0, 120), sent: !!(mainWindow && !mainWindow.isDestroyed()) });
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('terminal-notification', currentId, payload);
           }
@@ -2090,6 +2111,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     session.mcpServer = null;
 
     const realId = session.realSessionId || sessionId;
+    if (TRACE) trace('pty.exit', realId, { exitCode, alsoUnder: realId !== sessionId ? sessionId : null, wasBusy: !!session._cliBusy, sent: !!(mainWindow && !mainWindow.isDestroyed()) });
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('process-exited', realId, exitCode);
       // If a fork transition re-keyed this session under realId but the PTY
@@ -2110,6 +2132,13 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
 
   return { ok: true, reattached: false, mcpActive: !!mcpServer, sandbox: !!sessionOptions?.sandbox };
 });
+
+// --- IPC: activity-trace (fire-and-forget, opt-in) ---
+if (TRACE) {
+  ipcMain.on('activity-trace', (_event, cat, sid, fields) => {
+    trace(typeof cat === 'string' ? cat : 'renderer', sid, fields, 'renderer');
+  });
+}
 
 // --- IPC: terminal-input (fire-and-forget) ---
 ipcMain.on('terminal-input', (_event, sessionId, data) => {
@@ -2450,6 +2479,8 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  if (TRACE) { trace('app.quit', null, {}); activityTrace.close(); }
+
   // Shut down all MCP servers
   shutdownAllMcp();
 

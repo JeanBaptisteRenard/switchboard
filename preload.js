@@ -55,6 +55,11 @@ contextBridge.exposeInMainWorld('api', {
   readClipboard: () => ipcRenderer.invoke('read-clipboard'),
   clipboardHasImage: () => ipcRenderer.invoke('clipboard-has-image'),
 
+  // Opt-in activity trace — see docs/activity-trace.md. Main resolves the flag
+  // (activity-trace.js) and passes it as an argument; never re-parsed here.
+  activityTraceEnabled: process.argv.includes('--switchboard-activity-trace'),
+  traceActivity: (cat, sid, fields) => ipcRenderer.send('activity-trace', cat, sid, fields),
+
   // Send (fire-and-forget)
   sendInput: (id, data) => ipcRenderer.send('terminal-input', id, data),
   resizeTerminal: (id, cols, rows) => ipcRenderer.send('terminal-resize', id, cols, rows),
