@@ -17,7 +17,7 @@ Each session entry in the sidebar can show one of the following badges:
 
 Switchboard detects session state from two signals:
 
-- **OSC 0 terminal title sequences** — Claude CLI updates the terminal title with a braille spinner while it is working and clears it when idle. This is the authoritative "busy/idle" signal.
+- **OSC 0 terminal title sequences** — Claude CLI prefixes the terminal title with an animated spinner glyph while it is working and with ✳ when idle. This is the authoritative "busy/idle" signal.
 - **Terminal output activity** — any non-trivial output (excluding noise like progress spinners) also counts as activity.
 
 The combination means Switchboard can tell whether Claude is actively processing, waiting for you, or finished — without polling the JSONL transcript.

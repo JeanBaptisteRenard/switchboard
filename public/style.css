@@ -1006,6 +1006,12 @@ body { display: flex; flex-direction: column; }
   top: 0;
 }
 
+/* Busy session WITH live subagents: the same spinner, same cadence, violet
+   hue. See docs/subagents.md "Live status". */
+.session-item.cli-busy.has-busy-agents:not(.needs-attention) .session-status-dot::before {
+  color: #8088ff;
+}
+
 /* ---- Session info ---- */
 .session-info {
   flex: 1;

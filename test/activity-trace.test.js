@@ -10,6 +10,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 
 const {
   createActivityTrace, formatEntry, codePoints, busyDecision, progressDecision, envEnabled,
@@ -29,8 +30,6 @@ function capture(options = {}) {
 // --- codePoints: the whole reason the trace exists -------------------------
 
 test('codePoints renders the leading code points as padded hex', () => {
-  // U+25D0 is the CLI 2.1.239 spinner frame; the busy test in main.js still
-  // looks for braille (U+2800..U+28FF). The trace must make that visible.
   assert.equal(codePoints('◐ claude', 1), 'U+25D0');
   assert.equal(codePoints('◐ c', 3), 'U+25D0 U+0020 U+0063');
   assert.equal(codePoints('✳ idle', 1), 'U+2733');
@@ -54,7 +53,6 @@ test('busyDecision distinguishes emission from suppression', () => {
   assert.equal(busyDecision(true, false, true), 'suppressed:already-busy');
   assert.equal(busyDecision(false, true, true), 'emit:idle');
   assert.equal(busyDecision(false, true, false), 'suppressed:already-idle');
-  // A U+25D0 title matches neither test — the case the trace exists to expose.
   assert.equal(busyDecision(false, false, false), 'ignored:no-match');
   assert.equal(busyDecision(false, false, true), 'ignored:no-match');
 });
@@ -176,11 +174,45 @@ test('envEnabled defaults to off and only accepts explicit opt-in values', () =>
   assert.equal(envEnabled({ SWITCHBOARD_ACTIVITY_TRACE: '1' }), true);
   assert.equal(envEnabled({ SWITCHBOARD_ACTIVITY_TRACE: ' TRUE ' }), true);
   assert.equal(envEnabled({ SWITCHBOARD_ACTIVITY_TRACE: 'on' }), true);
+  // Absent and blank must reach the same verdict: the child-process test below
+  // removes the variable rather than emptying it, and the two must agree.
+  assert.equal(envEnabled({}), envEnabled({ SWITCHBOARD_ACTIVITY_TRACE: '' }));
 });
 
-test('the module singleton is off in a plain test process', () => {
-  // Guards the shipped default: requiring the module must not arm anything.
-  assert.equal(require('../activity-trace').enabled, false);
+// The singleton reads the ambient environment at require() time, so asserting
+// on it from inside this process would only describe the shell that launched
+// the suite — and would turn red exactly when someone enables the trace to
+// investigate something. Both directions are checked in a child process whose
+// environment is built explicitly.
+function enabledInChildEnv(overrides) {
+  const env = { ...process.env };
+  // Case-insensitively: Windows reports env keys with whatever case they were
+  // set in, and a spread copy deletes case-sensitively.
+  for (const k of Object.keys(env)) {
+    if (k.toUpperCase() === 'SWITCHBOARD_ACTIVITY_TRACE') delete env[k];
+  }
+  Object.assign(env, overrides);
+  const modulePath = path.join(__dirname, '..', 'activity-trace.js');
+  const r = spawnSync(
+    process.execPath,
+    ['-e', `process.stdout.write(String(require(${JSON.stringify(modulePath)}).enabled))`],
+    { env, encoding: 'utf8' }
+  );
+  assert.equal(r.status, 0, r.stderr);
+  return r.stdout.trim();
+}
+
+test('the module singleton is off in a process whose environment does not opt in', () => {
+  // The variable is removed from the child env, not blanked — the shipped
+  // default must hold whatever the parent shell carries.
+  assert.equal(enabledInChildEnv({}), 'false');
+  assert.equal(enabledInChildEnv({ SWITCHBOARD_ACTIVITY_TRACE: '' }), 'false');
+  assert.equal(enabledInChildEnv({ SWITCHBOARD_ACTIVITY_TRACE: '0' }), 'false');
+});
+
+test('the module singleton arms itself when the environment opts in', () => {
+  // Control for the test above: proves the rig can see the difference at all.
+  assert.equal(enabledInChildEnv({ SWITCHBOARD_ACTIVITY_TRACE: '1' }), 'true');
 });
 
 test('an enabled trace that was never init()ed still writes nothing', () => {

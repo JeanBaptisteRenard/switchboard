@@ -28,7 +28,17 @@ Because subagents are ephemeral, clicking one does **not** launch `claude --resu
 
 ## Live status
 
-In the sidebar, while at least one subagent is running, the parent session's status dot becomes a static violet ⠿ glyph — distinct from the light-blue braille spinner, which means the session *itself* is working. The session's own states (needs-attention, response-ready, cli-busy) take precedence; the glyph shows on a parent that is otherwise idle at the prompt, whether the subagent group is expanded or collapsed.
+The sidebar status dot has three shapes for a session that is doing something, and they differ only in movement and hue:
+
+| Dot | Meaning |
+|---|---|
+| Light-blue braille spinner | The session itself is working, no subagent running under it. |
+| Violet braille spinner (same glyph, same cadence) | The session is working **and** at least one subagent is running under it. |
+| Static violet ⠿ | The session is at the prompt; subagents are still running under it. |
+
+The violet spinner says the session is busy while agents are running. It does **not** say the session is *waiting* for them: the CLI reports one undifferentiated busy state on its terminal title and never signals "waiting for background agents" to the outside, so nothing here can tell generating apart from waiting. Reading it as "waiting" would be inventing information — see `.ai/contexts/ipc-bridge.md`, "The OSC 0 title is the primary busy channel".
+
+The violet tint reuses the existing spinner rather than adding an animation of its own (`docs/decisions/0002-discrete-steps-sidebar-animations.md`: nothing new that moves in steady state). The session's own higher-priority states still win — `needs-attention` and `response-ready` replace the dot entirely. All three shapes show whether the subagent group is expanded or collapsed.
 
 The grid view shows active subagents as colored pills on the parent session's card. Each pill represents one running sub-agent, color-coded by type:
 

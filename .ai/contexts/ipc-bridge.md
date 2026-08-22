@@ -130,6 +130,97 @@ Three things make that safe:
 - **`cli-busy` and `response-ready` are mutually exclusive.** `applyActivityClasses()` is the only writer of either class. The cascade would in fact favour the spinner anyway (`.session-item.cli-busy:not(.needs-attention) .session-status-dot` carries `!important` and one more class than the response-ready rule that follows it in `style.css`), but the state, not the cascade, is what decides.
 - **A poll reply cannot overwrite a fresher event.** `setActivity` bumps a monotonic counter per session; the poll snapshots it via `currentActivitySeq()` *before* the IPC round-trip and `reconcileBusyState` skips any session that moved in between.
 
+### The OSC 0 title is the primary busy channel
+
+Two channels can raise `session._cliBusy`, and they are not interchangeable:
+
+- **The OSC 0 title.** The CLI always sets it, so this is the channel that has
+  to work. Classification lives in `classify-title-activity.js`.
+- **OSC 9;4 progress.** Only emitted when the CLI's `terminalProgressBarEnabled`
+  setting is on. It stays wired as a second opinion; it must never be the only
+  one, because a user preference can switch it off and nothing would report it.
+
+`classifyTitleActivity(title, { allowFallback })` looks at the first code point:
+
+| First code point | Verdict | Rule name |
+|---|---|---|
+| `✳` U+2733 | idle | `idle-glyph` |
+| U+2800–U+28FF (braille frames) | busy | `glyph` |
+| U+25D0–U+25D3 (`◐◑◒◓`) | busy | `glyph` |
+| any other non-ASCII, followed by a space and a non-empty title | busy | `fallback` |
+| ASCII, or a bare non-ASCII word | no decision | `null` |
+
+**The glyph list is coupling to a third party's private rendering choice, and it
+has already broken once.** Until 2026-08-22 the busy test accepted braille only.
+The CLI had moved to half-circle frames, so the title could *clear* the busy
+state (`✳` still matched) but never *set* it, and the spinner survived only
+because OSC 9;4 happened to be on. The activity trace
+`~/.switchboard/activity-trace-20260822-181759.jsonl` is the evidence. Counted
+over a fixed window — its first ten minutes, `wall` from `16:18:00Z` to
+`16:28:00Z`, because the file keeps growing for as long as the variable stays
+set and bare totals would not reproduce — it holds 628 `osc.title` entries: 312
+starting U+25D0, 311 U+25D1, 3 `✳`, 2 bare `claude`, and no braille at all. 625
+of them were logged `decision: "ignored:no-match"`. Both `busy.emit` lines with
+`busy: true` in that window carry `via: "osc9.4"`. Not one busy transition came
+from the title.
+
+That is why the closed list has a net under it. The `fallback` rule assumes any
+single non-ASCII code point used as a title prefix is a status indicator, which
+is what a prefix in that position is for. Weighing the false positives:
+
+- A word starting with an accent or a CJK character (`Éditeur de texte`) does not
+  match — the rule needs the first code point to stand alone before a space.
+- An emoji-prefixed title from a shell prompt or a task runner *would* match. The
+  cost is bounded but real: only a `✳` title clears `_cliBusy`, so a wrong busy
+  sticks until the CLI next reports idle — the next turn, for a Claude session.
+  `main.js` passes `allowFallback: !session.isPlainTerminal`, so the generic rule
+  never fires on a plain terminal in the first place.
+- The alternative — a closed list with no net — fails silently and stays broken
+  for as long as nobody notices the spinner missing. A stuck spinner is visible;
+  a spinner that never lights is not.
+
+**What that guard does not cover.** `allowFallback` gates the `fallback` rule
+only; the `glyph` branch runs for every session. A plain terminal whose title
+starts with a code point from the ranges above — braille, or one of `◐◑◒◓` — is
+marked busy like any other, and since a plain terminal never emits `✳` nothing
+on the title path clears it: the state survives until the PTY exits, at which
+point `updateRunningIndicators()` in `public/app.js` drops `cli-busy` along with
+`has-running-pty`. That is a decision, not an oversight — the ranges are narrow,
+the *title* has to carry the glyph (a spinner printed to stdout is not a title),
+and the braille half of the exposure predates this change. It is not free
+either: U+25D0–U+25D3 is `circleHalves` from the `cli-spinners` package, which
+other tools draw from, so widening the ranges widened this too.
+`test/classify-title-activity.test.js` pins the behaviour, so whoever tightens
+it later knows they are reversing a decision rather than fixing an omission.
+
+To recheck after a CLI upgrade, run a session under `SWITCHBOARD_ACTIVITY_TRACE=1`
+(see `docs/activity-trace.md`) and count where busy comes from:
+
+```bash
+grep '"cat":"osc.title"' ~/.switchboard/activity-trace-*.jsonl \
+  | sed 's/.*"cp":"\([^ ]*\).*/\1/' | sort | uniq -c   # leading code points
+grep '"cat":"busy.emit"' ~/.switchboard/activity-trace-*.jsonl \
+  | grep '"busy":true' | sed 's/.*"via":"\([^"]*\)".*/\1/' | sort | uniq -c
+```
+
+Healthy output has busy emissions attributed to `osc0`, and the `rule` field on
+`osc.title` lines reading `glyph` rather than `fallback`. `rule: "fallback"` on
+every spinner frame means the CLI changed its glyphs again and the range table
+should be extended; `ignored:no-match` on titles that clearly carry a prefix
+means the fallback itself has regressed.
+
+**The title says busy; it never says why.** While the CLI waits on background
+agents it keeps animating the same spinner and never writes a `✳` title. Same
+trace, session `6577a487`: busy at `16:18:51Z` via `osc9.4`, then ◐/◑ frames and
+not one idle title for the rest of the ten-minute window — nine minutes in which
+"generating" and "waiting for my agents" are the same signal. It does draw the
+distinction in its own status line ("✻ Waiting for 1 background agent to
+finish") and has a tri-state channel for it (OSC 21337, idle/busy/waiting), but
+that channel is disabled in the shipped binary, so nothing reaches us. Switchboard therefore
+does not claim the distinction: the sidebar tints the busy spinner violet when
+subagents are live, which asserts only that both things are true at once — see
+`docs/subagents.md`, "Live status".
+
 ### Activity trace: why the main process is the only writer
 
 `activity-trace.js` + `public/activity-trace.js`, off unless
