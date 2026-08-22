@@ -56,33 +56,32 @@ function seedAgents(folder, sessionId, agents) {
   return subDir;
 }
 
-test('bootstrap call with 5 pre-existing subagents: old agents silent, fresh agents get synthetic spawn', () => {
-  // Updated for Fix 2: looksAlive bootstrap files now emit subagent-spawned
-  // with _bootstrap:true so the renderer can track their lifecycle. Old
-  // agents (>60s) stay silent to avoid flooding on startup.
+test('bootstrap is silent whatever the mtimes: every pre-existing file is recorded as finished', () => {
+  // Switchboard owns the PTYs it spawns subagents from. They all die with the
+  // process, so no file present at a session's first scan can belong to a live
+  // agent — however recently it was written.
   const events = setupModule();
   const tmp = mkTmp();
   try {
     const sessionId = 'parent-session';
-    // 3 fresh (looksAlive) + 2 old (completed-at-boot)
     seedAgents(tmp, sessionId, [
-      { id: 'a1', ageMs: 120_000 }, // 2 min old — silent
-      { id: 'a2', ageMs: 120_000 }, // 2 min old — silent
-      { id: 'a3', ageMs: 5_000 },   // fresh — gets synthetic spawn
-      { id: 'a4', ageMs: 5_000 },   // fresh — gets synthetic spawn
-      { id: 'a5', ageMs: 5_000 },   // fresh — gets synthetic spawn
+      { id: 'a1', ageMs: 120_000 },
+      { id: 'a2', ageMs: 120_000 },
+      { id: 'a3', ageMs: 5_000 },
+      { id: 'a4', ageMs: 5_000 },
+      { id: 'a5', ageMs: 0 },
     ]);
 
     const session = {}; // knownSubagents undefined → bootstrap
     detectSubagentTransitions(sessionId, session, tmp);
 
-    assert.equal(events.length, 3, 'exactly 3 synthetic spawns for fresh bootstrap agents');
-    for (const ev of events) {
-      assert.equal(ev.channel, 'subagent-spawned');
-      assert.equal(ev.payload._bootstrap, true, 'bootstrap spawn must carry _bootstrap flag');
-    }
+    assert.equal(events.length, 0, `bootstrap must emit nothing, got ${JSON.stringify(events)}`);
     assert.ok(session.knownSubagents instanceof Map);
     assert.equal(session.knownSubagents.size, 5);
+    for (const [agentId, entry] of session.knownSubagents) {
+      assert.equal(entry.completed, true, `${agentId} must be recorded as finished`);
+      assert.ok(entry._completedAt, `${agentId} must carry _completedAt`);
+    }
   } finally {
     cleanup(tmp);
   }
@@ -108,26 +107,115 @@ test('bootstrap marks an old-mtime agent (>60s) as completed: true', () => {
   }
 });
 
-test('bootstrap marks a fresh-mtime agent as completed: false and emits synthetic spawn', () => {
-  // Fix 2: fresh bootstrap files now emit subagent-spawned with _bootstrap:true.
+test('bootstrap marks a just-written agent as completed too, and stays silent', () => {
+  // The ghost this fixes: an agent that finished seconds before the app was
+  // restarted used to be announced as a live spawn, lighting the parent's
+  // activity glyph for a full STABLE_MS.
   const events = setupModule();
   const tmp = mkTmp();
   try {
     const sessionId = 'parent';
-    seedAgents(tmp, sessionId, [{ id: 'fresh', ageMs: 5_000 }]); // 5s old, well under 60s
+    seedAgents(tmp, sessionId, [{ id: 'fresh' }]); // mtime = now
 
     const session = {};
     detectSubagentTransitions(sessionId, session, tmp);
 
-    assert.equal(events.length, 1, 'bootstrap emits exactly 1 synthetic spawn for fresh agent');
-    assert.equal(events[0].channel, 'subagent-spawned');
-    assert.equal(events[0].payload._bootstrap, true);
-    assert.equal(events[0].payload.agentId, 'fresh');
+    assert.equal(events.length, 0, 'a just-written file at bootstrap must not emit a spawn');
     const entry = session.knownSubagents.get('fresh');
     assert.ok(entry);
-    assert.equal(entry.completed, false);
-    assert.equal(entry._completedAt, null);
+    assert.equal(entry.completed, true);
+    assert.ok(entry._completedAt, 'expected _completedAt to be stamped');
   } finally {
+    cleanup(tmp);
+  }
+});
+
+test('bootstrap opens no recheck window for history files, but keeps one for recent ones', () => {
+  // A window over the whole history would mean one statSync per file per
+  // flush, which the dir-mtime cache exists to avoid — and a file minutes old
+  // cannot be the live agent anyway. A recent file is the only one that could
+  // conceivably still be running, so it stays reversible: silent now, but
+  // rehabilitated if it grows. Freezing it would trade a visible ghost for an
+  // agent invisible for the whole session.
+  const events = setupModule();
+  const tmp = mkTmp();
+  try {
+    const sessionId = 'parent';
+    seedAgents(tmp, sessionId, [{ id: 'history', ageMs: 300_000 }, { id: 'recent' }]);
+
+    const session = {};
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    assert.equal(events.length, 0, 'bootstrap stays silent either way');
+    assert.equal(session.knownSubagents.get('history')._recheckStart, null,
+      'a plainly historical file is frozen outright');
+    assert.ok(session.knownSubagents.get('recent')._recheckStart,
+      'a recent file keeps a recheck window');
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('bootstrap is reversible: a recent file that then grows is a live agent after all', (t) => {
+  // The whole fix rests on "Switchboard owns the PTYs, so nothing survives a
+  // restart". If that ever fails — an orphaned process still writing, say —
+  // the agent must not vanish for the session. It is silent until it proves
+  // itself, then announced.
+  const events = setupModule();
+  const tmp = mkTmp();
+  try {
+    const sessionId = 'parent';
+    const subDir = seedAgents(tmp, sessionId, [{ id: 'survivor' }]);
+    const filePath = path.join(subDir, 'agent-survivor.jsonl');
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+
+    const session = {};
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(events.length, 0, 'nothing announced at bootstrap');
+    assert.equal(session.knownSubagents.get('survivor').completed, true, 'assumed finished for now');
+
+    // It is still writing.
+    t.mock.timers.tick(1_000);
+    setMtime(filePath, Date.now());
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    const spawns = events.filter(e => e.channel === 'subagent-spawned');
+    assert.equal(spawns.length, 1, `growth must produce exactly one spawn, got ${spawns.length}`);
+    assert.equal(spawns[0].payload.agentId, 'survivor');
+    assert.ok(!spawns[0].payload._heartbeat, 'it is a spawn, not a heartbeat');
+    assert.equal(session.knownSubagents.get('survivor').completed, false, 'the assumption is undone');
+
+    // And from there the normal lifecycle applies.
+    detectSubagentTransitions(sessionId, session, tmp);
+    t.mock.timers.tick(31_000);
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(events.filter(e => e.channel === 'subagent-completed').length, 1);
+  } finally {
+    t.mock.timers.reset();
+    cleanup(tmp);
+  }
+});
+
+test('bootstrap window closes: a recent file that never moves is never announced', (t) => {
+  // The ghost stays fixed: silence at bootstrap, and silence for good once the
+  // window has elapsed without the file moving.
+  const events = setupModule();
+  const tmp = mkTmp();
+  try {
+    const sessionId = 'parent';
+    seedAgents(tmp, sessionId, [{ id: 'justfinished' }]);
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+
+    const session = {};
+    detectSubagentTransitions(sessionId, session, tmp);
+    detectSubagentTransitions(sessionId, session, tmp);
+    t.mock.timers.tick(31_000);
+    detectSubagentTransitions(sessionId, session, tmp);
+
+    assert.equal(events.length, 0, 'a finished agent seen at startup is never announced');
+    assert.ok(!session.knownSubagents.get('justfinished')._recheckStart, 'window closed');
+  } finally {
+    t.mock.timers.reset();
     cleanup(tmp);
   }
 });
@@ -159,7 +247,6 @@ test('post-bootstrap: a brand-new agent file emits exactly one subagent-spawned 
 });
 
 test('post-bootstrap with no new agents emits no additional events (IPC-flood regression)', () => {
-  // Fix 2: bootstrap for fresh (ageMs:0) agents now emits synthetic spawns.
   // The regression guard is that *subsequent* flushes with no new files must
   // not re-emit — the event count must not increase after the first call.
   const events = setupModule();
@@ -175,7 +262,7 @@ test('post-bootstrap with no new agents emits no additional events (IPC-flood re
     ]);
 
     const session = {};
-    // Bootstrap absorbs all three silently (all old → no synthetic spawns)
+    // Bootstrap absorbs all three silently
     detectSubagentTransitions(sessionId, session, tmp);
     assert.equal(events.length, 0, 'old-agent bootstrap must be silent');
 
@@ -195,26 +282,28 @@ test('completion: agent with stable mtime for >30s emits subagent-completed (dri
   const tmp = mkTmp();
   try {
     const sessionId = 'parent';
-    // Create the agent file aged >60s so bootstrap records it as not-yet-completed
-    // (i.e. looksAlive=false path is too old — we want an agent that is first spotted
-    // post-bootstrap so its full lifecycle plays out).
-    // Seed with ageMs=0 so looksAlive=true; bootstrap will emit synthetic spawn.
-    const subDir = seedAgents(tmp, sessionId, [{ id: 'slow', ageMs: 0 }]);
+    const subDir = path.join(tmp, sessionId, 'subagents');
+    fs.mkdirSync(subDir, { recursive: true });
     const filePath = path.join(subDir, 'agent-slow.jsonl');
 
-    // Call 1: bootstrap — knownSubagents is created, synthetic spawn emitted,
-    //         agent entry stored with completed:false and no _stableStart yet.
     const session = {};
     // Enable fake Date with now=realNow so _stableStart gets a non-zero truthy value
     // (the stability timer check uses !known._stableStart which would be truthy for 0/epoch).
     t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
 
+    // Call 1: bootstrap on an empty dir. A live entry can only be created
+    // afterwards — bootstrap never announces a spawn.
     detectSubagentTransitions(sessionId, session, tmp);
-    // Bootstrap emits one synthetic spawn for this fresh agent
+
+    // Call 2: the agent starts, and is announced.
+    seedAgents(tmp, sessionId, [{ id: 'slow' }]);
+    setMtime(filePath, Date.now());
+    setMtime(subDir, Date.now());
+    detectSubagentTransitions(sessionId, session, tmp);
     assert.equal(events.filter(e => e.channel === 'subagent-spawned').length, 1);
     assert.equal(session.knownSubagents.get('slow').completed, false);
 
-    // Call 2: mtime unchanged from call 1 → _stableStart is set to "now"
+    // Call 3: mtime unchanged from the spawn → _stableStart is set to "now"
     detectSubagentTransitions(sessionId, session, tmp);
     assert.equal(session.knownSubagents.get('slow').completed, false);
 
@@ -248,8 +337,23 @@ test('heartbeat: a subagent whose file keeps growing re-emits subagent-spawned (
   const tmp = mkTmp();
   try {
     const sessionId = 'parent';
-    const subDir = seedAgents(tmp, sessionId, [{ id: 'longrun', ageMs: 0 }]);
+    const subDir = path.join(tmp, sessionId, 'subagents');
+    fs.mkdirSync(subDir, { recursive: true });
     const filePath = path.join(subDir, 'agent-longrun.jsonl');
+    const heartbeats = () => events.filter(e => e.channel === 'subagent-spawned' && e.payload._heartbeat);
+
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+
+    // Bootstrap on an empty dir, then the agent starts: spawn, and the
+    // heartbeat clock starts with it.
+    const session = {};
+    detectSubagentTransitions(sessionId, session, tmp);
+    seedAgents(tmp, sessionId, [{ id: 'longrun' }]);
+    setMtime(subDir, Date.now());
+    detectSubagentTransitions(sessionId, session, tmp);
+    assert.equal(events.filter(e => e.channel === 'subagent-spawned').length, 1, 'one real spawn');
+    assert.equal(heartbeats().length, 0, 'no heartbeat at spawn');
+
     const realBaseMs = fs.statSync(filePath).mtimeMs;
     let bump = 0;
     const bumpMtime = () => {
@@ -257,14 +361,6 @@ test('heartbeat: a subagent whose file keeps growing re-emits subagent-spawned (
       const d = new Date(realBaseMs + bump * 2000);
       fs.utimesSync(filePath, d, d);
     };
-    const heartbeats = () => events.filter(e => e.channel === 'subagent-spawned' && e.payload._heartbeat);
-
-    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
-
-    // Call 1: bootstrap — synthetic spawn, heartbeat clock starts.
-    const session = {};
-    detectSubagentTransitions(sessionId, session, tmp);
-    assert.equal(heartbeats().length, 0, 'no heartbeat at bootstrap');
 
     // 25s later the file has grown → past the 20s throttle → heartbeat.
     t.mock.timers.tick(25_000);
@@ -356,9 +452,8 @@ test('concurrent monitoring: detectSubagentTransitions for 2 distinct sessions e
     const bHasNewWorker = spawnedForB.some(e => e.payload.agentId === 'a-worker-new');
     assert.ok(!bHasNewWorker, 'sessB must not receive spawn events for sessA agents');
 
-    // Fresh workers from bootstrap emit with _bootstrap:true; the new post-bootstrap
-    // agent for sessA must NOT carry _bootstrap:true
-    assert.ok(!newWorkerEvent.payload._bootstrap, 'post-bootstrap spawn must not carry _bootstrap flag');
+    // Bootstrap announces nothing, so every spawn recorded here is a real one.
+    assert.ok(!newWorkerEvent.payload._bootstrap, 'no spawn carries a _bootstrap flag any more');
   } finally {
     cleanup(tmp);
   }
@@ -435,7 +530,7 @@ test('post-GC volume: 30 historical agent files plus 1 new one emit exactly one 
     const subDir = seedAgents(tmp, sessionId, olds);
     t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
 
-    // Bootstrap absorbs all 30 silently (all older than BOOTSTRAP_LIVE_MS).
+    // Bootstrap absorbs all 30 silently (all older than FRESH_SIGHTING_MS).
     const session = {};
     detectSubagentTransitions(sessionId, session, tmp);
     assert.equal(events.length, 0, 'bootstrap of old files must be silent');
@@ -488,7 +583,7 @@ test('post-bootstrap: an unknown file with an old mtime is recorded as finished,
 test('late sighting: a stale file that then grows is a live agent — the withheld spawn is emitted', (t) => {
   // detectSubagentTransitions only runs from flushChanges, whose debounce is
   // shared across PROJECTS_DIR and has no maxWait: a burst of parallel
-  // subagent writes can push the first flush past BOOTSTRAP_LIVE_MS. The age
+  // subagent writes can push the first flush past FRESH_SIGHTING_MS. The age
   // filter must be reversible, or a genuinely live agent discovered late would
   // be silently written off for the rest of the session.
   const events = setupModule();

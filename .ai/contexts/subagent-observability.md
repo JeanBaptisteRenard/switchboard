@@ -91,9 +91,17 @@ re-sees the entire history of the session**. `detectSubagentTransitions()` only
 rescans when the `subagents/` dir mtime moves — which is exactly what happens
 when a *new* subagent starts. Two rules keep that rescan quiet:
 
-- **A first sighting is only a spawn if the file is fresh.** An unknown file
-  whose mtime is already older than `BOOTSTRAP_LIVE_MS` (60 s) is recorded
-  silently as `completed: true`, with no `readSubagentMeta()` and no IPC.
+- **Bootstrap never announces anything.** Every file present at a session's
+  first scan is recorded silently as `completed: true`, whatever its mtime.
+  Switchboard owns the PTYs its subagents run in — one set per Electron
+  process — so they all died with the previous process, and a restored session
+  gets a brand-new PTY whose agents write *after* bootstrap and are picked up
+  by the normal path. Nothing on disk at that moment can be live. The silence
+  is unconditional; the *verdict* is not (next bullet).
+- **After bootstrap, a first sighting is only a spawn if the file is fresh.**
+  An unknown file whose mtime is already older than `FRESH_SIGHTING_MS` (60 s)
+  is recorded silently as `completed: true`, with no `readSubagentMeta()` and
+  no IPC.
 - **That verdict is an assumption, and it is reversible.** A stale first
   sighting is *not* proof the agent finished. `detectSubagentTransitions()`
   runs only from `flushChanges()`, whose debounce (`main.js`) is shared across
@@ -104,9 +112,17 @@ when a *new* subagent starts. Two rules keep that rescan quiet:
   it is rehabilitated** — `completed` returns to false and the withheld
   `subagent-spawned` is emitted (logged `[subagent-spawn-late]`). The window
   closes once the file has been seen motionless for a full `STABLE_MS`, after
-  which the entry is frozen and costs nothing. At bootstrap no window is
-  opened: the PTY belongs to Switchboard, so nothing it spawned can be
-  mid-flight before that session's first flush.
+  which the entry is frozen and costs nothing. **At bootstrap the window is
+  opened only for files whose mtime is fresh** — the handful that could
+  conceivably still be running. Everything older is frozen outright: a window
+  over the whole history would cost one `statSync` per historical file per
+  flush, exactly what the dir-mtime cache exists to avoid, and a file minutes
+  old cannot be the agent in question anyway. The narrow window is what keeps
+  the startup rule falsifiable: if the PTY-ownership argument above is ever
+  wrong (an orphaned process surviving a hard kill and still writing), the
+  agent is announced late instead of staying invisible for the whole session.
+  Silence at startup must not become a permanent blind spot — a visible late
+  spawn beats a silent disappearance.
 - **`knownSubagents` forgets an agent only when its file leaves the disk.** The
   earlier GC dropped completed entries after 5 minutes; because the file stayed,
   the next rescan rediscovered it as unknown and announced a spawn. That was the
@@ -132,6 +148,16 @@ directory bootstrap instead of being read through the old one's cache.
 Guaranteed: a static historical file never produces a spawn (it does not move,
 so it never enters the rehabilitation branch), and an agent still writing is
 always picked up — late at worst, never lost.
+
+Also guaranteed since 2026-08-22: **a restart is quiet**. Bootstrap used to
+treat any file younger than 60 s as a live agent and emit a synthetic
+`subagent-spawned` (`payload._bootstrap`). An agent that finished less than a
+minute before the app was restarted therefore came back as a ghost — purple
+activity glyph on the parent, green dot on the subagent group header — until
+the 30 s stability window declared it complete. Observed 2026-08-22; the
+synthetic bootstrap spawn is gone and `_bootstrap` is no longer emitted (the
+renderer still tolerates the field). What replaced it is silence plus a
+recheck window on recent files, not an irreversible verdict.
 
 Not guaranteed: an agent that goes quiet for longer than `STABLE_MS` mid-run —
 a long tool call, say — can be declared finished while it is still alive. That

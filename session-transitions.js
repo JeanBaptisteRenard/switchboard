@@ -71,8 +71,8 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
   // First walk for this session: pre-populate knownSubagents with every
   // existing file silently so we don't flood the renderer with spawn/complete
   // events for agents that already finished before Switchboard started watching.
-  // Files modified in the last 60s get a normal lifecycle; older ones are
-  // recorded as already-completed without IPC.
+  // No file present at this point can belong to a live agent, whatever its
+  // mtime — see .ai/contexts/subagent-observability.md
   if (isBootstrap) {
     session.knownSubagents = new Map();
   }
@@ -80,7 +80,7 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
   const mainWindow = getMainWindow();
   const now = Date.now();
   const STABLE_MS = 30000; // 30 seconds of no mtime advance → completed
-  const BOOTSTRAP_LIVE_MS = 60000; // file modified in last 60s = still alive at boot
+  const FRESH_SIGHTING_MS = 60000; // post-bootstrap: first sighting counts as live if newer than this
   // Re-emit subagent-spawned (idempotent on the renderer side — it just
   // refreshes the entry's last-seen timestamp) at most every HEARTBEAT_MS
   // while an agent's file keeps growing. Without this, the renderer's 60s
@@ -114,12 +114,20 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
     const mtimeMs = stat.mtimeMs;
 
     if (!known) {
-      // A stale file is assumed finished and recorded silently. At bootstrap
-      // that is certain; afterwards the sighting may simply be late, so the
-      // entry keeps a recheck window instead of being frozen.
+      // A file that cannot be live is recorded as finished, silently. At
+      // bootstrap that covers every file: Switchboard owns the PTYs, so
+      // nothing it spawned outlived the previous process. Afterwards only a
+      // stale mtime says so, and the sighting may simply be late.
+      //
+      // Either way the verdict stays reversible while the file could
+      // conceivably be alive — a recheck window rehabilitates it if it grows.
+      // Only a plainly historical file seen at bootstrap is frozen outright,
+      // which is what keeps startup free of a per-file statSync.
       // See .ai/contexts/subagent-observability.md
-      const looksAlive = (now - mtimeMs) < BOOTSTRAP_LIVE_MS;
+      const isFresh = (now - mtimeMs) < FRESH_SIGHTING_MS;
+      const looksAlive = !isBootstrap && isFresh;
       if (!looksAlive) {
+        const recheck = !isBootstrap || isFresh;
         session.knownSubagents.set(agentId, {
           mtimeMs,
           completed: true,
@@ -127,14 +135,13 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
           subagentType: null,
           description: null,
           _lastHeartbeatAt: now,
-          _recheckStart: isBootstrap ? null : now,
+          _recheckStart: recheck ? now : null,
         });
-        if (TRACE) trace('subagent.assumed-finished', sessionId, { agentId, ageMs: now - mtimeMs, bootstrap: isBootstrap, recheck: !isBootstrap });
+        if (TRACE) trace('subagent.assumed-finished', sessionId, { agentId, ageMs: now - mtimeMs, bootstrap: isBootstrap, recheck });
         continue;
       }
 
-      // First sighting of a live file: a synthetic spawn at bootstrap
-      // (_bootstrap), a genuine one afterwards.
+      // First sighting of a live file — always post-bootstrap, so a genuine spawn.
       const meta = readSubagentMeta(filePath) || {};
       session.knownSubagents.set(agentId, {
         mtimeMs,
@@ -144,17 +151,15 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
         description: meta.description || null,
         _lastHeartbeatAt: now,
       });
-      log.info(`[subagent-spawn${isBootstrap ? '-bootstrap' : ''}] parent=${sessionId} agentId=${agentId} type=${meta.agentType || 'unknown'}`);
-      if (TRACE) trace('subagent.spawned', sessionId, { agentId, kind: isBootstrap ? 'bootstrap' : 'spawn', subagentType: meta.agentType || null, ageMs: now - mtimeMs, sent: !!(mainWindow && !mainWindow.isDestroyed()) });
+      log.info(`[subagent-spawn] parent=${sessionId} agentId=${agentId} type=${meta.agentType || 'unknown'}`);
+      if (TRACE) trace('subagent.spawned', sessionId, { agentId, kind: 'spawn', subagentType: meta.agentType || null, ageMs: now - mtimeMs, sent: !!(mainWindow && !mainWindow.isDestroyed()) });
       if (mainWindow && !mainWindow.isDestroyed()) {
-        const payload = {
+        mainWindow.webContents.send('subagent-spawned', {
           parentSessionId: sessionId,
           agentId,
           subagentType: meta.agentType || null,
           description: meta.description || null,
-        };
-        if (isBootstrap) payload._bootstrap = true;
-        mainWindow.webContents.send('subagent-spawned', payload);
+        });
       }
     } else if (known.completed) {
       // Inside the recheck window of an assumed-finished entry. A file that
