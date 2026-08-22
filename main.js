@@ -1397,10 +1397,11 @@ ipcMain.handle('get-effective-settings', (_event, projectPath) => {
 });
 
 // --- IPC: get-active-sessions ---
+// see .ai/contexts/ipc-bridge.md "Busy-state reconciliation"
 ipcMain.handle('get-active-sessions', () => {
   const active = [];
   for (const [sessionId, session] of activeSessions) {
-    if (!session.exited) active.push(sessionId);
+    if (!session.exited) active.push({ sessionId, busy: !!session._cliBusy });
   }
   return active;
 });
