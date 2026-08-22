@@ -33,18 +33,25 @@ function gridSubagentColor(type) {
 (function initSubagentListeners() {
   if (typeof window.api === 'undefined') return;
 
+  // preload.js hands these callbacks the payload as their only argument.
   if (typeof window.api.onSubagentSpawned === 'function') {
-    window.api.onSubagentSpawned((event, data) => {
-      const { parentSessionId, agentId, subagentType } = data || {};
+    window.api.onSubagentSpawned((data) => {
+      const { parentSessionId, agentId, subagentType, _heartbeat } = data || {};
       if (!parentSessionId || !agentId) return;
-      if (!activeSubagents.has(parentSessionId)) activeSubagents.set(parentSessionId, new Map());
-      activeSubagents.get(parentSessionId).set(agentId, { agentId, subagentType, spawnedAt: Date.now() });
+      let map = activeSubagents.get(parentSessionId);
+      // A heartbeat means "still alive", never "started".
+      if (_heartbeat && !(map && map.has(agentId))) return;
+      if (!map) {
+        map = new Map();
+        activeSubagents.set(parentSessionId, map);
+      }
+      map.set(agentId, { agentId, subagentType, spawnedAt: Date.now() });
       updateGridSubagentPills(parentSessionId);
     });
   }
 
   if (typeof window.api.onSubagentCompleted === 'function') {
-    window.api.onSubagentCompleted((event, data) => {
+    window.api.onSubagentCompleted((data) => {
       const { parentSessionId, agentId } = data || {};
       if (!parentSessionId || !agentId) return;
       const map = activeSubagents.get(parentSessionId);

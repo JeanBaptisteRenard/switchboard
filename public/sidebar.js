@@ -64,12 +64,10 @@ function subagentTypeColor(type) {
 }
 
 // --- Live subagent tracking — see .ai/contexts/subagent-observability.md ---
-// parentSessionId → Map<agentId, lastSeenAtMs>. The timestamp is refreshed by
-// every subagent-spawned event — including the throttled still-alive
-// heartbeats the main process re-emits while an agent's transcript keeps
-// growing (session-transitions.js) — so the TTL below only evicts agents
-// that went silent (e.g. parent PTY died before a completion event could
-// fire), not agents that simply run longer than a minute.
+// parentSessionId → Map<agentId, lastSeenAtMs>. A spawn — real or _bootstrap —
+// adds an agent; a _heartbeat only refreshes one already tracked. The TTL below
+// then evicts agents that went silent without evicting one that merely runs
+// longer than a minute.
 const activeSubagentsByParent = new Map();
 const SUBAGENT_LIVE_TTL_MS = 60000;
 
@@ -141,10 +139,17 @@ function reflectSubagentRunningState(parentSessionId, agentId) {
 
   if (typeof window.api.onSubagentSpawned === 'function') {
     window.api.onSubagentSpawned((payload) => {
-      const { parentSessionId, agentId } = payload || {};
+      const { parentSessionId, agentId, _heartbeat } = payload || {};
       if (!parentSessionId || !agentId) return;
-      if (!activeSubagentsByParent.has(parentSessionId)) activeSubagentsByParent.set(parentSessionId, new Map());
-      activeSubagentsByParent.get(parentSessionId).set(agentId, Date.now());
+      let map = activeSubagentsByParent.get(parentSessionId);
+      // A heartbeat means "still alive", never "started": it must not create
+      // an entry for an agent we are not tracking.
+      if (_heartbeat && !(map && map.has(agentId))) return;
+      if (!map) {
+        map = new Map();
+        activeSubagentsByParent.set(parentSessionId, map);
+      }
+      map.set(agentId, Date.now());
       reflectSubagentRunningState(parentSessionId, agentId);
     });
   }

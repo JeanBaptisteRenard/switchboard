@@ -347,3 +347,117 @@ test('pruneStaleSubagents: a subagent spawned within the last 60s is NOT evicted
     ctx.destroy();
   }
 });
+
+// --- A heartbeat must never resurrect an untracked agent ---
+// subagent-spawned doubles as the still-alive heartbeat (payload._heartbeat).
+// The handler used to add-or-refresh unconditionally, so any heartbeat for an
+// agent the renderer no longer tracks (completed, TTL-pruned, or dropped by
+// clearActiveSubagentsFor) re-lit its running dot. A heartbeat only ever means
+// "still alive", never "started".
+
+function projectWithThreeSubagents() {
+  const project = projectWithLiveSubagent();
+  for (const n of [2, 3]) {
+    project.sessions.push({
+      sessionId: `sub:s-top-1:agent-${n}`,
+      parentSessionId: 's-top-1',
+      agentId: `agent-${n}`,
+      subagentType: 'plan',
+      description: `subagent ${n}`,
+      modified: '2026-05-22T09:59:00.000Z',
+      messageCount: 1,
+    });
+  }
+  return project;
+}
+
+test('a heartbeat for an agent absent from the live map does not resurrect it', () => {
+  const ctx = setupSidebarDom();
+  try {
+    ctx.sidebar.renderProjects([projectWithLiveSubagent()], true);
+    const item = ctx.document.getElementById('si-sub:s-top-1:agent-1');
+    assert.ok(!item.classList.contains('running'), 'not running to begin with');
+
+    ctx.emitSubagentSpawned({ parentSessionId: 's-top-1', agentId: 'agent-1', subagentType: 'explore', _heartbeat: true });
+
+    assert.ok(!item.classList.contains('running'), 'heartbeat for an untracked agent must not mark it running');
+    assert.ok(!ctx.document.getElementById('si-s-top-1').classList.contains('has-busy-agents'),
+      'and it must not light the parent indicator either');
+
+    // Not just the DOM toggle — no state was created, so a full re-render agrees.
+    ctx.sidebar.renderProjects([projectWithLiveSubagent()], false);
+    assert.ok(!ctx.document.getElementById('si-sub:s-top-1:agent-1').classList.contains('running'),
+      'still not running after a full re-render');
+  } finally {
+    ctx.destroy();
+  }
+});
+
+test('a heartbeat after completion does not bring the agent back', () => {
+  const ctx = setupSidebarDom();
+  try {
+    ctx.sidebar.renderProjects([projectWithLiveSubagent()], true);
+    ctx.emitSubagentSpawned({ parentSessionId: 's-top-1', agentId: 'agent-1', subagentType: 'explore' });
+    ctx.emitSubagentCompleted({ parentSessionId: 's-top-1', agentId: 'agent-1' });
+
+    ctx.emitSubagentSpawned({ parentSessionId: 's-top-1', agentId: 'agent-1', subagentType: 'explore', _heartbeat: true });
+
+    const item = ctx.document.getElementById('si-sub:s-top-1:agent-1');
+    assert.ok(!item.classList.contains('running'), 'a late heartbeat must not undo the completion');
+  } finally {
+    ctx.destroy();
+  }
+});
+
+test('the observed inversion: once the only live subagent completes, none of the three rows is running', () => {
+  const ctx = setupSidebarDom();
+  try {
+    const project = projectWithThreeSubagents();
+    ctx.sidebar.renderProjects([project], true);
+
+    // agent-2 is the one genuinely working; agents 1 and 3 are history.
+    ctx.emitSubagentSpawned({ parentSessionId: 's-top-1', agentId: 'agent-2', subagentType: 'plan' });
+    assert.ok(ctx.document.getElementById('si-sub:s-top-1:agent-2').classList.contains('running'),
+      'the live one is running');
+
+    ctx.emitSubagentCompleted({ parentSessionId: 's-top-1', agentId: 'agent-2' });
+
+    // The main process re-announces every file it rescans. Heartbeats for
+    // finished agents must be inert.
+    for (const id of ['agent-1', 'agent-2', 'agent-3']) {
+      ctx.emitSubagentSpawned({ parentSessionId: 's-top-1', agentId: id, subagentType: 'plan', _heartbeat: true });
+    }
+
+    ctx.sidebar.renderProjects([projectWithThreeSubagents()], false);
+
+    for (const id of ['agent-1', 'agent-2', 'agent-3']) {
+      const el = ctx.document.getElementById(`si-sub:s-top-1:${id}`);
+      assert.ok(el, `${id} must be rendered`);
+      assert.ok(!el.classList.contains('running'), `${id} must not be running after the live agent completed`);
+    }
+    assert.ok(!ctx.document.getElementById('si-s-top-1').classList.contains('has-busy-agents'),
+      'parent indicator off — no subagent is working');
+  } finally {
+    ctx.destroy();
+  }
+});
+
+test('a real spawn (no _heartbeat) still adds an agent the renderer has never seen', () => {
+  const ctx = setupSidebarDom();
+  try {
+    ctx.sidebar.renderProjects([projectWithLiveSubagent()], true);
+
+    ctx.emitSubagentSpawned({ parentSessionId: 's-top-1', agentId: 'agent-1', subagentType: 'explore' });
+
+    const item = ctx.document.getElementById('si-sub:s-top-1:agent-1');
+    assert.ok(item.classList.contains('running'), 'a genuine spawn still marks the agent running');
+    assert.ok(ctx.document.getElementById('si-s-top-1').classList.contains('has-busy-agents'),
+      'and still lights the parent indicator');
+
+    // A bootstrap spawn is a real "this agent is live" statement too.
+    ctx.emitSubagentSpawned({ parentSessionId: 's-top-1', agentId: 'agent-9', subagentType: 'plan', _bootstrap: true });
+    assert.ok(ctx.window.isSubagentActive('s-top-1', 'agent-9'), 'bootstrap spawns are tracked like real ones');
+  } finally {
+    ctx.destroy();
+  }
+});
