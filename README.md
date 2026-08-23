@@ -31,7 +31,7 @@ This repository is a fork of **[doctly/switchboard](https://github.com/doctly/sw
 - **Full-Text Search** — Find any session by what was discussed, not just when it happened
 - **Sandboxed Sessions** (Linux) — Optionally run Claude inside a [bubblewrap](https://github.com/containers/bubblewrap) sandbox where the rest of `$HOME` is hidden: only the project directory and Claude's own config/state are visible (filesystem isolation — network and environment are shared, see [docs](docs/settings.md#what-the-sandbox-does-and-doesnt-isolate)). Off by default; enable per session, per project, or globally. Needs unprivileged user namespaces, which Ubuntu 23.10+ restricts by default — the wrapper says so and how to fix it
 - **IDE Emulation** — Switchboard acts as an IDE for Claude CLI, showing file diffs and opens in a side panel where you can accept, reject, or edit changes before they're applied. Supports both inline and side-by-side diff views. Disable this in Global Settings if you prefer Claude to use your own editor (VS Code, Cursor, etc.)
-- **Memory** — Browse and edit your CLAUDE.md memory files in one place
+- **Memory & Work Files** — Browse and edit your CLAUDE.md memory files and per-project `.work-files/` scratch notes in one place
 - **Activity Stats** — Heatmap of your coding activity across all projects
 - **Session Names** — Picks up session names from Claude Code's `/rename` command automatically
 
@@ -88,7 +88,7 @@ Full user-facing documentation lives in [docs/](docs/README.md):
 - [Session Restore](docs/session-restore.md) — persist open sessions and restore them on restart
 - [Keyboard Shortcuts](docs/keyboard-shortcuts.md) — editor/terminal shortcuts and rebindable session-nav keys
 - [Notifications](docs/notifications.md) — sidebar status badges
-- [Memory and Work Files](docs/plans-memory-workfiles.md) — CodeMirror panels for CLAUDE.md and `.work-files/`
+- [Memory and Work Files](docs/memory-workfiles.md) — CodeMirror panels for CLAUDE.md and `.work-files/`
 - [Activity Stats](docs/activity-stats.md) — coding activity heatmap
 - [Settings Reference](docs/settings.md) — every field in Global and Project Settings
 - [Automation](docs/automation.md) — scheduled Claude tasks (cron) and the file-based trigger API

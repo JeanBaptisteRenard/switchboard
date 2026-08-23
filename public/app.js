@@ -1122,9 +1122,6 @@ document.querySelectorAll('.sidebar-tab').forEach(tab => {
   });
 });
 
-// Plans & viewer helpers → plans-memory-view.js
-
-
 // Grid view → grid-view.js
 // Initialize grid observers now that DOM refs are ready
 initGridObservers();
@@ -1133,7 +1130,7 @@ initGridObservers();
 
 // Stats view (loadStats, buildUsageSection, buildDailyBarChart, buildHeatmap, calculateStreak, buildStatsSummary) → stats-view.js
 
-// Memory viewer → plans-memory-view.js
+// Memory & Work Files viewers → memory-workfiles-view.js
 
 
 // Dialogs (resolveDefaultSessionOptions, forkSession, showNewSessionPopover,

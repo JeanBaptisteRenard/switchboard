@@ -161,7 +161,7 @@ const rendererCrossFileGlobals = {
   WebglAddon: 'readonly',
   UnicodeGraphemesAddon: 'readonly',
 
-  // Terminal/grid/file-panel/plans/stats/notifications and assorted helpers
+  // Terminal/grid/file-panel/stats/notifications and assorted helpers
   // shared across renderer files (defined somewhere in public/*.js).
   TERMINAL_THEME: 'writable',
   TERMINAL_THEMES: 'readonly',

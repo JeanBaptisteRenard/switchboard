@@ -16,7 +16,7 @@ const liveSubagents = new Set();
 // Active subagent file watches for the currently-rendered viewer. Each entry
 // is a stopWatch closure created when an Agent block expands and starts a
 // live tail. Drained on viewer dismissal so we don't leak fs.watchFile polls.
-// Attached to `window` so the cross-file hideAllViewers() (in plans-memory-view.js)
+// Attached to `window` so the cross-file hideAllViewers() (in memory-workfiles-view.js)
 // can drain via the function declaration below — top-level `const` in classic
 // scripts isn't global.
 window.__activeViewerWatches = window.__activeViewerWatches || new Set();

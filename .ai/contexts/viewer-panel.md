@@ -30,7 +30,7 @@ panel.getContent();                    // current editor content
 panel.destroy();                       // tear down (rare; usually open() replaces)
 ```
 
-Used at `public/app.js:19-44` for the three panel instances.
+Used at `public/app.js:31-55` for the two panel instances.
 
 ## Toolbar buttons (visibility rules)
 
