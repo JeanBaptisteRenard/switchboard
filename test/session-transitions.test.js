@@ -7,6 +7,14 @@ const path = require('path');
 const sessionTransitions = require('../session-transitions');
 const { detectSubagentTransitions, init } = sessionTransitions;
 
+// detectSubagentTransitions arms the settle tick on every call. These tests
+// drive the scan by hand, so a real 5 s timer would be a phantom that could
+// fire onto an unrelated later test under CI load. Stub it out for the file:
+// nothing here needs setTimeout, and the tick has its own suite.
+const realSetTimeout = globalThis.setTimeout;
+test.before(() => { globalThis.setTimeout = () => ({ unref() {} }); });
+test.after(() => { globalThis.setTimeout = realSetTimeout; });
+
 function mkTmp() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-st-'));
 }
