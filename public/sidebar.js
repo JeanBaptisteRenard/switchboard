@@ -440,7 +440,7 @@ function renderProjects(projects, resort) {
     }
     const anyFilterActive = showStarredOnly || showRunningOnly || showTodayOnly || searchMatchIds !== null;
     // see .ai/contexts/subagent-observability.md
-    const keepForOrphanSubagents = !anyFilterActive && subagentIndex.size > 0;
+    const keepForOrphanSubagents = subagentIndex.size > 0 && !showStarredOnly && !showRunningOnly && !showTodayOnly;
     if (filtered.length === 0 && !project._projectMatchedOnly && !keepForOrphanSubagents && (project.sessions.length > 0 || anyFilterActive)) return null;
 
     // Sort
@@ -567,7 +567,8 @@ function renderProjects(projects, resort) {
         // section is rarely the user's focus and can grow long on long-lived
         // projects (this very session has 1300+ orphan subagents).
         const orphanStateKey = 'orphanExpanded:' + projectPath;
-        const expanded = localStorage.getItem(orphanStateKey) === '1';
+        // see .ai/contexts/subagent-observability.md
+        const expanded = searchMatchIds !== null || localStorage.getItem(orphanStateKey) === '1';
 
         const orphanGroup = document.createElement('div');
         orphanGroup.className = 'sidebar-orphan-subagents' + (expanded ? '' : ' collapsed');
