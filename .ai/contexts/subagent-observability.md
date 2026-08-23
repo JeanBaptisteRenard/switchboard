@@ -255,22 +255,24 @@ lost (Show Archived brought it back), but the old behaviour hid this by
 accident: archiving the children too really did empty `project.sessions`, so
 the disappearance was legitimate.
 
-The guard now carries `keepForOrphanSubagents = !anyFilterActive &&
-subagentIndex.size > 0`. When `filtered` is empty, every indexed subagent is by
-definition an orphan (`allTopLevelIds` is built from the rendered items, which
-are none), so the existing orphan bucket renders them under a surviving header.
-The `!anyFilterActive` half is load-bearing: without it, `showStarredOnly` /
-`showRunningOnly` / `showTodayOnly` / an active search would resurrect every
-project that merely owns a subagent, since subagents never satisfy those
-filters. The other cases the guard protects are untouched — an empty project
-directory still renders (`subagentIndex.size === 0`), a filtered-out project
-still hides, and `_projectMatchedOnly` still short-circuits ahead of it.
-
-Still open, reported but not fixed: when a search matches **only** subagent
-transcripts in a project, `refreshSidebar` narrows `sessions` to those matches
-and `processProjectSessions` then filters them all out, so the project
-disappears from the results instead of surfacing the matching transcript. That
-needs a UI decision (render the hit as an orphan group?), not just a filter.
+The guard now carries `keepForOrphanSubagents = subagentIndex.size > 0 &&
+!showStarredOnly && !showRunningOnly && !showTodayOnly`. When `filtered` is
+empty, every indexed subagent is by definition an orphan (`allTopLevelIds` is
+built from the rendered items, which are none), so the existing orphan bucket
+renders them under a surviving header. The three named filters are
+load-bearing: without excluding them, `showStarredOnly` / `showRunningOnly` /
+`showTodayOnly` would resurrect every project that merely owns a subagent,
+since subagents never satisfy those filters. Search is deliberately **not** in
+that exclusion list: `refreshSidebar` (`public/app.js`) has already dropped any
+project with zero matching sessions before `processProjectSessions` ever runs,
+so by the time this guard is reached under an active search, `subagentIndex`
+being non-empty means a subagent transcript is the match — keeping the project
+alive surfaces it instead of losing it. The orphan bucket's default-collapsed
+state is overridden the same way (`expanded = searchMatchIds !== null || ...`)
+so the matching subagent doesn't require an extra click to see. The other
+cases the guard protects are untouched — an empty project directory still
+renders (`subagentIndex.size === 0`), a filtered-out project still hides, and
+`_projectMatchedOnly` still short-circuits ahead of it.
 
 ## If you change this, also check
 
@@ -278,6 +280,7 @@ needs a UI decision (render the hit as an orphan group?), not just a filter.
 - `test/dom-subagent-transcript.test.js` — 4 tests covering the routing branch + transcript render
 - `test/dom-sidebar.test.js` — covers orphan group rendering
 - `test/dom-project-archive-all.test.js` — pins the project archive-all filter
+- `test/dom-sidebar-search-subagent-hits.test.js` — pins the search-only-hits-a-subagent case and the showStarredOnly regression, one test per guard clause
 - `test/session-transitions.test.js` — spawn/complete/heartbeat lifecycle plus
   the resurrection guards above
 - `test/dom-grid-subagent-pills.test.js` — pins the grid-view IPC handler arity
