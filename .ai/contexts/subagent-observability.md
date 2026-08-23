@@ -274,9 +274,72 @@ cases the guard protects are untouched — an empty project directory still
 renders (`subagentIndex.size === 0`), a filtered-out project still hides, and
 `_projectMatchedOnly` still short-circuits ahead of it.
 
+## Capped subagent lists
+
+Both subagent lists used to build every row on every render, and both then
+hid most of what they had just built:
+
+- `appendSubagentChildren` filled `.sidebar-subagents-container` with all of a
+  parent's children and set `display:none` on the container unless the caret
+  was expanded;
+- the project-level orphan bucket in `buildSessionsList` appended every orphan
+  and let `.sidebar-orphan-subagents.collapsed > :not(.sidebar-orphan-label)`
+  hide them in CSS.
+
+`buildSubagentItem` produces 7 elements per row, so a project with 1300
+children and 1300 orphans built 18 200 elements per render — measured on the
+jsdom harness (`test/dom-setup.js`), 18 275 elements total in the sidebar,
+of which 18 200 were subagent rows nobody was looking at. Neither `+ N older`
+nor the collapsed-group CSS helps here: they save screen space, not
+construction.
+
+Each list now renders, by default, the **union** of
+
+- every subagent for which `isSubagentActive(parentSessionId, agentId)` holds, and
+- the `SUBAGENT_PREVIEW_COUNT` (10) most recent by `modified`
+
+(`splitSubagentsForPreview`), and the remainder is **not built at all** — only
+a `+ N more` toggle is emitted (`appendSubagentRestToggle`). Same fixture after
+the change: 217 elements in the sidebar, 20 subagent rows. The union is
+deliberate, not a truncated sort: a long-running subagent whose transcript
+stopped growing hours ago must keep its `.running` dot, which a
+recency-only cut would silently extinguish — the exact class of bug PR #130
+was about. Row order inside each list is unchanged; only membership is.
+
+Clicking the toggle builds the remainder there and then, removes the toggle,
+and records the list in the `expandedSubagentRest` localStorage set
+(`p:<parentSessionId>` for a parent's children, `o:<projectPath>` for a
+project's orphan bucket). The next render reads that set *before* splitting
+and builds the whole list, so what the user expanded survives morphdom —
+same mechanism as `expandedSubagents` and `orphanExpanded:<projectPath>`,
+including the one-shot GC that drops `p:` entries whose session is gone from
+`sessionMap`.
+
+Two details that are easy to get wrong:
+
+- **The toggle's payload cannot live in its closure.** morphdom keeps the
+  *old* element whenever ids match (`getNodeKey`), so a listener bound at
+  build time keeps forever the data of the render that created it. The
+  remainder is therefore held in the module-level `pendingSubagentRest` map,
+  keyed by the toggle's id, cleared at the top of `renderProjects` and
+  repopulated by each build — the kept listener always reads current data.
+- **An active search bypasses the cap** (`searchMatchIds !== null`), for the
+  same reason the orphan bucket auto-expands during a search: `refreshSidebar`
+  has already narrowed `project.sessions` to the matches, so every remaining
+  row is a hit and hiding one behind a click would lose it.
+
+Not addressed, and worth knowing: a *collapsed* caret still builds its 10
+preview rows, and the "active" criterion is `isSubagentActive` alone.
+`attentionSessions` / `responseReadySessions` / `sessionBusyState` are keyed
+by PTY-owning sessions and never hold a subagent id on this fork (subagent
+click opens a read-only transcript, fork PR #9), so no other indicator can be
+capped out of view — but that is a property of the current wiring, not an
+invariant enforced anywhere.
+
 ## If you change this, also check
 
 - `eslint.config.js` `rendererCrossFileGlobals` — must list any new renderer-global functions (e.g. `showSubagentTranscript`, `drainViewerWatches`) or lint fails on `no-undef`
+- `test/dom-subagent-list-cap.test.js` — pins the union criterion, the "+ N more" lazy build, and the survival of an expanded remainder across a re-render
 - `test/dom-subagent-transcript.test.js` — 4 tests covering the routing branch + transcript render
 - `test/dom-sidebar.test.js` — covers orphan group rendering
 - `test/dom-project-archive-all.test.js` — pins the project archive-all filter

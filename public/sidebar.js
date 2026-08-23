@@ -33,6 +33,13 @@ function _gcExpandedSubagentsOnce() {
       localStorage.setItem('expandedSubagents', JSON.stringify([...pruned]));
     }
   } catch {} // eslint: allowEmptyCatch
+  try {
+    const raw = new Set(JSON.parse(localStorage.getItem('expandedSubagentRest') || '[]'));
+    const pruned = new Set([...raw].filter(k => !k.startsWith('p:') || sessionMap.has(k.slice(2))));
+    if (pruned.size !== raw.size) {
+      localStorage.setItem('expandedSubagentRest', JSON.stringify([...pruned]));
+    }
+  } catch {} // eslint: allowEmptyCatch
 }
 
 function getExpandedSubagents() {
@@ -46,6 +53,22 @@ function saveExpandedSubagents(set) {
   try {
     localStorage.setItem('expandedSubagents', JSON.stringify([...set]));
   } catch (e) {}
+}
+
+// see .ai/contexts/subagent-observability.md (capped subagent lists)
+const SUBAGENT_PREVIEW_COUNT = 10;
+
+function getExpandedSubagentRest() {
+  _gcExpandedSubagentsOnce();
+  try {
+    return new Set(JSON.parse(localStorage.getItem('expandedSubagentRest') || '[]'));
+  } catch { return new Set(); } // eslint: allowEmptyCatch
+}
+
+function saveExpandedSubagentRest(set) {
+  try {
+    localStorage.setItem('expandedSubagentRest', JSON.stringify([...set]));
+  } catch {} // eslint: allowEmptyCatch
 }
 
 // Subagent type → accent color (background / border)
@@ -226,6 +249,50 @@ function buildSubagentItem(session) {
   return item;
 }
 
+// see .ai/contexts/subagent-observability.md (capped subagent lists)
+function splitSubagentsForPreview(list) {
+  if (list.length <= SUBAGENT_PREVIEW_COUNT) return { shown: list, rest: [] };
+  const recent = new Set(
+    [...list]
+      .sort((a, b) => new Date(b.modified || 0) - new Date(a.modified || 0))
+      .slice(0, SUBAGENT_PREVIEW_COUNT)
+      .map(s => s.sessionId)
+  );
+  const shown = [];
+  const rest = [];
+  for (const s of list) {
+    if (recent.has(s.sessionId) || isSubagentActive(s.parentSessionId, s.agentId)) shown.push(s);
+    else rest.push(s);
+  }
+  return { shown, rest };
+}
+
+// see .ai/contexts/subagent-observability.md (capped subagent lists)
+const pendingSubagentRest = new Map();
+
+function appendSubagentRestToggle(container, domKey, stateKey, rest) {
+  if (rest.length === 0) return;
+  const toggle = document.createElement('div');
+  toggle.className = 'subagents-more-toggle js-stateful';
+  toggle.id = 'submore-' + domKey;
+  toggle.textContent = `+ ${rest.length} more`;
+  pendingSubagentRest.set(toggle.id, { stateKey, rest });
+  toggle.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const pending = pendingSubagentRest.get(toggle.id);
+    if (!pending) return;
+    pendingSubagentRest.delete(toggle.id);
+    const frag = document.createDocumentFragment();
+    for (const s of pending.rest) frag.appendChild(buildSubagentItem(s));
+    toggle.parentNode.insertBefore(frag, toggle);
+    toggle.remove();
+    const set = getExpandedSubagentRest();
+    set.add(pending.stateKey);
+    saveExpandedSubagentRest(set);
+  });
+  container.appendChild(toggle);
+}
+
 // Shared by buildSessionsList and buildSlugGroup — see .ai/contexts/subagent-observability.md
 function appendSubagentChildren(parentEl, parentSessionId, subagentIndex) {
   const children = subagentIndex && subagentIndex.get(parentSessionId);
@@ -242,14 +309,22 @@ function appendSubagentChildren(parentEl, parentSessionId, subagentIndex) {
   if (parentHasActiveSubagent(parentSessionId)) caret.classList.add('has-running-child');
   caret.innerHTML = `<span class="caret-arrow">&#9654;</span> ${children.length} subagent${children.length !== 1 ? 's' : ''}<span class="caret-running-dot"></span>`;
 
+  const domKey = parentSessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
   const childrenContainer = document.createElement('div');
   childrenContainer.className = 'sidebar-subagents-container js-stateful';
-  childrenContainer.id = 'subc-' + parentSessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  childrenContainer.id = 'subc-' + domKey;
   childrenContainer.style.display = isExpanded ? '' : 'none';
 
-  for (const child of children) {
+  const restKey = 'p:' + parentSessionId;
+  const restExpanded = searchMatchIds !== null || getExpandedSubagentRest().has(restKey);
+  const { shown, rest } = restExpanded
+    ? { shown: children, rest: [] }
+    : splitSubagentsForPreview(children);
+
+  for (const child of shown) {
     childrenContainer.appendChild(buildSubagentItem(child));
   }
+  appendSubagentRestToggle(childrenContainer, domKey, restKey, rest);
 
   caret.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -376,6 +451,7 @@ function buildSlugGroup(slug, sessions, subagentIndex) {
 
 function renderProjects(projects, resort) {
   pruneStaleSubagents();
+  pendingSubagentRest.clear();
   const newSidebar = document.createElement('div');
 
   // Sort project groups using sortedOrder as source of truth
@@ -585,9 +661,16 @@ function renderProjects(projects, resort) {
         });
         orphanGroup.appendChild(orphanLabel);
 
-        for (const orphan of orphans) {
+        const restKey = 'o:' + projectPath;
+        const restExpanded = searchMatchIds !== null || getExpandedSubagentRest().has(restKey);
+        const { shown, rest } = restExpanded
+          ? { shown: orphans, rest: [] }
+          : splitSubagentsForPreview(orphans);
+
+        for (const orphan of shown) {
           orphanGroup.appendChild(buildSubagentItem(orphan));
         }
+        appendSubagentRestToggle(orphanGroup, fId, restKey, rest);
         sessionsList.appendChild(orphanGroup);
       }
     }

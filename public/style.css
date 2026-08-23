@@ -740,6 +740,25 @@ body { display: flex; flex-direction: column; }
   background: rgba(120,130,255,0.08);
 }
 
+.subagents-more-toggle {
+  padding: 3px 10px;
+  margin: 2px 12px 4px 52px;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: #7a7a90;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s;
+  border-radius: 5px;
+  display: inline-block;
+  background: rgba(255,255,255,0.03);
+}
+
+.subagents-more-toggle:hover {
+  color: #8088ff;
+  background: rgba(120,130,255,0.08);
+}
+
 /* ---- Slug groups ---- */
 .slug-group { }
 .slug-group-header {
