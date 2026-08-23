@@ -222,6 +222,29 @@ test('an enabled trace that was never init()ed still writes nothing', () => {
   assert.equal(t.currentFile, null);
 });
 
+// Pruning runs on the retired stream's close callback — see docs/activity-trace.md
+// "Testing the async prune path" for why these wait on the condition, not the clock.
+async function waitUntil(check, { tries = 500, intervalMs = 20 } = {}) {
+  for (let i = 0; i < tries; i++) {
+    if (check()) return true;
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return check();
+}
+
+function readEntries(files) {
+  const out = [];
+  for (const f of files) {
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch { continue; }
+    for (const line of content.split('\n')) {
+      if (!line) continue;
+      try { out.push(JSON.parse(line)); } catch { /* mid-flush line, next poll picks it up */ }
+    }
+  }
+  return out;
+}
+
 // --- bounding: rotation with a fixed number of retained segments -----------
 
 test('the trace rotates segments and retains a bounded number of them', async () => {
@@ -232,21 +255,15 @@ test('the trace rotates segments and retains a bounded number of them', async ()
   assert.ok(t.files.length > 2, 'the run produced more segments than it retains');
   t.close();
 
-  // Pruning runs on the retired stream's close callback.
   let files = [];
-  for (let i = 0; i < 100; i++) {
+  await waitUntil(() => {
     files = fs.readdirSync(dir).filter(f => f.endsWith('.jsonl'));
-    if (files.length <= 2) break;
-    await new Promise(r => setTimeout(r, 10));
-  }
+    return files.length <= 2;
+  });
   assert.equal(files.length, 2, 'older segments are unlinked, disk use stays bounded');
   assert.ok(files.every(f => f.startsWith('activity-trace-')));
   fs.rmSync(dir, { recursive: true, force: true });
 });
-
-// Pruning runs on the retired stream's close callback, so it always lags a
-// synchronous burst of writes by at least a tick.
-const settle = () => new Promise(r => setTimeout(r, 60));
 
 test('a segment that cannot be unlinked stays queued and is retried, not forgotten', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-trace-lock-'));
@@ -263,7 +280,7 @@ test('a segment that cannot be unlinked stays queued and is retried, not forgott
   });
   t.init(dir);
   for (let i = 0; i < 60; i++) t.trace('fill', 's1', { i, pad: 'xxxxxxxxxxxxxxxxxxxx' });
-  await settle();
+  await waitUntil(() => attempts.length > 1);
 
   const stale = t.files[0];
   assert.ok(attempts.length > 1, 'the locked segment is retried at each rotation');
@@ -272,7 +289,7 @@ test('a segment that cannot be unlinked stays queued and is retried, not forgott
 
   locked = false;
   for (let i = 0; i < 40; i++) t.trace('fill', 's1', { i, pad: 'xxxxxxxxxxxxxxxxxxxx' });
-  await settle();
+  await waitUntil(() => t.files.length === 2);
   assert.equal(t.files.length, 2, 'the backlog drains back to the ceiling once the lock clears');
   assert.equal(t.files.includes(stale), false);
   t.close();
@@ -287,15 +304,16 @@ test('a failed prune is reported in the trace itself, once per file', async () =
   });
   t.init(dir);
   for (let i = 0; i < 60; i++) t.trace('fill', 's1', { i, pad: 'xxxxxxxxxxxxxxxxxxxx' });
-  await settle();
   const files = t.files.slice();
-  t.close();
-  await settle();
 
-  const rows = files
-    .flatMap(f => fs.readFileSync(f, 'utf8').split('\n'))
-    .filter(Boolean).map(l => JSON.parse(l));
-  const warnings = rows.filter(e => e.cat === 'trace.prune-failed');
+  // Order matters here — see docs/activity-trace.md "Testing the async prune path".
+  let warnings = [];
+  await waitUntil(() => {
+    warnings = readEntries(files).filter(e => e.cat === 'trace.prune-failed');
+    return warnings.length >= 1;
+  });
+  t.close();
+
   assert.ok(warnings.length >= 1, 'exceeding the announced ceiling is not silent');
   assert.equal(warnings[0].error, 'EBUSY');
   assert.equal(new Set(warnings.map(w => w.file)).size, warnings.length,
