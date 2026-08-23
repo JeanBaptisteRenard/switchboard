@@ -1298,7 +1298,7 @@ window.api.onProjectsChanged(() => {
 let activityTimer = null;
 
 function renderDefaultStatus() {
-  const totalSessions = cachedAllProjects.reduce((n, p) => n + p.sessions.length, 0);
+  const totalSessions = cachedAllProjects.reduce((n, p) => n + p.sessions.filter(s => !s.parentSessionId).length, 0);
   const totalProjects = cachedAllProjects.length;
   const running = activePtyIds.size;
   const parts = [];

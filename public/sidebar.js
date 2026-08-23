@@ -439,7 +439,9 @@ function renderProjects(projects, resort) {
       });
     }
     const anyFilterActive = showStarredOnly || showRunningOnly || showTodayOnly || searchMatchIds !== null;
-    if (filtered.length === 0 && !project._projectMatchedOnly && (project.sessions.length > 0 || anyFilterActive)) return null;
+    // see .ai/contexts/subagent-observability.md
+    const keepForOrphanSubagents = !anyFilterActive && subagentIndex.size > 0;
+    if (filtered.length === 0 && !project._projectMatchedOnly && !keepForOrphanSubagents && (project.sessions.length > 0 || anyFilterActive)) return null;
 
     // Sort
     filtered = [...filtered].sort((a, b) => {
@@ -824,7 +826,7 @@ function rebindSidebarEvents(projects) {
     if (archiveGroupBtn) {
       archiveGroupBtn.onclick = async (e) => {
         e.stopPropagation();
-        const sessions = project.sessions.filter(s => !s.archived);
+        const sessions = project.sessions.filter(s => !s.parentSessionId && !s.archived);
         if (sessions.length === 0) return;
         const shortName = shortProjectPath(project.projectPath);
         if (!confirm(`Archive all ${sessions.length} session${sessions.length > 1 ? 's' : ''} in ${shortName}?`)) return;

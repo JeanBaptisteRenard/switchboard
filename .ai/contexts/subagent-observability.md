@@ -215,11 +215,69 @@ process, not from mtime.
   *new* query scoped to a slug-group's subtree must apply this guard too —
   it's not automatic.
 
+## `project.sessions` carries subagents
+
+`buildProjectsFromCache` (`session-cache.js`) groups **every** `session_cache`
+row by `projectPath`, subagent rows included — they are indexed from
+`<folder>/<parent>/subagents/agent-*.jsonl` with the same `folder` and
+`projectPath` as their parent, and the row keeps `parentSessionId` set. So the
+`project.sessions` array the renderer receives is a flat list of parents *and*
+children.
+
+Every consumer must therefore drop `s.parentSessionId` rows itself before
+treating the array as "the project's sessions". `processProjectSessions`
+(`public/sidebar.js`) does exactly that (`allSessions.filter(s => !s.parentSessionId)`)
+after handing the full list to `buildSubagentIndex`; the DB side does the same
+in `getTotalCounts` (`db.js`), which counts `WHERE parentSessionId IS NULL`.
+
+Two consumers had missed it and were fixed together:
+
+- the project-level **Archive all sessions** button — it counted subagents in
+  its confirmation prompt ("Archive all 87 sessions…" on a project with a
+  handful of real ones), archived each subagent transcript so it vanished from
+  under its parent, and called `stopSession` on any subagent id that happened
+  to be in `activePtyIds`;
+- the status bar's `N sessions` total (`renderDefaultStatus`, `public/app.js`),
+  which disagreed with the stats panel's own total for the same reason.
+
+Covered by `test/dom-project-archive-all.test.js`.
+
+### The knock-on: the project vanished instead
+
+Not archiving the children exposed a latent hole in `processProjectSessions`'s
+skip guard. After an archive-all, `buildProjectsFromCache(false)` drops the
+now-archived parent rows but keeps the unarchived subagent rows, so
+`project.sessions.length > 0` while `filtered` (top-level only) is empty — the
+guard returned `null`, the render loop hit `continue`, and the project vanished
+from the default view entirely: no header, and no orphan bucket either, because
+that bucket lives inside `buildSessionsList`, past the `continue`. No data was
+lost (Show Archived brought it back), but the old behaviour hid this by
+accident: archiving the children too really did empty `project.sessions`, so
+the disappearance was legitimate.
+
+The guard now carries `keepForOrphanSubagents = !anyFilterActive &&
+subagentIndex.size > 0`. When `filtered` is empty, every indexed subagent is by
+definition an orphan (`allTopLevelIds` is built from the rendered items, which
+are none), so the existing orphan bucket renders them under a surviving header.
+The `!anyFilterActive` half is load-bearing: without it, `showStarredOnly` /
+`showRunningOnly` / `showTodayOnly` / an active search would resurrect every
+project that merely owns a subagent, since subagents never satisfy those
+filters. The other cases the guard protects are untouched — an empty project
+directory still renders (`subagentIndex.size === 0`), a filtered-out project
+still hides, and `_projectMatchedOnly` still short-circuits ahead of it.
+
+Still open, reported but not fixed: when a search matches **only** subagent
+transcripts in a project, `refreshSidebar` narrows `sessions` to those matches
+and `processProjectSessions` then filters them all out, so the project
+disappears from the results instead of surfacing the matching transcript. That
+needs a UI decision (render the hit as an orphan group?), not just a filter.
+
 ## If you change this, also check
 
 - `eslint.config.js` `rendererCrossFileGlobals` — must list any new renderer-global functions (e.g. `showSubagentTranscript`, `drainViewerWatches`) or lint fails on `no-undef`
 - `test/dom-subagent-transcript.test.js` — 4 tests covering the routing branch + transcript render
 - `test/dom-sidebar.test.js` — covers orphan group rendering
+- `test/dom-project-archive-all.test.js` — pins the project archive-all filter
 - `test/session-transitions.test.js` — spawn/complete/heartbeat lifecycle plus
   the resurrection guards above
 - `test/dom-grid-subagent-pills.test.js` — pins the grid-view IPC handler arity
