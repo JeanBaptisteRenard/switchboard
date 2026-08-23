@@ -2013,6 +2013,12 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   };
   activeSessions.set(sessionId, session);
 
+  // see .ai/contexts/cli-session-state.md
+  if (!isPlainTerminal && !cliSessionState.ensureWatching()) {
+    const retry = setTimeout(() => cliSessionState.ensureWatching(), 15000);
+    if (typeof retry.unref === 'function') retry.unref();
+  }
+
   ptyProcess.onData(data => {
     const currentId = session.realSessionId || sessionId;
 
@@ -2193,6 +2199,18 @@ const sessionTransitions = require('./session-transitions');
 sessionTransitions.init({ PROJECTS_DIR, activeSessions, getMainWindow: () => mainWindow, log, rekeyMcpServer });
 const { detectSessionTransitions } = sessionTransitions;
 
+// see .ai/contexts/cli-session-state.md
+const cliSessionState = require('./cli-session-state');
+cliSessionState.init({
+  activeSessions,
+  log,
+  onIdle: (sessionId, session) => {
+    sessionTransitions.detectSubagentTransitions(
+      sessionId, session, path.join(PROJECTS_DIR, session.projectFolder)
+    );
+  },
+});
+
 // --- fs.watch on projects directory ---
 let projectsWatcher = null;
 
@@ -2342,6 +2360,7 @@ if (!gotSingleInstanceLock) {
     buildMenu();
     createWindow();
     startProjectsWatcher();
+    cliSessionState.ensureWatching();
     // Remove IDE lock files left behind by a crashed instance whose PID was
     // reused (the function only unlinks locks matching our own pid).
     cleanStaleLockFiles(log);
@@ -2489,6 +2508,7 @@ app.on('before-quit', () => {
     projectsWatcher.close();
     projectsWatcher = null;
   }
+  cliSessionState.stop();
 
   // Kill all PTY processes on quit
   for (const [, session] of activeSessions) {

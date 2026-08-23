@@ -1,6 +1,6 @@
 # Context engineering — Switchboard
 
-Five sub-system docs, ~150 lines each, written for AI agents who need to make a focused change without re-reading 1800 LOC of `main.js`.
+Seven sub-system docs, ~150 lines each, written for AI agents who need to make a focused change without re-reading 1800 LOC of `main.js`.
 
 ## When to read which
 
@@ -12,6 +12,7 @@ Five sub-system docs, ~150 lines each, written for AI agents who need to make a 
 | Memory/.work-files tabs, CodeMirror panel, format/delete buttons | [viewer-panel](viewer-panel.md) |
 | New IPC, preload bridge changes, renderer ↔ main protocol | [ipc-bridge](ipc-bridge.md) |
 | File-trigger watcher, harness input injection, idle-wait | [trigger-watcher](trigger-watcher.md) |
+| Claude CLI state files, early subagent rescan, canary tests | [cli-session-state](cli-session-state.md) |
 
 ## Reading order for a new contributor (~30 min)
 
