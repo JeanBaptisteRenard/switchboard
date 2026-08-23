@@ -23,7 +23,7 @@ const assert = require('node:assert/strict');
 
 const { setupSidebarDom } = require('./dom-setup');
 
-function scheduleRerunProject(overrides = {}) {
+function scheduleRerunProject({ subagentParentId = 'sched-run-2', ...overrides } = {}) {
   const baseTime = Date.parse('2026-08-20T09:00:00Z');
   const t = (offsetMs) => new Date(baseTime + offsetMs).toISOString();
   // summary as read-session-file.js derives it for a createScheduleSession()
@@ -56,8 +56,8 @@ function scheduleRerunProject(overrides = {}) {
         archived: 0,
       },
       {
-        sessionId: 'sub:sched-run-2:agent-1',
-        parentSessionId: 'sched-run-2',
+        sessionId: `sub:${subagentParentId}:agent-1`,
+        parentSessionId: subagentParentId,
         agentId: 'agent-1',
         subagentType: 'explore',
         description: 'explore subagent',
@@ -151,6 +151,57 @@ test('"Archive all sessions in group" only archives the two top-level reruns, no
       'only the two top-level reruns must be archived — the nested subagent must not reach archiveSession');
     assert.ok(!stopCalls.includes('sub:sched-run-2:agent-1'),
       'the nested subagent must not reach stopSession either');
+  } finally {
+    ctx.destroy();
+  }
+});
+
+// Adversarial review of #134 found buildSlugGroup() calling appendSubagentChildren
+// from three separate loops (promoted / rest-under-"more" / all-sessions-else) and
+// only the first was exercised — see .ai/contexts/subagent-observability.md.
+test('a session in the "+N more" (non-promoted) part of a slug group still gets its subagent children attached', () => {
+  const ctx = setupSidebarDom();
+  try {
+    ctx.window.activePtyIds.add('sched-run-2'); // only sched-run-2 is promoted; sched-run-1 lands in "rest"
+    ctx.sidebar.renderProjects([scheduleRerunProject({ subagentParentId: 'sched-run-1' })], true);
+
+    const group = ctx.document.getElementById('slug-hn-top-articles');
+    assert.ok(group, 'the two schedule reruns must be grouped by shared slug');
+    assert.ok(group.classList.contains('has-promoted'), 'sched-run-2 being active must promote it, pushing sched-run-1 into rest');
+
+    const olderDiv = ctx.document.getElementById('sgo-slug-hn-top-articles');
+    assert.ok(olderDiv, 'the "+N more" container must be rendered since rest.length > 0');
+
+    const caret = ctx.document.getElementById('sub-caret-sched-run-1');
+    assert.ok(caret, 'subagent caret for the non-promoted rerun must exist');
+    assert.ok(olderDiv.contains(caret), 'the caret must be nested inside the "+N more" container, next to its parent session-item');
+
+    const subagentItem = ctx.document.getElementById('si-sub:sched-run-1:agent-1');
+    assert.ok(subagentItem, 'the subagent item must be rendered');
+    assert.ok(olderDiv.contains(subagentItem), 'the subagent item must be nested inside the "+N more" container, not dropped to the orphan bucket');
+  } finally {
+    ctx.destroy();
+  }
+});
+
+test('a session in a slug group with no active PTY at all still gets its subagent children attached', () => {
+  const ctx = setupSidebarDom();
+  try {
+    // No session in this group has an active PTY, so buildSlugGroup() takes
+    // the plain "all sessions" branch rather than the promoted/rest split.
+    ctx.sidebar.renderProjects([scheduleRerunProject({ subagentParentId: 'sched-run-2' })], true);
+
+    const group = ctx.document.getElementById('slug-hn-top-articles');
+    assert.ok(group, 'the two schedule reruns must be grouped by shared slug');
+    assert.ok(!group.classList.contains('has-promoted'), 'no session is active, so the group must not be in the promoted state');
+
+    const caret = ctx.document.getElementById('sub-caret-sched-run-2');
+    assert.ok(caret, 'subagent caret must exist even when no session in the group is running');
+    assert.ok(group.contains(caret), 'the caret must be nested inside the slug group, next to its parent session-item');
+
+    const subagentItem = ctx.document.getElementById('si-sub:sched-run-2:agent-1');
+    assert.ok(subagentItem, 'the subagent item must be rendered');
+    assert.ok(group.contains(subagentItem), 'the subagent item must be nested inside the slug group, not dropped to the orphan bucket');
   } finally {
     ctx.destroy();
   }
