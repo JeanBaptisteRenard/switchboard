@@ -89,7 +89,7 @@ function setupCombinedDom() {
   const MORPHDOM_PATH = path.join(__dirname, '..', 'node_modules', 'morphdom', 'dist', 'morphdom-umd.js');
   vm.runInContext(fs.readFileSync(MORPHDOM_PATH, 'utf8'), dom.getInternalVMContext(), { filename: 'morphdom-umd.js' });
 
-  for (const file of ['utils.js', 'icons.js', 'shortcuts.js', 'grid-view.js', 'sidebar.js']) {
+  for (const file of ['utils.js', 'icons.js', 'shortcuts.js', 'subagent-timing.js', 'grid-view.js', 'sidebar.js']) {
     evalInWindow(dom, path.join(PUBLIC_DIR, file));
   }
 

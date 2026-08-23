@@ -130,6 +130,7 @@ const rendererCrossFileGlobals = {
   folderId: 'readonly',
   slugId: 'readonly',
   subagentTypeColor: 'readonly',
+  SUBAGENT_LIVE_TTL_MS: 'readonly',
   getExpandedSubagents: 'readonly',
   saveExpandedSubagents: 'readonly',
   getExpandedSlugs: 'readonly',
@@ -286,6 +287,28 @@ module.exports = [
         ...globals.browser,
         ...rendererCrossFileGlobals,
         module: 'writable',
+      },
+    },
+    rules: {
+      'no-undef': 'error',
+      'no-unused-vars': ['warn', { args: 'none', varsIgnorePattern: '^_' }],
+      'no-redeclare': 'warn',
+    },
+  },
+
+  // Producer of a cross-file renderer global: classic <script> in the renderer,
+  // require()-d by the main process and tests. It declares SUBAGENT_LIVE_TTL_MS
+  // rather than consuming it, so the global is switched off here — otherwise
+  // no-redeclare flags the one definition the other two files depend on.
+  {
+    files: ['public/subagent-timing.js'],
+    languageOptions: {
+      ecmaVersion: 2024,
+      sourceType: 'script',
+      globals: {
+        ...globals.browser,
+        module: 'writable',
+        SUBAGENT_LIVE_TTL_MS: 'off',
       },
     },
     rules: {

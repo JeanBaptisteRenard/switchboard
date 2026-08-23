@@ -92,7 +92,6 @@ function subagentTypeColor(type) {
 // then evicts agents that went silent without evicting one that merely runs
 // longer than a minute.
 const activeSubagentsByParent = new Map();
-const SUBAGENT_LIVE_TTL_MS = 60000;
 
 function isSubagentActive(parentSessionId, agentId) {
   const map = activeSubagentsByParent.get(parentSessionId);
@@ -113,6 +112,34 @@ function pruneStaleSubagents() {
     if (map.size === 0) activeSubagentsByParent.delete(parentId);
   }
   if (window.ATRACE) window.atrace('subagents.prune', null, { map: 'activeSubagentsByParent', cutoff, parents: activeSubagentsByParent.size, agents: [...activeSubagentsByParent.values()].reduce((n, m) => n + m.size, 0), fn: 'pruneStaleSubagents' });
+}
+
+let subagentTtlTimer = null;
+
+function scheduleSubagentTtlTick() {
+  if (subagentTtlTimer) return;
+  let oldest = Infinity;
+  for (const map of activeSubagentsByParent.values()) {
+    for (const lastSeenAt of map.values()) {
+      if (lastSeenAt < oldest) oldest = lastSeenAt;
+    }
+  }
+  if (oldest === Infinity) return;
+  const delay = Math.max(1, oldest + SUBAGENT_LIVE_TTL_MS + 1 - Date.now());
+  subagentTtlTimer = setTimeout(runSubagentTtlTick, delay);
+}
+
+function runSubagentTtlTick() {
+  subagentTtlTimer = null;
+  const tracked = [];
+  for (const [parentId, map] of activeSubagentsByParent) {
+    for (const agentId of map.keys()) tracked.push([parentId, agentId]);
+  }
+  pruneStaleSubagents();
+  for (const [parentId, agentId] of tracked) {
+    if (!isSubagentActive(parentId, agentId)) reflectSubagentRunningState(parentId, agentId);
+  }
+  scheduleSubagentTtlTick();
 }
 
 // Drop all live-subagent state for a parent whose PTY just stopped, and sync
@@ -180,6 +207,7 @@ function reflectSubagentRunningState(parentSessionId, agentId) {
       }
       if (window.ATRACE) window.atrace('recv.subagent-spawned', parentSessionId, { map: 'activeSubagentsByParent', op: 'set', agentId, from: map.get(agentId) ?? null, applied: true, bootstrap: !!payload._bootstrap, heartbeat: !!_heartbeat, fn: 'onSubagentSpawned' });
       map.set(agentId, Date.now());
+      scheduleSubagentTtlTick();
       reflectSubagentRunningState(parentSessionId, agentId);
     });
   }

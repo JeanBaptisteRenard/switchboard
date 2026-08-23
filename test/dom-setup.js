@@ -119,6 +119,7 @@ function setupSidebarDom() {
   // Real utils.js and icons.js — small and dependency-free.
   evalInWindow(dom, path.join(PUBLIC_DIR, 'utils.js'));
   evalInWindow(dom, path.join(PUBLIC_DIR, 'icons.js'));
+  evalInWindow(dom, path.join(PUBLIC_DIR, 'subagent-timing.js'));
 
   // Finally, sidebar.js.
   evalInWindow(dom, path.join(PUBLIC_DIR, 'sidebar.js'));

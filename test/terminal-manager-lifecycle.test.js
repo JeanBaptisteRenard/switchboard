@@ -533,7 +533,7 @@ test('safeFit: clamps rows to content box when cell height is available via _cor
   const fs2 = require('node:fs');
   const path2 = require('node:path');
   const vm2 = require('node:vm');
-  for (const file of ['utils.js', 'shortcuts.js', 'terminal-context-menu.js', 'terminal-manager.js', 'grid-view.js']) {
+  for (const file of ['utils.js', 'shortcuts.js', 'subagent-timing.js', 'terminal-context-menu.js', 'terminal-manager.js', 'grid-view.js']) {
     const src = fs2.readFileSync(path2.join(PUBLIC_DIR, file), 'utf8');
     vm2.runInContext(src, ctx, { filename: file });
   }

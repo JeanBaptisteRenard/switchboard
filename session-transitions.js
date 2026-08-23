@@ -2,6 +2,7 @@ const path = require('path');
 const fs = require('fs');
 const { readSubagentMeta } = require('./read-session-file');
 const { enabled: TRACE, trace } = require('./activity-trace');
+const { SUBAGENT_LIVE_TTL_MS } = require('./public/subagent-timing');
 
 /**
  * Fork detection for active PTY sessions.
@@ -18,6 +19,47 @@ function init(ctx) {
 }
 
 // --- Subagent spawn / completion detection ---
+
+// see .ai/contexts/subagent-observability.md
+const SETTLE_TICK_MS = 5000;
+const STABLE_MS = 30000;
+const MAX_STABLE_MS = 300000;
+const STABLE_LADDER_MS = [STABLE_MS, 120000, MAX_STABLE_MS];
+let settleTimer = null;
+
+function nextStableMs(current) {
+  const i = STABLE_LADDER_MS.indexOf(current || STABLE_MS);
+  if (i < 0 || i + 1 >= STABLE_LADDER_MS.length) return MAX_STABLE_MS;
+  return STABLE_LADDER_MS[i + 1];
+}
+
+function hasUnsettledSubagents(session) {
+  if (!session.knownSubagents) return false;
+  for (const known of session.knownSubagents.values()) {
+    if (!known.completed || known._recheckStart) return true;
+  }
+  return false;
+}
+
+function armSubagentSettleTick(session) {
+  if (settleTimer || !hasUnsettledSubagents(session)) return;
+  settleTimer = setTimeout(runSubagentSettleTick, SETTLE_TICK_MS);
+  if (typeof settleTimer.unref === 'function') settleTimer.unref();
+}
+
+function runSubagentSettleTick() {
+  settleTimer = null;
+  if (!activeSessions) return;
+  for (const [sessionId, session] of [...activeSessions]) {
+    if (session.exited || session.isPlainTerminal || !session.projectFolder) continue;
+    if (!hasUnsettledSubagents(session)) continue;
+    detectSubagentTransitions(
+      session.realSessionId || sessionId,
+      session,
+      path.join(PROJECTS_DIR, session.projectFolder)
+    );
+  }
+}
 
 /** Walk <folder>/<sessionId>/subagents/ and detect new or completed subagent files.
  *  Mutates session.knownSubagents (Map<agentId, { mtimeMs, completed }>).
@@ -79,8 +121,8 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
 
   const mainWindow = getMainWindow();
   const now = Date.now();
-  const STABLE_MS = 30000; // 30 seconds of no mtime advance → completed
   const FRESH_SIGHTING_MS = 60000; // post-bootstrap: first sighting counts as live if newer than this
+  const LIVE_RECHECK_MS = 300000; // an agent completed by the stability timer stays falsifiable this long
   // Re-emit subagent-spawned (idempotent on the renderer side — it just
   // refreshes the entry's last-seen timestamp) at most every HEARTBEAT_MS
   // while an agent's file keeps growing. Without this, the renderer's 60s
@@ -170,7 +212,9 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
         known.mtimeMs = mtimeMs;
         known.completed = false;
         known._completedAt = null;
+        if (known._recheckMs) known._stableMs = nextStableMs(known._stableMs);
         known._recheckStart = null;
+        known._recheckMs = null;
         known._stableStart = null;
         known.subagentType = meta.agentType || null;
         known.description = meta.description || null;
@@ -184,9 +228,10 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
             description: meta.description || null,
           });
         }
-      } else if (now - known._recheckStart >= STABLE_MS) {
+      } else if (now - known._recheckStart >= (known._recheckMs || STABLE_MS)) {
         // Observed motionless for a full stability window — settled.
         known._recheckStart = null;
+        known._recheckMs = null;
       }
     } else {
       if (mtimeMs !== known.mtimeMs) {
@@ -194,25 +239,29 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
         known.mtimeMs = mtimeMs;
         known._stableStart = null;
         // Still-alive heartbeat (throttled) — see HEARTBEAT_MS above.
-        if (now - (known._lastHeartbeatAt || 0) >= HEARTBEAT_MS
-            && mainWindow && !mainWindow.isDestroyed()) {
+        const unseenForMs = now - (known._lastHeartbeatAt || 0);
+        if (unseenForMs >= HEARTBEAT_MS && mainWindow && !mainWindow.isDestroyed()) {
+          // see .ai/contexts/subagent-observability.md
+          const stale = unseenForMs >= SUBAGENT_LIVE_TTL_MS;
           known._lastHeartbeatAt = now;
-          if (TRACE) trace('subagent.spawned', sessionId, { agentId, kind: 'heartbeat', subagentType: known.subagentType || null, sent: true });
+          if (TRACE) trace('subagent.spawned', sessionId, { agentId, kind: stale ? 'reannounce' : 'heartbeat', subagentType: known.subagentType || null, sent: true });
           mainWindow.webContents.send('subagent-spawned', {
             parentSessionId: sessionId,
             agentId,
             subagentType: known.subagentType || null,
             description: known.description || null,
-            _heartbeat: true,
+            ...(stale ? {} : { _heartbeat: true }),
           });
         }
       } else {
         // mtime stable — start or continue stability timer
         if (!known._stableStart) {
           known._stableStart = now;
-        } else if (now - known._stableStart >= STABLE_MS) {
+        } else if (now - known._stableStart >= (known._stableMs || STABLE_MS)) {
           known.completed = true;
           known._completedAt = now;
+          known._recheckStart = now;
+          known._recheckMs = LIVE_RECHECK_MS;
           log.info(`[subagent-complete] parent=${sessionId} agentId=${agentId}`);
           if (TRACE) trace('subagent.completed', sessionId, { agentId, stableForMs: now - known._stableStart, reason: 'mtime-stable', sent: !!(mainWindow && !mainWindow.isDestroyed()) });
           if (mainWindow && !mainWindow.isDestroyed()) {
@@ -238,6 +287,8 @@ function detectSubagentTransitions(sessionId, session, folderPath) {
       if (!onDisk.has(agentId)) session.knownSubagents.delete(agentId);
     }
   }
+
+  armSubagentSettleTick(session);
 }
 
 // --- Fork detection ---

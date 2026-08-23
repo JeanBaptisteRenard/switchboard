@@ -66,7 +66,8 @@ This is the **#1 fork-specific feature** (upstream PR #47 still pending). It per
   `.running` from this Map on every render, so the state survives a full
   sidebar rebuild; the IPC handlers only fast-path the visual toggle between
   rebuilds (`reflectSubagentRunningState`).
-- **Why a TTL** (`SUBAGENT_LIVE_TTL_MS` = 60s, mirroring grid-view's):
+- **Why a TTL** (`SUBAGENT_LIVE_TTL_MS` = 60s, shared with grid-view — see
+  "One TTL, one definition" below):
   `detectSubagentTransitions()` only polls subagents of `!exited` sessions —
   if the parent's PTY dies before a subagent goes 30s quiet, the matching
   `subagent-completed` never fires and the entry would be stuck forever.
@@ -140,6 +141,20 @@ when a *new* subagent starts. Two rules keep that rescan quiet:
   re-added it, at the cost of a `statSync` and a `readSubagentMeta()` each.
   The map is now bounded by the directory's own file count.
 
+The settle tick reopens this question, because the predicate that arms it counts
+completed-but-still-falsifiable entries — which is exactly what bootstrap leaves
+behind for a *recent* file. So the periodic sweep now rescans the very entries
+PR #147 was about, with no watcher event involved. It does not wake the ghost:
+those entries are recorded `completed: true`, and the rehabilitation branch fires
+only on an mtime that actually moved. That is pinned by execution, not by
+reading — `test/subagent-settle-tick.test.js` drives the tick past the close of
+the window on a bootstrap file and asserts no IPC is ever emitted, and a sibling
+test grows the file mid-window to check the late spawn is still emitted, once.
+Neutralising the mtime-growth condition makes the first test report
+`the tick must never announce a bootstrap file, got
+["subagent-spawned","subagent-completed","subagent-spawned"]` — the ghost, now
+oscillating on a clock.
+
 Renderer side, `subagent-spawned` doubles as the still-alive heartbeat
 (`payload._heartbeat`). **A heartbeat refreshes an agent already tracked; it
 never creates an entry** — in `public/sidebar.js` and `public/grid-view.js`
@@ -174,6 +189,158 @@ always been the module's only completion signal, and it applies identically to
 an agent tracked from its first line. The renderer's 60 s TTL has the same
 shape. Anything that needs true liveness would have to come from the parent
 process, not from mtime.
+
+## The liveness signal needs a clock of its own (measured 2026-08-23/24)
+
+`detectSubagentTransitions()` owns three signals — spawn, heartbeat, completion —
+and until now it ran from exactly one place: the projects watcher's debounced
+flush (`main.js:startProjectsWatcher`, `setTimeout(flushChanges, 500)` re-armed
+on every `fs.watch` event over `PROJECTS_DIR`). A function that only runs when a
+file changes cannot detect that a file **stopped** changing. Three symptoms,
+all measured in `~/AppData/Roaming/switchboard/logs/main.log`:
+
+- **Completion arrives minutes late.** Agent `a9be19fb0a7e0e504`: last transcript
+  write 23:42:18, `[subagent-complete]` logged **23:52:55** — 10 min 37 s for a
+  30 s stability window. The parent was `waiting for your input` (OSC 9 at
+  23:43:35), so nothing wrote in the folder and no flush ran. The event fired at
+  the moment activity resumed, which is what the user saw as "the indicators
+  went dark when the parent came back".
+- **Completion also arrives *wrongly*.** Agents `a8e8c25f42a65b026` and
+  `a19dcbbb23270de85` were declared complete at 23:56:53 and 00:00:27 while
+  still writing at 00:02:00 and 00:01:45. A tool call longer than `STABLE_MS`
+  is indistinguishable from a finished agent — a documented limitation, but the
+  verdict was **irreversible**: the completion branch set `completed = true`
+  without a `_recheckStart`, so the entry hit the
+  `if (known.completed && !known._recheckStart) continue` fast path forever and
+  the agent could never light up again. `LIVE_RECHECK_MS` (5 min) now keeps a
+  stability completion falsifiable exactly like an assumed-finished one; renewed
+  growth rehabilitates it and re-emits the spawn (`[subagent-spawn-late]`).
+  This is load-bearing for the tick below: giving the stability clock a clock
+  makes false completions *more* frequent, not less, so reversibility is the
+  half that makes the pair safe.
+
+  **The window widens on each rehabilitation** — `STABLE_LADDER_MS`
+  (30 s -> 2 min -> `MAX_STABLE_MS` = 5 min, capped by name, carried on the
+  entry as `_stableMs`). An agent that has already gone quiet for longer than
+  its window is an agent whose silences are long; widening converges instead of
+  letting it oscillate complete -> rehabilitated -> complete, one visible blink
+  per cycle. The widening is deliberately **not** applied to the other
+  rehabilitation case: an *assumed*-finished entry (bootstrap, or a stale first
+  sighting) was never declared finished by the stability timer and carries no
+  evidence of long silences, so widening it would slow the normal case for
+  nothing. `_recheckMs` is the discriminator — it is set only on a stability
+  completion. Getting that wrong is caught by the two pre-existing bootstrap
+  reversibility tests.
+
+  **Widening required one companion change.** A wider window means an agent can
+  stay silent past the renderer's 60 s TTL without being completed — and the
+  renderer refuses a heartbeat for an agent it no longer tracks, by design. On
+  its own the widening would therefore have traded a blink for a permanent
+  blackout: exactly the bug being fixed, since before this branch the
+  completion/rehabilitation pair was the *only* path that re-lit a TTL-pruned
+  entry. So when the growth branch finds the agent unseen for at least
+  `SUBAGENT_LIVE_TTL_MS` it emits a **real spawn instead of a heartbeat**. That is
+  safe in all three cases the no-resurrect guard defends against: a completed
+  entry never reaches the growth branch, a TTL-pruned one is precisely what we
+  want to revive on fresh evidence of growth, and a dead parent never gets
+  scanned at all (`detectSubagentTransitions` runs only for `!exited`
+  sessions).
+- **Heartbeats stop too**, and the renderer's 60 s TTL then evicts a live agent.
+  Combined with "a heartbeat never resurrects an untracked agent", that eviction
+  is permanent as well.
+
+The settle tick (`SETTLE_TICK_MS`, `armSubagentSettleTick`) re-runs the scan for
+sessions that still hold a non-completed entry, independent of the watcher. It
+arms only when something is unsettled, re-arms from its own sweep, and stops on
+its own once every tracked agent has both completed **and** closed its recheck
+window — no idle cost when no subagent is running. `unref()` keeps it out of the
+way of process shutdown and of tests.
+
+A completed-but-still-falsifiable entry counts as unsettled on purpose: without
+that, in a silent folder its window could only ever close on a write to some
+*other* file in the same folder, so the "generous but bounded" promise above
+would not hold. Note that arming is guarded in two places — in
+`armSubagentSettleTick` and again in the sweep — so a test that only drains
+timers cannot tell the two apart; `test/subagent-settle-tick.test.js` scans a
+settled session directly and asserts nothing gets armed.
+
+**Refuted, so it does not get fixed here**: the debounce being *starved* by a
+flood of writes (re-armed faster than 500 ms while several transcripts append).
+The log disproves it — completions were emitted at 23:56:53 and 00:00:27 while
+three transcripts were being written, so the flush was running normally under
+load. No `maxWait` was added.
+
+### One TTL, one definition
+
+The main process and both renderer views must agree on the liveness TTL, and
+the failure is silent and one-directional: shorten the renderer's TTL alone and
+there is a band of durations in which the renderer has already pruned the entry
+while the main process is still sending heartbeats the renderer refuses — the
+permanent blackout this branch exists to fix, reintroduced with nothing to
+catch it. (Diverging the other way is harmless.)
+
+It used to be three independent `60000` literals held together by a comment.
+`public/subagent-timing.js` is now the single definition, following the
+dual-mode pattern already used by `public/shortcuts.js` and
+`public/terminal-manager.js`: a classic `<script>` for the renderer plus a
+`typeof module !== 'undefined'` export footer for `require()`. Three consumption
+contexts, all of which have to keep working:
+
+- **main process** — `require('./public/subagent-timing')` from
+  `session-transitions.js`. Root-to-`public/` is a new direction for this repo
+  but the directory is already in electron-builder's `files`, so it ships.
+- **renderer** — `<script src="subagent-timing.js">` in `index.html`, placed
+  before `grid-view.js` and `sidebar.js`. A top-level `const` lands in the
+  global *lexical* scope, not on `window`: sibling scripts resolve the bare
+  identifier, but `window.SUBAGENT_LIVE_TTL_MS` is `undefined`. Don't "verify"
+  the wiring by reading it off `window`.
+- **jsdom harness** — every harness that evaluates `sidebar.js` or
+  `grid-view.js` must evaluate `subagent-timing.js` first or they die on
+  `no-undef`/ReferenceError. Seven of them do (`test/dom-setup.js` plus six
+  test files with their own file lists); a new harness has to remember.
+
+`eslint.config.js` carries the constant in `rendererCrossFileGlobals` for the
+consumers, and gives the *producing* file its own block that switches that
+global `off` — otherwise `no-redeclare` flags the single definition, which is
+what the eight standing warnings on `shortcuts.js` are.
+
+### The renderer safety nets had no clock either
+
+`pruneStaleGridSubagents()` was called only from `wrapInGridCard()` and
+`pruneStaleSubagents()` only from `renderProjects()` — both render-driven, so a
+stale entry survived exactly in the idle case the TTL exists to cover. Each view
+now arms its own one-shot timer (`scheduleGridSubagentTtlTick` /
+`scheduleSubagentTtlTick`, names kept distinct per the shadowing rule above),
+scheduled **at the oldest entry's deadline** rather than on a polling interval:
+one wakeup per TTL period while agents are tracked, none at all when the map is
+empty, and a targeted refresh (`updateGridSubagentPills` /
+`reflectSubagentRunningState`) only for the entries the prune actually removed.
+That satisfies ADR 0002 — no steady-state cost, no render on an empty tick.
+
+The deadline arithmetic is `Math.max(1, oldest + TTL + 1 - now)`, and the tests
+assert on the armed `delay`, not just on the eviction — a constant interval or
+an inverted sign is otherwise invisible, which is precisely the property ADR
+0002 exists to protect. Note that the `Math.max` is unreachable: the prune
+deletes on a strict `spawnedAt < now - TTL`, so any entry that survives it
+satisfies `oldest + TTL >= now` and the expression is already `>= 1`. The `+1`
+is the part that keeps a boundary tick off `setTimeout(0)`. Both are kept, and
+the test pins the invariant (`delay >= 1`) rather than either guard, so it still
+holds if the prune's comparison is ever loosened to `<=`.
+
+These nets are a **backstop, not the fix**: with the main-process signal
+repaired they should almost never fire. `test/subagent-settle-tick.test.js` and
+`test/dom-subagent-ttl-tick.test.js` pin both halves; the DOM one substitutes
+`window.setTimeout` so the tick is driven by its own condition, never by a wall
+clock wait (see `docs/activity-trace.md`, "Testing the async prune path").
+
+### Still open
+
+The grid was reported showing two live pills while the sidebar showed one, at a
+moment when the log says one of the two had already been (falsely) completed.
+`onSubagentCompleted` removes the grid entry and calls
+`updateGridSubagentPills`, which is a no-op when `gridCards` has no card for
+that parent id — a plausible explanation, **not verified**: it needs the live
+DOM, which was not available.
 
 ## Subagent children inside a slug group (issue #128 ask 4, rehab-plan.md A3)
 

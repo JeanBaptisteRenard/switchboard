@@ -46,6 +46,7 @@ function gridSubagentColor(type) {
         activeSubagents.set(parentSessionId, map);
       }
       map.set(agentId, { agentId, subagentType, spawnedAt: Date.now() });
+      scheduleGridSubagentTtlTick();
       updateGridSubagentPills(parentSessionId);
     });
   }
@@ -67,13 +68,40 @@ function gridSubagentColor(type) {
 // Prune subagents that have been running for more than 60 s without a completion event.
 // see .ai/contexts/subagent-observability.md
 function pruneStaleGridSubagents() {
-  const cutoff = Date.now() - 60000;
+  const cutoff = Date.now() - SUBAGENT_LIVE_TTL_MS;
   for (const [parentId, map] of activeSubagents) {
     for (const [agentId, info] of map) {
       if (info.spawnedAt < cutoff) map.delete(agentId);
     }
     if (map.size === 0) activeSubagents.delete(parentId);
   }
+}
+
+let gridSubagentTtlTimer = null;
+
+function scheduleGridSubagentTtlTick() {
+  if (gridSubagentTtlTimer) return;
+  let oldest = Infinity;
+  for (const map of activeSubagents.values()) {
+    for (const info of map.values()) {
+      if (info.spawnedAt < oldest) oldest = info.spawnedAt;
+    }
+  }
+  if (oldest === Infinity) return;
+  const delay = Math.max(1, oldest + SUBAGENT_LIVE_TTL_MS + 1 - Date.now());
+  gridSubagentTtlTimer = setTimeout(runGridSubagentTtlTick, delay);
+}
+
+function runGridSubagentTtlTick() {
+  gridSubagentTtlTimer = null;
+  const sizeBefore = new Map();
+  for (const [parentId, map] of activeSubagents) sizeBefore.set(parentId, map.size);
+  pruneStaleGridSubagents();
+  for (const [parentId, size] of sizeBefore) {
+    const map = activeSubagents.get(parentId);
+    if (!map || map.size !== size) updateGridSubagentPills(parentId);
+  }
+  scheduleGridSubagentTtlTick();
 }
 
 // Re-render the pill row for a single card (if it exists in the grid).
