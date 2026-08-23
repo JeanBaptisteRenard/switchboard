@@ -65,8 +65,8 @@ function gridSubagentColor(type) {
 })();
 
 // Prune subagents that have been running for more than 60 s without a completion event.
-// Called on each grid render cycle.
-function pruneStaleSubagents() {
+// see .ai/contexts/subagent-observability.md
+function pruneStaleGridSubagents() {
   const cutoff = Date.now() - 60000;
   for (const [parentId, map] of activeSubagents) {
     for (const [agentId, info] of map) {
@@ -252,7 +252,7 @@ function wrapInGridCard(sessionId) {
   updateRunningIndicators();
 
   // Render subagent pills for any already-tracked children
-  pruneStaleSubagents();
+  pruneStaleGridSubagents();
   updateGridSubagentPills(sessionId);
 }
 

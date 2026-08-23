@@ -83,6 +83,14 @@ This is the **#1 fork-specific feature** (upstream PR #47 still pending). It per
 - **`subagentDomId()`** mirrors `subagentSessionId()` in
   `read-session-file.js` — that file is main-process and not `require()`-able
   from the renderer (sidebar.js loads as a plain script), hence the local copy.
+- **Grid view keeps its own parallel tracking** (`activeSubagents` +
+  `pruneStaleGridSubagents()` in `grid-view.js`, pruned from `wrapInGridCard()`
+  rather than on a timer). Renderer files are plain non-module `<script>`s
+  sharing one global scope and `sidebar.js` loads *after* `grid-view.js`
+  (`index.html:132` then `:136`), so a top-level function declared under the
+  same name in both is silently shadowed — that is what froze the grid's TTL
+  prune until PR #137. Keep cross-file names distinct;
+  `test/dom-grid-sidebar-prune-collision.test.js` pins the pair.
 
 ## Not resurrecting finished subagents
 
