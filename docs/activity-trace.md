@@ -257,6 +257,39 @@ buffers, so a slow disk delays the trace instead of blocking the main thread —
 the trade is that the last few lines may be lost on a hard crash. A clean quit
 flushes and closes (`app.quit` is the last line).
 
+## Testing the async prune path
+
+`rotate()` runs `openSegment()` synchronously but hands the retired stream's
+cleanup (`pruneSegments`) to its `end()` callback, because Windows refuses to
+unlink a handle that is still open — the callback only fires once the OS has
+actually closed the file. Under `node --test`'s default concurrency (one
+process per test file, dozens running at once), that callback can take far
+longer than it does in isolation: CPU and disk contention from the sibling
+processes delays the event loop turn it needs.
+
+Two tests in `test/activity-trace.test.js` used to bridge that async gap with
+a fixed `setTimeout(60)`. That is a duration bet, not a correctness check, and
+it hides a real ordering hazard rather than just being slow: `close()` sets
+`stream = null` synchronously. If a `pruneSegments` callback from an earlier
+rotation is still queued when `close()` runs, it later calls `trace()` to
+record the `trace.prune-failed` warning, finds `stream` already null, and
+`trace()`'s own `if (!stream && !write) return;` guard drops the line with no
+error — a silent no-op, not a crash. On a quiet machine 60 ms is enough for
+the callback to run before `close()` is reached; under the full suite's
+parallel load it sometimes is not, and the warning that the test asserts on
+never gets written. This is a test-ordering bug, not a production one: at
+real quit time losing one diagnostic warning about pruning (never the trace
+data itself) is an acceptable trade, not a defect worth guarding against.
+
+All three of these tests now poll the actual condition (`waitUntil`, capped at
+10 s) instead of sleeping a fixed duration — bounded by an outcome, not a
+clock — and, in the prune-failure test, wait for the warning to land on disk
+*before* calling `close()`, so the shutdown never races the pending callback.
+The segment-count test above them flaked the same way once under full-suite
+load even with a 1 s poll budget, purely from Windows filesystem-metadata
+contention across dozens of concurrent `node --test` processes — not a logic
+bug, just headroom that needed to be more generous.
+
 ## Related
 
 - [Notifications](notifications.md) — what each indicator means to a user
