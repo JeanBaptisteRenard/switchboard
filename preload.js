@@ -51,7 +51,8 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('session-detected', (_event, tempId, realId) => callback(tempId, realId));
   },
   onProcessExited: (callback) => {
-    ipcRenderer.on('process-exited', (_event, sessionId, exitCode) => callback(sessionId, exitCode));
+    ipcRenderer.on('process-exited', (_event, sessionId, exitCode, signal, userStopped) =>
+      callback(sessionId, exitCode, signal, userStopped));
   },
   onTerminalNotification: (callback) => {
     ipcRenderer.on('terminal-notification', (_event, sessionId, message) => callback(sessionId, message));

@@ -347,6 +347,20 @@ function createTerminalEntry(session) {
   return entry;
 }
 
+// Did the user end this session, or did it die on its own? An exit the user
+// asked for tears the session down; anything else keeps the terminal mounted
+// behind an exit banner so the error output stays readable.
+//
+// `userStopped` covers the UI stop button (main marks the kill as requested).
+// A clean code-0 exit with no signal covers `/exit` and ctrl-D. Everything
+// else — a non-zero code, or a signal we didn't send (SIGSEGV, an OOM kill) —
+// is a death. The exit code alone can't decide this: node-pty reports a
+// signal kill as code 0, so the stop button would look exactly like a crash.
+function wasIntentionalExit({ exitCode, signal, userStopped }) {
+  if (userStopped) return true;
+  return exitCode === 0 && !signal;
+}
+
 // Clean up a closed session entry (dispose terminal, remove DOM, remove from maps).
 function destroySession(sessionId) {
   const entry = openSessions.get(sessionId);
@@ -433,5 +447,5 @@ function setupDragAndDrop(container, getSessionId) {
 // Expose pure key-handling predicates to Node for unit testing. No-op in the
 // browser, where this file is loaded as a plain <script> and `module` is undefined.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { isImeComposing, shouldSendSpaceDirectly, decodeOsc52Payload };
+  module.exports = { isImeComposing, shouldSendSpaceDirectly, decodeOsc52Payload, wasIntentionalExit };
 }

@@ -267,35 +267,52 @@ window.api.onSessionForked((oldId, newId) => {
   pollActiveSessions();
 });
 
-window.api.onProcessExited((sessionId, exitCode) => {
+window.api.onProcessExited((sessionId, exitCode, signal, userStopped) => {
   const entry = openSessions.get(sessionId);
   const session = sessionMap.get(sessionId);
-  if (entry) {
-    entry.closed = true;
-    // Write a visible exit banner so the user can see when the process ended
-    // and read any error output it printed (claude / devbox / shell stderr).
-    // Without this, a fast-failing pre-launch command would tear down the
-    // terminal before the user could read the error.
-    try {
-      const colour = exitCode === 0 ? '\x1b[2m' : '\x1b[33m';
-      entry.terminal.write(
-        `\r\n${colour}── session exited (code ${exitCode}) ──\x1b[0m\r\n`
-      );
-    } catch {}
-  }
+  if (entry) entry.closed = true;
 
-  // Plain terminal sessions are ephemeral — destroy immediately and remove from
-  // the sidebar. Claude sessions stay mounted (see below) so the user can read
-  // the exit reason.
-  if (session?.type === 'terminal') {
-    if (entry) destroySession(sessionId);
+  const intentional = wasIntentionalExit({ exitCode, signal, userStopped });
+
+  // A Claude session that died stays mounted behind an exit banner so the user
+  // can read the error it printed (claude / devbox / shell stderr) — without
+  // this, a fast-failing pre-launch command tears the terminal down before the
+  // error is readable. Cleanup is deferred to openSession, which destroys the
+  // closed entry when the user re-clicks the session. The sidebar row stays
+  // put too, so there's somewhere to relaunch from.
+  if (session?.type !== 'terminal' && !intentional) {
+    if (entry) {
+      try {
+        const reason = signal ? `signal ${signal}` : `code ${exitCode}`;
+        entry.terminal.write(`\r\n\x1b[33m── session exited (${reason}) ──\x1b[0m\r\n`);
+      } catch {}
+    }
+    // A pending session that died never wrote a .jsonl, so loadProjects keeps
+    // re-injecting it. Mark it dead so it stops sorting as a running session.
+    const pending = pendingSessions.get(sessionId);
+    if (pending) pending.exited = true;
     if (gridViewActive) {
       gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
-    } else if (activeSessionId === sessionId) {
-      setActiveSession(null);
-      terminalHeader.style.display = 'none';
-      placeholder.style.display = '';
     }
+    pollActiveSessions();
+    return;
+  }
+
+  // Everything else — plain terminals (always ephemeral) and Claude sessions
+  // the user ended themselves — goes away.
+  if (entry) destroySession(sessionId);
+  if (gridViewActive) {
+    gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
+  } else if (activeSessionId === sessionId) {
+    setActiveSession(null);
+    terminalHeader.style.display = 'none';
+    placeholder.style.display = '';
+  }
+
+  // Drop the sidebar row for sessions with nothing to reopen: plain terminals,
+  // and Claude sessions still pending (no .jsonl was ever written). A session
+  // that produced real data keeps its row and reloads from the DB.
+  if (session?.type === 'terminal' || pendingSessions.has(sessionId)) {
     pendingSessions.delete(sessionId);
     for (const projList of [cachedProjects, cachedAllProjects]) {
       for (const proj of projList) {
@@ -304,20 +321,10 @@ window.api.onProcessExited((sessionId, exitCode) => {
     }
     sessionMap.delete(sessionId);
     refreshSidebar();
-    pollActiveSessions();
-    return;
-  }
-
-  // Claude sessions: keep the terminal mounted with the exit banner visible so
-  // the user can read what happened. Cleanup is deferred — openSession destroys
-  // the closed entry when the user re-clicks the session (existing behavior).
-  // If the session was pending (no .jsonl was written), leave the sidebar
-  // entry in place too so the user has somewhere to relaunch from; it'll be
-  // tidied up by the regular pending-reconciliation pass once it's clear no
-  // real session file is coming.
-
-  if (gridViewActive) {
-    gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
+    // The pending marker can outlive the .jsonl by a beat (reconciliation only
+    // runs in loadProjects), so re-sync: a session that did write real data
+    // gets its row back from the DB rather than vanishing until the next watch.
+    if (session?.type !== 'terminal') loadProjects();
   }
 
   pollActiveSessions();
@@ -826,6 +833,10 @@ async function openSession(session, customOptions) {
     return;
   }
   if (typeof setSessionMcpActive === 'function') setSessionMcpActive(sessionId, !!result.mcpActive);
+
+  // Relaunching a session that had died clears the dead marker on its pending entry
+  const pending = pendingSessions.get(sessionId);
+  if (pending) pending.exited = false;
 
   showSession(sessionId);
   pollActiveSessions();

@@ -10,6 +10,15 @@
 // showJsonlViewer, forkSession, openSession, loadProjects, markUnread,
 // clearUnread, refreshSidebar (app.js/dialogs.js)
 
+// A session counts as running while its PTY is alive, or while it's pending —
+// a just-launched session has no PTY in activePtyIds until the next poll. A
+// pending session whose process died is marked exited and no longer counts.
+function isSessionRunning(sessionId) {
+  if (activePtyIds.has(sessionId)) return true;
+  const pending = pendingSessions.get(sessionId);
+  return !!pending && !pending.exited;
+}
+
 function slugId(slug) {
   return 'slug-' + slug.replace(/[^a-zA-Z0-9_-]/g, '_');
 }
@@ -164,8 +173,8 @@ function renderProjects(projects, resort) {
 
     // Sort
     filtered = [...filtered].sort((a, b) => {
-      const aRunning = activePtyIds.has(a.sessionId) || pendingSessions.has(a.sessionId);
-      const bRunning = activePtyIds.has(b.sessionId) || pendingSessions.has(b.sessionId);
+      const aRunning = isSessionRunning(a.sessionId);
+      const bRunning = isSessionRunning(b.sessionId);
       const aPri = (a.starred && aRunning ? 3 : aRunning ? 2 : a.starred ? 1 : 0);
       const bPri = (b.starred && bRunning ? 3 : bRunning ? 2 : b.starred ? 1 : 0);
       if (aPri !== bPri) return bPri - aPri;
@@ -185,12 +194,12 @@ function renderProjects(projects, resort) {
     }
     const allItems = [];
     for (const session of ungrouped) {
-      const isRunning = activePtyIds.has(session.sessionId) || pendingSessions.has(session.sessionId);
+      const isRunning = isSessionRunning(session.sessionId);
       allItems.push({ sortTime: new Date(session.modified).getTime(), pinned: !!session.starred, running: isRunning, element: buildSessionItem(session) });
     }
     for (const [slug, sessions] of slugMap) {
       const mostRecentTime = Math.max(...sessions.map(s => new Date(s.modified).getTime()));
-      const hasRunning = sessions.some(s => activePtyIds.has(s.sessionId) || pendingSessions.has(s.sessionId));
+      const hasRunning = sessions.some(s => isSessionRunning(s.sessionId));
       const hasPinned = sessions.some(s => s.starred);
       const element = sessions.length === 1 ? buildSessionItem(sessions[0]) : buildSlugGroup(slug, sessions);
       allItems.push({ sortTime: mostRecentTime, pinned: hasPinned, running: hasRunning, element });
