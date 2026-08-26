@@ -19,6 +19,12 @@ const id = 'claude';
 const label = 'Claude';
 const binary = 'claude';
 
+// Claude owns the unprefixed folder namespace: a key is the encoded project
+// path exactly as it sits in ~/.claude/projects. Harnesses added later carry a
+// prefix so their keys can never be mistaken for one of these — encodeProjectPath
+// emits [a-zA-Z0-9-] only, so any key containing a '/' is unambiguously theirs.
+const folderPrefix = null;
+
 // --- Layout ---
 
 function sessionsRoot() {
@@ -191,7 +197,7 @@ function readSessionFile(filePath, folder, projectPath) {
     if (!summary || messageCount < 1) return null;
     return {
       sessionId, folder, projectPath,
-      harness: id,
+      runtime: id,
       sessionFile: filePath,
       summary, firstPrompt: summary,
       // created/modified are display+sort values from message timestamps;
@@ -260,7 +266,7 @@ function buildLaunchArgs({ sessionId, isNew, options }) {
 }
 
 module.exports = {
-  id, label, binary,
+  id, label, binary, folderPrefix,
   available, sessionsRoot, listFolders, folderPath, folderForProject,
   listTranscripts, transcriptPath,
   deriveProjectPath, resolveWorktreePath,

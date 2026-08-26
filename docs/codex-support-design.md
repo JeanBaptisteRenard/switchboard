@@ -124,7 +124,7 @@ Each adapter exports:
 
 `readSessionFile` must keep returning the exact object
 `upsertCachedSessions` already writes, so `session-cache.js` needs no shape
-changes — only `readSessionFile(...)` → `getHarness(session.harness).readSessionFile(...)`.
+changes — only `readSessionFile(...)` → `getHarness(row.runtime).readSessionFile(...)`.
 
 ### Folder keys
 
@@ -156,29 +156,35 @@ day) — store `NULL`. It is only read by the empty-project backfill in
 
 ## 4. Data model and migration
 
-### Why `harness`, not `agent`
+### Naming: `harnesses/` in code, `runtime` in the schema
 
-`agent` is already taken in this schema. The `feat/subagent-support` branch adds
-`parentSessionId`, `agentId`, `subagentType` to `session_cache`, where **`agentId`
-means a Claude subagent**. A column named `agent` meaning "which CLI" sitting next
-to `agentId` meaning "which subagent" would be actively misleading. `harness` is
-also the accurate word: what varies is the CLI program wrapping the model, not the
-model and not the agent it runs.
+The module namespace is `harnesses/`, not `agents/`, because **`agent` is already
+taken**: `feat/subagent-support` adds `parentSessionId`, `agentId`, `subagentType`
+to `session_cache`, where `agentId` means a Claude *subagent*. "Harness" is also
+the accurate word — what varies is the CLI program wrapping the model.
 
-(`runtime` / `sessionFile` appear in `test/db-schema-reconcile.test.js`, but those
-are a synthetic fixture simulating a foreign schema — no branch actually defines
-them, so there is no name to match. `sessionFile` is kept below because it pairs
-with the existing `fileMtime` column.)
+The column is `runtime`, not `harness`, for a different reason: **it already
+exists.** A build from a parallel branch left `runtime TEXT DEFAULT 'claude'` and
+`sessionFile TEXT` in real databases (confirmed against a live db_version-5 DB:
+859 rows, `runtime = 'claude'` throughout, `sessionFile` null throughout). Those
+are exactly the two columns this design needs, with exactly the right semantics,
+so they are adopted rather than shadowed by a second pair that would drift.
+
+The names differ between layer and schema, which is a small price for not
+carrying two columns that mean the same thing.
 
 Two columns on `session_cache`:
 
 ```sql
-ALTER TABLE session_cache ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude';
+ALTER TABLE session_cache ADD COLUMN runtime TEXT DEFAULT 'claude';
 ALTER TABLE session_cache ADD COLUMN sessionFile TEXT;
 ```
 
-- `harness` — which CLI owns this session. Defaulting to `'claude'` means every
-  existing row is correct with no backfill.
+- `runtime` — which CLI owns this session. The default means every existing row
+  is correct with no backfill. `NOT NULL` is deliberately omitted: the parallel
+  branch's column is nullable, and requiring it would force a table rebuild on
+  DBs that already have data. Reads go through `getHarness()`, which treats null
+  as Claude.
 - `sessionFile` — absolute transcript path. Needed because a Codex filename is
   `rollout-<ts>-<id>.jsonl`, not `<id>.jsonl`. `NULL` on old rows, and
   `transcriptPath()` falls back to `PROJECTS_DIR/folder/sessionId.jsonl`.
@@ -241,21 +247,21 @@ and only overrides defined values.
 ## 6. UI
 
 **Sidebar icon.** `buildSessionItem` already prepends a `.terminal-badge` for
-`type === 'terminal'`. Same slot, driven by `session.harness`: Claude glyph,
+`type === 'terminal'`. Same slot, driven by `session.runtime`: Claude glyph,
 Codex glyph, or the terminal glyph. Add `is-codex` next to `is-terminal`.
 
 **New-session popover.** `showNewSessionPopover` currently hardcodes three
 buttons. Generate the harness rows from `availableHarnesses()`, each with a plain
 and a "Configure…" variant, then the Terminal row.
 
-**Resume.** No UI change. `openSession` reads `session.harness` from the row and
+**Resume.** No UI change. `openSession` reads `session.runtime` from the row and
 main dispatches on it.
 
 ---
 
 ## 7. What stays Claude-only
 
-Gate these on `harness === 'claude'` rather than trying to generalise now:
+Gate these on `runtime === 'claude'` rather than trying to generalise now:
 
 - **MCP / IDE emulation** — `--ide`, `CLAUDE_CODE_SSE_PORT`, `mcp-bridge.js`.
   Codex has its own MCP model; skip it entirely for Codex sessions.
@@ -302,7 +308,7 @@ Each step leaves the app working.
   and the cwd/mtime fallback when originator is absent.
 - A migration test in the style of `test/db-schema-reconcile.test.js`: open a
   pre-upgrade DB, run reconciliation, assert existing rows read back with
-  `harness = 'claude'` and that nothing was deleted.
+  `runtime = 'claude'` and that nothing was deleted.
 
 ---
 

@@ -3,12 +3,26 @@ const fs = require('fs');
 const { Worker } = require('worker_threads');
 const { getFolderIndexMtimeMs } = require('./folder-index-state');
 const { encodeProjectPath } = require('./encode-project-path');
-const { getHarness, DEFAULT_HARNESS } = require('./harnesses');
+const { getHarness, DEFAULT_HARNESS, harnessForFolder } = require('./harnesses');
 
 // Only Claude sessions are indexed today; the harness lookup is here so the
 // call sites already read the right way when codex folders join them.
 const claude = getHarness(DEFAULT_HARNESS);
 const { deriveProjectPath, readSessionFile } = claude;
+
+/**
+ * Folder key → the directory holding its transcripts.
+ *
+ * Claude's root is the injected PROJECTS_DIR, not claude.sessionsRoot(): init()
+ * is handed that path so tests and the dev data-dir override can repoint it, and
+ * resolving through the harness default would quietly ignore them. Prefixed keys
+ * belong to a harness with a fixed root of its own, so those do go through it.
+ */
+function resolveFolderPath(folder) {
+  const h = harnessForFolder(folder);
+  if (!h.folderPrefix) return path.join(PROJECTS_DIR, folder);
+  return h.folderPath(String(folder).slice(h.folderPrefix.length));
+}
 
 /**
  * Session cache module.
@@ -43,7 +57,7 @@ function init(ctx) {
 
 /** Read one folder from filesystem by scanning .jsonl files directly */
 function readFolderFromFilesystem(folder) {
-  const folderPath = path.join(PROJECTS_DIR, folder);
+  const folderPath = resolveFolderPath(folder);
   const projectPath = deriveProjectPath(folderPath, folder);
   if (!projectPath) return { projectPath: null, sessions: [] };
   const sessions = [];
@@ -61,7 +75,7 @@ function readFolderFromFilesystem(folder) {
 
 /** Refresh a single folder incrementally: only re-read changed/new .jsonl files */
 function refreshFolder(folder) {
-  const folderPath = path.join(PROJECTS_DIR, folder);
+  const folderPath = resolveFolderPath(folder);
   if (!fs.existsSync(folderPath)) {
     deleteCachedFolder(folder);
     return;
@@ -174,7 +188,7 @@ function reconcileCacheFromFilesystem() {
 
     for (const folder of folders) {
       const meta = metaMap.get(folder);
-      const folderPath = path.join(PROJECTS_DIR, folder);
+      const folderPath = resolveFolderPath(folder);
       if (!meta || getFolderIndexMtimeMs(folderPath) > (meta.indexMtimeMs || 0)) {
         refreshFolder(folder);
       }
@@ -213,6 +227,7 @@ function buildProjectsFromCache(showArchived) {
       projectPath: row.projectPath,
       slug: row.slug || null,
       aiTitle: row.aiTitle || null,
+      runtime: row.runtime || DEFAULT_HARNESS,
       name: meta?.name || null,
       starred: meta?.starred || 0,
       archived: meta?.archived || 0,

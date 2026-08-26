@@ -11,9 +11,10 @@
 //
 // Every harness module exports:
 //
-//   id              string, matches session_cache.harness
+//   id              string, matches session_cache.runtime
 //   label           display name
 //   binary          the executable name
+//   folderPrefix    namespace for its folder keys, or null for the default one
 //   available()     is this harness usable on this machine
 //   sessionsRoot()  directory holding all its transcripts
 //   listFolders()   folder keys under that root
@@ -45,4 +46,28 @@ function availableHarnesses() {
   return allHarnesses().filter(h => h.available());
 }
 
-module.exports = { HARNESSES, DEFAULT_HARNESS, getHarness, allHarnesses, availableHarnesses };
+/**
+ * Which harness a session_cache.folder key belongs to.
+ *
+ * Keys are namespaced by prefix so one column can address every harness's
+ * layout. Claude's keys are unprefixed (encoded project paths), so it is the
+ * fallback — which also makes rows written before this existed resolve
+ * correctly without a backfill.
+ */
+function harnessForFolder(folder) {
+  for (const h of allHarnesses()) {
+    if (h.folderPrefix && String(folder).startsWith(h.folderPrefix)) return h;
+  }
+  return getHarness(DEFAULT_HARNESS);
+}
+
+/** Absolute transcript path for a cached session row. */
+function transcriptPath(row) {
+  return getHarness(row.runtime).transcriptPath(row);
+}
+
+module.exports = {
+  HARNESSES, DEFAULT_HARNESS,
+  getHarness, allHarnesses, availableHarnesses,
+  harnessForFolder, transcriptPath,
+};

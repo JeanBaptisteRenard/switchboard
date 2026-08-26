@@ -63,7 +63,7 @@ if (app.isPackaged || process.env.FORCE_UPDATER) {
 }
 const {
   getMeta, getAllMeta, toggleStar, setName, setArchived,
-  isCachePopulated, getAllCached, getCachedByFolder, getCachedFolder, getCachedSession, upsertCachedSessions,
+  isCachePopulated, getAllCached, getCachedByFolder, getCachedSession, upsertCachedSessions,
   deleteCachedSession, deleteCachedFolder,
   getFolderMeta, getAllFolderMeta, setFolderMeta,
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
@@ -72,7 +72,7 @@ const {
   closeDb,
 } = require('./db');
 
-const { getHarness, DEFAULT_HARNESS } = require('./harnesses');
+const { getHarness, DEFAULT_HARNESS, transcriptPath } = require('./harnesses');
 const claudeHarness = getHarness(DEFAULT_HARNESS);
 const PROJECTS_DIR = claudeHarness.sessionsRoot();
 const PLANS_DIR = path.join(os.homedir(), '.claude', 'plans');
@@ -909,9 +909,11 @@ ipcMain.handle('rename-session', (_event, sessionId, name) => {
 
 // --- IPC: archive-session ---
 ipcMain.handle('read-session-jsonl', (_event, sessionId) => {
-  const folder = getCachedFolder(sessionId);
-  if (!folder) return { error: 'Session not found in cache' };
-  const jsonlPath = path.join(PROJECTS_DIR, folder, sessionId + '.jsonl');
+  const row = getCachedSession(sessionId);
+  if (!row) return { error: 'Session not found in cache' };
+  // The harness owns its transcript naming — Claude uses <sessionId>.jsonl,
+  // others do not — so resolve through it rather than rebuilding the path here.
+  const jsonlPath = transcriptPath(row);
   try {
     const content = fs.readFileSync(jsonlPath, 'utf-8');
     const entries = [];

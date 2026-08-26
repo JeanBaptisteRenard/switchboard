@@ -106,3 +106,29 @@ test('every registered harness implements the full shape', () => {
     }
   }
 });
+
+// --- folder namespacing ---
+//
+// One `folder` column addresses every harness's on-disk layout, and that only
+// works because Claude's keys can never look like a prefixed one. This pins the
+// invariant the whole scheme rests on; a change to encodeProjectPath that let a
+// '/' through would silently route real Claude folders at another harness.
+test('encodeProjectPath never emits a character that could look like a prefix', () => {
+  const { encodeProjectPath } = require('../encode-project-path');
+  const paths = [
+    '/Users/me/proj',
+    '/Users/me/proj/.claude/worktrees/wt',
+    '/Users/me/a b/c.d_e',
+    '/Users/me/' + 'x'.repeat(400),   // the >200 char hash branch
+    'C:\\Users\\me\\proj',
+  ];
+  for (const p of paths) {
+    assert.match(encodeProjectPath(p), /^[a-zA-Z0-9-]+$/, p);
+  }
+});
+
+test('an unprefixed folder key resolves to Claude', () => {
+  const { harnessForFolder } = require('../harnesses');
+  assert.equal(harnessForFolder('-Users-me-proj').id, 'claude');
+  assert.equal(harnessForFolder('').id, 'claude');
+});

@@ -84,9 +84,93 @@ test('foreign higher-version database is reconciled, not crashed', () => {
     assert.equal(state.cacheCount, 0, 'stale cache cleared for re-index');
     assert.equal(state.metaCount, 0, 'folder index gate cleared for re-index');
     assert.equal(state.version, '5', 'foreign db_version not downgraded');
-    for (const col of ['parentSessionId', 'agentId', 'runtime', 'sessionFile']) {
+    for (const col of ['parentSessionId', 'agentId', 'subagentType']) {
       assert.ok(state.cols.includes(col), `foreign column ${col} preserved`);
     }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Adding the harness/sessionFile columns must not cost an existing user their
+// index. Unlike fileMtime — which changed what `modified` meant and therefore
+// had to wipe the cache — these are purely additive: every pre-existing row is
+// a Claude session, which is what the NOT NULL DEFAULT says.
+test('runtime/sessionFile are added without dropping cached rows', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-db-harness-'));
+  try {
+    // A realistic pre-upgrade DB: current schema through fileMtime, no harness.
+    const seed = runInElectronNode(`
+      const Database = require('better-sqlite3');
+      const db = new Database(require('path').join(process.env.SWITCHBOARD_DATA_DIR, 'switchboard.db'));
+      db.exec(\`CREATE TABLE session_cache (
+        sessionId TEXT PRIMARY KEY, folder TEXT NOT NULL, projectPath TEXT,
+        summary TEXT, firstPrompt TEXT, created TEXT, modified TEXT,
+        messageCount INTEGER DEFAULT 0, slug TEXT, aiTitle TEXT, fileMtime TEXT
+      )\`);
+      db.exec('CREATE TABLE cache_meta (folder TEXT PRIMARY KEY, projectPath TEXT, indexMtimeMs REAL)');
+      db.exec('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)');
+      db.prepare("INSERT INTO settings (key, value) VALUES ('db_version', '4')").run();
+      db.prepare(\`INSERT INTO session_cache (sessionId, folder, projectPath, summary, modified, fileMtime)
+        VALUES ('old-1', '-Users-me-proj', '/Users/me/proj', 'hello', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')\`).run();
+      db.prepare("INSERT INTO cache_meta (folder, indexMtimeMs) VALUES ('-Users-me-proj', 123)").run();
+    `, dir);
+    assert.equal(seed.status, 0, seed.stderr);
+
+    const r = loadDbModule(dir);
+    assert.equal(r.status, 0, r.stderr);
+
+    const row = JSON.parse(runInElectronNode(`
+      const Database = require('better-sqlite3');
+      const db = new Database(require('path').join(process.env.SWITCHBOARD_DATA_DIR, 'switchboard.db'));
+      console.log(JSON.stringify({
+        row: db.prepare("SELECT * FROM session_cache WHERE sessionId = 'old-1'").get(),
+        cacheCount: db.prepare('SELECT COUNT(*) c FROM session_cache').get().c,
+        metaCount: db.prepare('SELECT COUNT(*) c FROM cache_meta').get().c,
+      }));
+    `, dir).stdout.trim().split('\n').pop());
+
+    assert.equal(row.cacheCount, 1, 'no re-index forced');
+    assert.equal(row.metaCount, 1, 'folder index gate kept');
+    assert.equal(row.row.runtime, 'claude', 'existing rows backfill to claude');
+    assert.equal(row.row.sessionFile, null, 'sessionFile left null, path is reconstructed');
+    assert.equal(row.row.summary, 'hello', 'row content untouched');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A DB that already carries runtime/sessionFile from a parallel branch must be
+// adopted as-is, not shadowed by a second pair of columns meaning the same
+// thing. This is the shape of the author's real database.
+test('a pre-existing runtime column is adopted, not duplicated', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-db-adopt-'));
+  try {
+    const seed = runInElectronNode(`
+      const Database = require('better-sqlite3');
+      const db = new Database(require('path').join(process.env.SWITCHBOARD_DATA_DIR, 'switchboard.db'));
+      db.exec(\`CREATE TABLE session_cache (
+        sessionId TEXT PRIMARY KEY, folder TEXT NOT NULL, projectPath TEXT,
+        summary TEXT, firstPrompt TEXT, created TEXT, modified TEXT,
+        messageCount INTEGER DEFAULT 0, slug TEXT, aiTitle TEXT,
+        parentSessionId TEXT, agentId TEXT, subagentType TEXT, description TEXT,
+        runtime TEXT DEFAULT 'claude', sessionFile TEXT, fileMtime TEXT
+      )\`);
+      db.exec('CREATE TABLE cache_meta (folder TEXT PRIMARY KEY, projectPath TEXT, indexMtimeMs REAL)');
+      db.exec('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)');
+      db.prepare("INSERT INTO settings (key, value) VALUES ('db_version', '5')").run();
+      db.prepare(\`INSERT INTO session_cache (sessionId, folder, summary, modified, fileMtime, runtime)
+        VALUES ('old-1', '-Users-me-proj', 'hello', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'claude')\`).run();
+    `, dir);
+    assert.equal(seed.status, 0, seed.stderr);
+
+    const r = loadDbModule(dir);
+    assert.equal(r.status, 0, r.stderr);
+
+    const state = inspectDb(dir);
+    assert.ok(!state.cols.includes('harness'), 'no duplicate column added alongside runtime');
+    assert.equal(state.cols.filter(c => c === 'runtime').length, 1, 'runtime not re-added');
+    assert.equal(state.cacheCount, 1, 'rows kept');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
