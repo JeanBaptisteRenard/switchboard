@@ -57,6 +57,7 @@
     "productName": "Switchboard",
     "files": [
       "*.js",
+      "harnesses/**/*",
       "workers/**/*",
       "public/**/*",
       "node_modules/**/*"

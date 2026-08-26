@@ -2,9 +2,13 @@ const path = require('path');
 const fs = require('fs');
 const { Worker } = require('worker_threads');
 const { getFolderIndexMtimeMs } = require('./folder-index-state');
-const { deriveProjectPath } = require('./derive-project-path');
-const { readSessionFile } = require('./read-session-file');
 const { encodeProjectPath } = require('./encode-project-path');
+const { getHarness, DEFAULT_HARNESS } = require('./harnesses');
+
+// Only Claude sessions are indexed today; the harness lookup is here so the
+// call sites already read the right way when codex folders join them.
+const claude = getHarness(DEFAULT_HARNESS);
+const { deriveProjectPath, readSessionFile } = claude;
 
 /**
  * Session cache module.
@@ -36,8 +40,6 @@ function init(ctx) {
   getMeta = ctx.db.getMeta;
   setName = ctx.db.setName;
 }
-
-// readSessionFile is imported from read-session-file.js (shared with worker)
 
 /** Read one folder from filesystem by scanning .jsonl files directly */
 function readFolderFromFilesystem(folder) {

@@ -72,7 +72,9 @@ const {
   closeDb,
 } = require('./db');
 
-const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
+const { getHarness, DEFAULT_HARNESS } = require('./harnesses');
+const claudeHarness = getHarness(DEFAULT_HARNESS);
+const PROJECTS_DIR = claudeHarness.sessionsRoot();
 const PLANS_DIR = path.join(os.homedir(), '.claude', 'plans');
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const STATS_CACHE_PATH = path.join(CLAUDE_DIR, 'stats-cache.json');
@@ -252,7 +254,7 @@ function buildMenu() {
 
 // --- Session cache helpers ---
 
-const { deriveProjectPath } = require('./derive-project-path');
+const { deriveProjectPath } = claudeHarness;
 
 // Session cache → session-cache.js
 const sessionCache = require('./session-cache');
@@ -1052,50 +1054,13 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         }
       }, 300);
     } else {
-      // Build claude command, using array to prevent accidental shell injection
-      const claudeArgs = [];
-      if (sessionOptions?.forkFrom) {
-        claudeArgs.push('--resume', String(sessionOptions.forkFrom), '--fork-session');
-      } else if (isNew) {
-        claudeArgs.push('--session-id', String(sessionId));
-      } else {
-        claudeArgs.push('--resume', String(sessionId));
-      }
+      // Argv is built by the harness and quoted here, so a value can never be
+      // spliced into the command line as shell syntax.
+      const claudeArgs = claudeHarness.buildLaunchArgs({
+        sessionId, isNew, options: sessionOptions,
+      });
 
-      if (sessionOptions) {
-        if (sessionOptions.dangerouslySkipPermissions) {
-          claudeArgs.push('--dangerously-skip-permissions');
-        } else if (sessionOptions.permissionMode) {
-          claudeArgs.push('--permission-mode', String(sessionOptions.permissionMode));
-        }
-        // --worktree only applies when STARTING a session — it creates a fresh
-        // isolated git worktree. Resuming (isNew === false) must reuse the
-        // session's existing directory, so ignore the worktree option on resume
-        // regardless of which call site supplied it (sidebar click, schedule
-        // creator, fork, …). Otherwise a resume tries to spin up a new worktree
-        // and fails to attach.
-        if (isNew && sessionOptions.worktree) {
-          claudeArgs.push('--worktree');
-          if (sessionOptions.worktreeName) {
-            claudeArgs.push(String(sessionOptions.worktreeName));
-          }
-        }
-        if (sessionOptions.chrome) {
-          claudeArgs.push('--chrome');
-        }
-        if (sessionOptions.addDirs) {
-          const dirs = String(sessionOptions.addDirs).split(',').map(d => d.trim()).filter(Boolean);
-          for (const dir of dirs) {
-            claudeArgs.push('--add-dir', dir);
-          }
-        }
-      }
-
-      if (sessionOptions?.appendSystemPrompt) {
-        claudeArgs.push('--append-system-prompt', String(sessionOptions.appendSystemPrompt));
-      }
-
-      let claudeCmd = 'claude ' + quoteArgvForShell(shell, claudeArgs);
+      let claudeCmd = claudeHarness.binary + ' ' + quoteArgvForShell(shell, claudeArgs);
 
       // preLaunchCmd is raw shell by design (e.g. "aws-vault exec profile --") — block newlines only
       if (sessionOptions?.preLaunchCmd) {
