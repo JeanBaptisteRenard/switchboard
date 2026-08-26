@@ -72,7 +72,7 @@ const {
   closeDb,
 } = require('./db');
 
-const { getHarness, DEFAULT_HARNESS, transcriptPath } = require('./harnesses');
+const { getHarness, DEFAULT_HARNESS, transcriptPath, availableHarnesses } = require('./harnesses');
 const claudeHarness = getHarness(DEFAULT_HARNESS);
 const PROJECTS_DIR = claudeHarness.sessionsRoot();
 const PLANS_DIR = path.join(os.homedir(), '.claude', 'plans');
@@ -269,8 +269,8 @@ sessionCache.init({
     setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName,
   },
 });
-const { readSessionFile, readFolderFromFilesystem, refreshFolder, reconcileCacheFromFilesystem,
-        buildProjectsFromCache, notifyRendererProjectsChanged, sendStatus, populateCacheViaWorker } = sessionCache;
+const { refreshFolder, reconcileCacheFromFilesystem, buildProjectsFromCache,
+        notifyRendererProjectsChanged, sendStatus, populateCacheViaWorker } = sessionCache;
 
 // --- IPC: browse-folder ---
 ipcMain.handle('browse-folder', async () => {
@@ -1358,6 +1358,52 @@ function startProjectsWatcher() {
   }
 }
 
+// --- fs.watch on each non-Claude harness's sessions directory ---
+//
+// Separate from startProjectsWatcher because the path shape is different: a
+// Claude event names <project-folder>/<file>, a codex event names
+// <YYYY>/<MM>/<DD>/<file>. Both end up calling refreshFolder with a folder key.
+const harnessWatchers = [];
+
+function startHarnessWatchers() {
+  for (const h of availableHarnesses()) {
+    if (!h.folderPrefix) continue; // Claude's root is startProjectsWatcher's job
+    const root = h.sessionsRoot();
+    if (!fs.existsSync(root)) continue;
+
+    const pendingFolders = new Set();
+    let debounceTimer = null;
+
+    function flush() {
+      debounceTimer = null;
+      const folders = new Set(pendingFolders);
+      pendingFolders.clear();
+      for (const folder of folders) {
+        try { refreshFolder(folder); } catch (err) { log.error('[harness-watch]', folder, err.message); }
+      }
+      if (folders.size) notifyRendererProjectsChanged();
+    }
+
+    try {
+      const watcher = fs.watch(root, { recursive: true }, (_eventType, filename) => {
+        if (!filename) return;
+        const parts = filename.split(path.sep);
+        // Transcripts sit at <YYYY>/<MM>/<DD>/<file>; anything shallower is a
+        // directory being created, which the next file event will cover.
+        if (parts.length < 4 || !parts[parts.length - 1].endsWith('.jsonl')) return;
+        pendingFolders.add(h.folderPrefix + parts.slice(0, 3).join('/'));
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(flush, 500);
+      });
+      watcher.on('error', (err) => log.error(`[harness-watch] ${h.id}:`, err.message));
+      harnessWatchers.push(watcher);
+      log.info(`[harness-watch] watching ${h.id} at ${root}`);
+    } catch (err) {
+      log.error(`[harness-watch] failed to watch ${h.id}:`, err.message);
+    }
+  }
+}
+
 // --- IPC: app version ---
 ipcMain.handle('get-app-version', () => app.getVersion());
 
@@ -1398,6 +1444,7 @@ if (!gotSingleInstanceLock) {
     buildMenu();
     createWindow();
     startProjectsWatcher();
+    startHarnessWatchers();
     scheduleIpc.ensureScheduleCreatorCommand();
 
     // Shared runCommand for cron scheduler and "run now" — takes argv, not a shell string

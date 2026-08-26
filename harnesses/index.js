@@ -15,18 +15,21 @@
 //   label           display name
 //   binary          the executable name
 //   folderPrefix    namespace for its folder keys, or null for the default one
+//   groupsByProject is one folder exactly one project (Claude) or many (Codex)
 //   available()     is this harness usable on this machine
 //   sessionsRoot()  directory holding all its transcripts
 //   listFolders()   folder keys under that root
 //   folderPath(f)   folder key → absolute directory
-//   listTranscripts(f)         absolute transcript paths in a folder
+//   listTranscripts(dir)       absolute transcript paths in a folder directory
+//   sessionIdFromPath(file)    transcript path → session id, without reading it
 //   transcriptPath(row)        cached row → absolute transcript path
 //   readSessionFile(file, folder, projectPath) → session row, or null
 //   buildLaunchArgs({ sessionId, isNew, options }) → argv after the binary
 
 const claude = require('./claude');
+const codex = require('./codex');
 
-const HARNESSES = { [claude.id]: claude };
+const HARNESSES = { [claude.id]: claude, [codex.id]: codex };
 
 const DEFAULT_HARNESS = claude.id;
 

@@ -96,13 +96,32 @@ test('transcriptPath prefers a stored sessionFile over reconstructing one', () =
   );
 });
 
-test('every registered harness implements the full shape', () => {
-  const required = ['id', 'label', 'binary', 'available', 'sessionsRoot', 'listFolders',
-    'folderPath', 'folderForProject', 'listTranscripts', 'transcriptPath',
-    'readSessionFile', 'buildLaunchArgs'];
+test('every registered harness implements the indexing contract', () => {
+  const required = ['id', 'label', 'binary', 'folderPrefix', 'groupsByProject',
+    'available', 'sessionsRoot', 'listFolders', 'folderPath', 'folderForProject',
+    'listTranscripts', 'sessionIdFromPath', 'transcriptPath',
+    'deriveProjectPath', 'readSessionFile'];
   for (const h of require('../harnesses').allHarnesses()) {
     for (const key of required) {
       assert.ok(h[key] !== undefined, `${h.id} is missing ${key}`);
+    }
+  }
+});
+
+// buildLaunchArgs is not in the list above on purpose: a harness can be indexed
+// (its history shows in the sidebar) before it can be launched. Codex joins this
+// assertion when resume lands.
+test('Claude implements the launch contract', () => {
+  assert.equal(typeof claude.buildLaunchArgs, 'function');
+});
+
+test('folder prefixes are unique and cannot shadow each other', () => {
+  const prefixes = require('../harnesses').allHarnesses()
+    .map(h => h.folderPrefix).filter(Boolean);
+  assert.equal(new Set(prefixes).size, prefixes.length, 'duplicate folderPrefix');
+  for (const a of prefixes) {
+    for (const b of prefixes) {
+      if (a !== b) assert.ok(!b.startsWith(a), `${b} is shadowed by ${a}`);
     }
   }
 });

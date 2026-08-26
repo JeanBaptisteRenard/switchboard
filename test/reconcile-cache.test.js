@@ -73,3 +73,79 @@ test('reconcileCacheFromFilesystem indexes new and stale folders but skips up-to
     fs.rmSync(projectsDir, { recursive: true, force: true });
   }
 });
+
+// --- codex folders ---
+
+const ROLLOUT = 'rollout-2026-08-26T11-55-02-01a03f6c-fdf9-7c83-86e3-c388f81d765c.jsonl';
+
+function writeRollout(dayDir, cwd) {
+  fs.mkdirSync(dayDir, { recursive: true });
+  const lines = [
+    { timestamp: '2026-08-26T10:00:00Z', type: 'session_meta', payload: { session_id: 'root', cwd } },
+    { timestamp: '2026-08-26T10:00:01Z', type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [{ type: 'text', text: 'hello' }] } },
+  ];
+  fs.writeFileSync(path.join(dayDir, ROLLOUT), lines.map(l => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+}
+
+// A codex date folder holds sessions from many projects, so it has no
+// folder-level project path. refreshFolder used to bail on exactly that
+// condition, which would have skipped every codex folder silently.
+test('reconcile indexes codex date folders even though they have no folder project', () => {
+  const projectsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-claude-'));
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-codex-'));
+  const prevHome = process.env.CODEX_HOME;
+  try {
+    process.env.CODEX_HOME = codexHome;
+    writeRollout(path.join(codexHome, 'sessions', '2026', '08', '26'), '/tmp/some-project');
+
+    const metaMap = new Map();
+    const fake = makeFakeDb(metaMap);
+    sessionCache.init({
+      PROJECTS_DIR: projectsDir, activeSessions: new Map(),
+      getMainWindow: () => null, log: console, db: fake.db,
+    });
+
+    sessionCache.reconcileCacheFromFilesystem();
+    assert.ok(fake.indexedFolders.has('codex/2026/08/26'), 'codex folder should be indexed');
+    // cache_meta records a null project for it — many projects share the folder.
+    assert.equal(metaMap.get('codex/2026/08/26').projectPath, null);
+
+    // Second pass: unchanged on disk, so the mtime gate must skip it. Without
+    // this the date folders would be fully re-read on every get-projects call.
+    const second = makeFakeDb(metaMap);
+    sessionCache.init({
+      PROJECTS_DIR: projectsDir, activeSessions: new Map(),
+      getMainWindow: () => null, log: console, db: second.db,
+    });
+    sessionCache.reconcileCacheFromFilesystem();
+    assert.equal(second.indexedFolders.size, 0, 'up-to-date codex folder should be skipped');
+  } finally {
+    if (prevHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prevHome;
+    fs.rmSync(projectsDir, { recursive: true, force: true });
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('a codex home that does not exist contributes nothing and does not throw', () => {
+  const projectsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-nocodex-'));
+  const prevHome = process.env.CODEX_HOME;
+  try {
+    process.env.CODEX_HOME = path.join(os.tmpdir(), 'switchboard-definitely-absent-' + process.pid);
+    writeSession(path.join(projectsDir, 'proj'), '/tmp/proj');
+
+    const metaMap = new Map();
+    const fake = makeFakeDb(metaMap);
+    sessionCache.init({
+      PROJECTS_DIR: projectsDir, activeSessions: new Map(),
+      getMainWindow: () => null, log: console, db: fake.db,
+    });
+
+    sessionCache.reconcileCacheFromFilesystem();
+    assert.ok(fake.indexedFolders.has('proj'), 'claude folders still indexed');
+    assert.equal([...fake.indexedFolders].filter(f => f.startsWith('codex/')).length, 0);
+  } finally {
+    if (prevHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prevHome;
+    fs.rmSync(projectsDir, { recursive: true, force: true });
+  }
+});

@@ -25,6 +25,10 @@ const binary = 'claude';
 // emits [a-zA-Z0-9-] only, so any key containing a '/' is unambiguously theirs.
 const folderPrefix = null;
 
+// A Claude folder IS a project: every transcript in it shares one cwd, so the
+// project is derived once per folder rather than per file.
+const groupsByProject = true;
+
 // --- Layout ---
 
 function sessionsRoot() {
@@ -55,10 +59,9 @@ function folderForProject(projectPath) {
   return encodeProjectPath(projectPath);
 }
 
-/** Transcript files inside a folder, as absolute paths. */
-function listTranscripts(folder) {
+/** Transcript files inside a folder directory, as absolute paths. */
+function listTranscripts(dir) {
   try {
-    const dir = folderPath(folder);
     return fs.readdirSync(dir)
       .filter(f => f.endsWith('.jsonl'))
       .map(f => path.join(dir, f));
@@ -72,6 +75,11 @@ function listTranscripts(folder) {
  * when present; rows written before that column existed reconstruct the path
  * from folder + sessionId, which is exactly how Claude names its files.
  */
+/** Claude names each transcript after its session id. */
+function sessionIdFromPath(filePath) {
+  return path.basename(filePath, '.jsonl');
+}
+
 function transcriptPath({ sessionId, folder, sessionFile }) {
   if (sessionFile) return sessionFile;
   return path.join(folderPath(folder), sessionId + '.jsonl');
@@ -91,17 +99,6 @@ function extractCwdFromJsonl(filePath) {
     }
   } catch {}
   return null;
-}
-
-function resolveWorktreePath(cwd) {
-  if (!cwd) return cwd;
-  // Detect worktree paths: <project>/.claude-worktrees/<name>, <project>/.worktrees/<name>, or <project>/.claude/worktrees/<name>
-  const worktreeMatch = cwd.match(/^(.+?)\/\.(?:claude\/worktrees|claude-worktrees|worktrees)\/[^/]+\/?$/);
-  if (worktreeMatch) {
-    const parent = worktreeMatch[1];
-    if (fs.existsSync(parent)) return parent;
-  }
-  return cwd;
 }
 
 /** The project a folder belongs to, read out of any transcript it contains. */
@@ -266,10 +263,10 @@ function buildLaunchArgs({ sessionId, isNew, options }) {
 }
 
 module.exports = {
-  id, label, binary, folderPrefix,
+  id, label, binary, folderPrefix, groupsByProject,
   available, sessionsRoot, listFolders, folderPath, folderForProject,
-  listTranscripts, transcriptPath,
-  deriveProjectPath, resolveWorktreePath,
+  listTranscripts, sessionIdFromPath, transcriptPath,
+  deriveProjectPath,
   readSessionFile,
   buildLaunchArgs,
 };

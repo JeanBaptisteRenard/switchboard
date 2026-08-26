@@ -15,6 +15,7 @@ installed locally, not read from docs.
 | Transcript location | `~/.claude/projects/<encoded-project>/<sessionId>.jsonl` | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ISO>-<sessionId>.jsonl` |
 | Grouping on disk | one dir per **project** | one dir per **date** (mixed projects) |
 | Project path source | `cwd` on any line | `session_meta.payload.cwd` on line 1 |
+| Session id | the file name | the file name's uuid suffix |
 | Pre-assign session id | `claude --session-id <uuid>` | **not possible** |
 | Resume | `claude --resume <id>` | `codex resume <id>` |
 | Fork | `claude --resume <id> --fork-session` | `codex fork <id>` |
@@ -33,16 +34,31 @@ Line 1 is always `session_meta`:
   "originator":"codex_cli_rs","cli_version":"0.149.1","source":"cli"}}
 ```
 
+**The session id is the file name's uuid, not `session_meta.session_id`.**
+That field is the *lineage root* and is repeated by every resume and fork of a
+conversation — on this machine six rollout files share one value, which would
+collide on `session_cache.sessionId`. The file name's uuid is unique per
+rollout, is what `codex resume <id>` accepts (verified), and is what codex's own
+`session_index.jsonl` keys on.
+
 Subsequent lines carry a `type` and a `payload.type`:
 
-- `event_msg` / `user_message` → user text (first one is the summary)
-- `event_msg` / `agent_message` → assistant text
+- `response_item` / `message` with a `role` → **the authoritative text**
+- `event_msg` / `user_message`, `agent_message` → a duplicate copy of the same
+  turns, emitted by some versions only
 - `event_msg` / `token_count`, `task_started`, `task_complete` → bookkeeping
 - `response_item` / `message`, `reasoning`, `custom_tool_call`, `custom_tool_call_output`
 - `turn_context`, `world_state` → per-turn config
 
-Message count = user_message + agent_message. Timestamps are ISO-8601 UTC, so
-the same first/last scan `read-session-file.js` already does works unchanged.
+Count **only** `response_item` messages: it is present in all 53 rollouts on
+this machine while `event_msg` is missing from 6, and counting both would double
+every turn. Skip `role: 'developer'` (CLI scaffolding) and skip user messages
+opening with a simple XML tag — codex injects `<environment_context>`,
+`<recommended_plugins>`, `<turn_aborted>`, `<transcript>` as user turns, and
+across every rollout on disk no genuine prompt starts with one.
+
+Timestamps are ISO-8601 UTC, so the same first/last scan Claude's parser already
+does works unchanged.
 
 ---
 
