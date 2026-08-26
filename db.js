@@ -227,6 +227,43 @@ const migrations = [
       }
     } catch {}
   },
+  // v9: purge rows summarised from local-command bookkeeping. /clear and /model
+  // open a new transcript whose first records are only that bookkeeping, which
+  // read-session-file.js used to take as the summary — titling every session
+  // started by /clear "<command-name>/clear…" and listing bookkeeping-only
+  // transcripts as phantom sessions. The parser no longer does; drop the rows
+  // it already wrote, plus the cache_meta gate for their folders so the next
+  // reconcile re-reads exactly those files (every other file in the folder
+  // still hits the fileMtime fast path and is left untouched).
+  (db) => {
+    try {
+      const bad = db.prepare(`SELECT sessionId, folder FROM session_cache
+         WHERE summary LIKE '<command-name>%' OR summary LIKE '<local-command-stdout>%'`
+      ).all();
+      if (bad.length === 0) return;
+      const delRow = db.prepare('DELETE FROM session_cache WHERE sessionId = ?');
+      const delFolderMeta = db.prepare('DELETE FROM cache_meta WHERE folder = ?');
+      for (const { sessionId, folder } of bad) {
+        delRow.run(sessionId);
+        if (folder) delFolderMeta.run(folder);
+      }
+      // Search entries live in tables created further down this file, so they
+      // may not exist yet on a DB this migration is the first to touch —
+      // prepared separately so a missing table throws here instead of skipping
+      // the purge above. External-content FTS5 ordering: fts delete first (it
+      // reads search_content), then content, then the map.
+      try {
+        const delFts = db.prepare("DELETE FROM search_fts WHERE rowid IN (SELECT rowid FROM search_map WHERE type = 'session' AND id = ?)");
+        const delContent = db.prepare("DELETE FROM search_content WHERE rowid IN (SELECT rowid FROM search_map WHERE type = 'session' AND id = ?)");
+        const delMap = db.prepare("DELETE FROM search_map WHERE type = 'session' AND id = ?");
+        for (const { sessionId } of bad) {
+          delFts.run(sessionId);
+          delContent.run(sessionId);
+          delMap.run(sessionId);
+        }
+      } catch {}
+    } catch {}
+  },
 ];
 
 const currentDbVersion = (() => {
