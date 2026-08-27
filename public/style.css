@@ -115,7 +115,7 @@ body { display: flex; flex-direction: column; }
 #status-bar-quota {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 26px;
   cursor: pointer;
   opacity: 0.95;
   flex-shrink: 0;
@@ -602,9 +602,12 @@ body { display: flex; flex-direction: column; }
   display: none;
 }
 
+/* Left edge lines up with the session rows above it (.session-item's 7px
+   inset), so the toggle reads as part of the same list. It was indented to
+   clear the pin back when the pin had its own gutter column. */
 .sessions-more-toggle {
   padding: 4px 10px;
-  margin: 4px 12px 10px 40px;
+  margin: 4px 12px 10px 7px;
   font-size: 11px;
   font-weight: 500;
   color: #7a7a90;
@@ -728,9 +731,10 @@ body { display: flex; flex-direction: column; }
 
 .slug-group.collapsed .slug-group-sessions { display: none; }
 .slug-group.collapsed .slug-group-older { display: none; }
+/* Same alignment as .sessions-more-toggle, inside a slug group's indent. */
 .slug-group-more {
   padding: 4px 10px;
-  margin: 4px 12px 10px 22px;
+  margin: 4px 12px 10px 7px;
   font-size: 11px;
   font-weight: 500;
   color: #7a7a90;
@@ -756,7 +760,7 @@ body { display: flex; flex-direction: column; }
 
 /* ---- Session items ---- */
 .session-item {
-  padding: 0 12px;
+  padding: 0 7px;
   cursor: pointer;
   transition: all 0.12s;
 }
@@ -765,7 +769,7 @@ body { display: flex; flex-direction: column; }
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  padding: 10px 10px;
+  padding: 10px 8px;
   border-radius: 8px;
   transition: background 0.12s;
   position: relative;
@@ -779,18 +783,37 @@ body { display: flex; flex-direction: column; }
   background: rgba(120,130,255,0.14);
 }
 
+/* ---- Gutter: logo above, pin below ---- */
+.session-gutter {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* Dim until the row is hovered or the session is actually pinned, so an
+   unpinned pin does not compete with the logo above it. */
+.session-gutter .session-pin {
+  opacity: 0.4;
+}
+
+.session-item:hover .session-gutter .session-pin,
+.session-gutter .session-pin.pinned {
+  opacity: 1;
+}
+
 /* ---- Pin ---- */
 .session-pin {
   flex-shrink: 0;
   cursor: pointer;
   font-size: 13px;
-  line-height: 1.5;
+  line-height: 1;
   color: #7a7a96;
   transition: all 0.15s;
   user-select: none;
   display: flex;
   align-items: center;
-  margin-top: 5px;
 }
 
 .session-pin:hover {
@@ -1079,12 +1102,22 @@ body { display: flex; flex-direction: column; }
 }
 
 /* ---- Needs attention indicator (ripple) ---- */
+/* The dot is absolutely positioned in the gutter mark; it must stay that way
+   (it was `position: relative` when it was a plain flex child). */
 .session-item.needs-attention .session-status-dot,
 .session-item.needs-attention .session-status-dot.running {
   background: #f0a050;
   box-shadow: none;
   animation: none;
-  position: relative;
+}
+
+/* The logo is the thing the eye lands on, so a blocked session colours that,
+   not just the 6px dot beside it. */
+.session-item.needs-attention .session-mark-icon,
+.session-item.needs-attention.is-codex .session-mark-icon,
+.session-item.needs-attention.is-terminal .session-mark-icon {
+  color: #f0a050;
+  opacity: 1;
 }
 
 .session-item.needs-attention .session-status-dot::before,
@@ -3802,6 +3835,45 @@ body { display: flex; flex-direction: column; }
   vertical-align: middle;
 }
 
-.session-item.is-codex .session-status-dot.running {
-  background: #10a37f;
+/* The running dot means "running", not "which CLI" — it stays one colour for
+   every harness. The logo beside it is what carries the brand. */
+
+/* A CLI that is not installed shows its toggle greyed rather than hidden, so
+   the list explains itself. */
+.settings-toggle input:disabled + .settings-toggle-slider {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ---- Quota gauge: one group per CLI ---- */
+/* Each CLI's windows sit behind its own logo, with a wider gap between groups
+   than between bars so the two read as separate blocks rather than one run. */
+.quota-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.quota-runtime-icon {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  opacity: 0.9;
+}
+
+.quota-group-codex .quota-runtime-icon { color: #10a37f; }
+
+/* Bars are tinted by the CLI that reported them too — the label alone
+   ("Week") is ambiguous once two CLIs are on the bar. */
+.quota-item-codex .quota-label { color: #10a37f; }
+.quota-item-codex .quota-fill { background: #10a37f; }
+.quota-item-codex .quota-fill.quota-mid { background: #d6a53c; }
+.quota-item-codex .quota-fill.quota-high { background: #e5714d; }
+
+/* Plan, credit balance and reset credits — codex reports these, Claude does not. */
+.usage-account-facts {
+  margin-top: 10px;
+  text-align: right;
+  opacity: 0.85;
 }

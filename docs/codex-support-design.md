@@ -320,11 +320,45 @@ Gate these on `runtime === 'claude'` rather than trying to generalise now:
 - **Fork / plan-accept detection** — `session-transitions.js` matches on
   `forkedFrom`, `planContent`, and `slug`, none of which exist in a rollout.
   Codex `fork` is an explicit command, so no detection is needed.
-- **Busy-state** — the `✳` / braille OSC-0 title probe is Claude-specific.
-  Codex sessions get no busy dot until its TUI is probed separately.
+(Busy-state was on this list until the TUI was probed — see below.)
 - **Scheduled tasks** — `schedule-runner.js`, `createScheduleSession`.
 - **Stats view** — reads `~/.claude/stats-cache.json`.
 - **Slug grouping** — no slug in a rollout, so Codex sessions render ungrouped.
+
+### Activity: working, waiting, blocked
+
+Probed from a live session rather than guessed. Codex uses **the same terminal
+title protocol as Claude**: a braille spinner frame (U+2800–U+28FF) prefixes the
+title while a turn runs. The difference is idle — Claude marks it with `✳`,
+codex simply drops the prefix, so for codex "not a spinner" *is* idle. Reading
+it as "no information" would leave sessions spinning in the sidebar forever, and
+treating a plain Claude title the same way would end a busy state early. Hence
+`parseTitleState` per harness.
+
+The other two states arrive as OSC 9, but only if notifications are on, so the
+launch forces them:
+
+```
+-c tui.notifications=true
+-c tui.notification_method="osc9"
+-c tui.notification_condition="always"
+```
+
+Same reasoning as `TERM_PROGRAM=iTerm.app` for Claude — the signal is what drives
+the sidebar. `unfocused` would suppress exactly the case that matters. Passed as
+`-c` overrides, so the user's own `config.toml` is untouched.
+
+Codex sends two kinds, with wording nothing like Claude's:
+
+| Payload | Means |
+|---|---|
+| `Approval requested: <command>` | blocked on the user |
+| the agent's final message | turn finished, response waiting |
+
+So classification moves into the harness too, and main hands the renderer a
+*kind* rather than the renderer re-deriving one from text. Verified end to end:
+busy at 7.5s, idle + `kind=idle` at 13.2s carrying the answer, `kind=attention`
+at 30.3s carrying the approval request.
 
 **JSONL viewer** needs a real Codex path, not a gate: map `user_message` /
 `agent_message` / `custom_tool_call` to the viewer's existing user / assistant /

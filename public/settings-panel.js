@@ -63,6 +63,23 @@
       return (current[fieldName] === undefined || current[fieldName] === null) ? 'disabled' : '';
     }
 
+    // Fetched before the template so the toggles render as direct children of
+    // their section: the card's rounded top and bottom come from
+    // `.settings-section > .settings-field`, which a wrapper div would break.
+    const harnesses = isProject ? [] : await window.api.getHarnesses().catch(() => []);
+    const harnessFields = harnesses.map(h => `
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">${escapeHtml(h.label)}</span>
+            <div class="settings-description">${h.available
+              ? `Scan for <code>${escapeHtml(h.id)}</code> sessions, show them, and offer it when starting one`
+              : 'Not installed on this machine'}</div>
+          </div>
+          <div class="settings-field-control">
+            <label class="settings-toggle"><input type="checkbox" class="sv-harness-toggle" data-harness="${escapeHtml(h.id)}" ${h.available ? '' : 'data-unavailable="1"'} ${h.enabled ? 'checked' : ''} ${h.available ? '' : 'disabled'}><span class="settings-toggle-slider"></span></label>
+          </div>
+        </div>`).join('');
+
     const permModeValue = fieldValue('permissionMode', '');
     const codexSandboxValue = fieldValue('codexSandbox', '');
     const codexApprovalValue = fieldValue('codexApproval', '');
@@ -84,6 +101,10 @@
 
     settingsViewerBody.innerHTML = `
     <div class="settings-form">
+      ${harnessFields ? `<div class="settings-section">
+        <div class="settings-section-title">CLI Agents</div>${harnessFields}
+      </div>` : ''}
+
       <div class="settings-section">
         <div class="settings-section-title">Claude CLI Options</div>
 
@@ -306,6 +327,31 @@
     </div>
   `;
 
+    // At least one CLI has to stay on, or the sidebar has nothing to show and
+    // the "+" menu nothing to offer. The last one still switched on is locked
+    // rather than hidden, so the reason is visible. Main refuses an all-off
+    // state too, for any writer that does not come through this panel.
+    const harnessToggles = [...settingsViewerBody.querySelectorAll('.sv-harness-toggle')]
+      .filter(t => !t.dataset.unavailable);
+    function syncHarnessLock() {
+      const on = harnessToggles.filter(t => t.checked);
+      for (const t of harnessToggles) {
+        const lock = on.length === 1 && t.checked;
+        t.disabled = lock;
+        const field = t.closest('.settings-field');
+        const desc = field?.querySelector('.settings-description');
+        if (desc && lock && !desc.dataset.originalText) {
+          desc.dataset.originalText = desc.innerHTML;
+          desc.textContent = 'Kept on — at least one CLI must stay enabled';
+        } else if (desc && !lock && desc.dataset.originalText) {
+          desc.innerHTML = desc.dataset.originalText;
+          delete desc.dataset.originalText;
+        }
+      }
+    }
+    harnessToggles.forEach(t => t.addEventListener('change', syncHarnessLock));
+    syncHarnessLock();
+
     // Use-global checkboxes toggle field disabled state
     settingsViewerBody.querySelectorAll('.use-global-cb').forEach(cb => {
       cb.addEventListener('change', () => {
@@ -359,6 +405,14 @@
         settings.codexSandbox = settingsViewerBody.querySelector('#sv-codex-sandbox').value;
         settings.codexApproval = settingsViewerBody.querySelector('#sv-codex-approval').value;
         settings.codexModel = settingsViewerBody.querySelector('#sv-codex-model').value.trim();
+        // Store the disabled set rather than the enabled one, so a CLI added in
+        // a later version is on by default instead of silently missing.
+        // Includes locked and unavailable toggles: `disabled` only stops the
+        // user changing them, their checked state is still the setting.
+        const toggles = [...settingsViewerBody.querySelectorAll('.sv-harness-toggle')];
+        if (toggles.length) {
+          settings.disabledHarnesses = toggles.filter(t => !t.checked).map(t => t.dataset.harness);
+        }
         settings.visibleSessionCount = parseInt(settingsViewerBody.querySelector('#sv-visible-count').value) || 10;
         settings.sessionMaxAgeDays = parseInt(settingsViewerBody.querySelector('#sv-max-age').value) || 3;
         settings.terminalTheme = settingsViewerBody.querySelector('#sv-terminal-theme').value || 'switchboard';

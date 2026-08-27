@@ -8,6 +8,7 @@ const log = require('electron-log');
 // getFolderIndexMtimeMs moved to session-cache.js
 const { startMcpServer, shutdownMcpServer, shutdownAll: shutdownAllMcp, resolvePendingDiff, rekeyMcpServer, cleanStaleLockFiles } = require('./mcp-bridge');
 const { fetchAndTransformUsage } = require('./claude-auth');
+const codexAuth = require('./codex-auth');
 
 // SWITCHBOARD_DATA_DIR isolates a dev/test instance from the installed app:
 // db.js puts switchboard.db under it, and pointing userData there gives the
@@ -72,7 +73,7 @@ const {
   closeDb,
 } = require('./db');
 
-const { getHarness, DEFAULT_HARNESS, transcriptPath, availableHarnesses,
+const { getHarness, DEFAULT_HARNESS, transcriptPath, availableHarnesses, allHarnesses, progressBusyState,
         harnessForFolder: getHarnessForFolder } = require('./harnesses');
 const claudeHarness = getHarness(DEFAULT_HARNESS);
 const PROJECTS_DIR = claudeHarness.sessionsRoot();
@@ -509,6 +510,7 @@ ipcMain.handle('save-plan', (_event, filePath, content) => {
 
 // --- IPC: get-stats ---
 ipcMain.handle('get-stats', () => {
+  if (!harnessEnabled(DEFAULT_HARNESS)) return null;
   try {
     if (!fs.existsSync(STATS_CACHE_PATH)) return null;
     const raw = fs.readFileSync(STATS_CACHE_PATH, 'utf8');
@@ -607,6 +609,10 @@ ipcMain.handle('refresh-stats', async () => {
     });
   }
 
+  // A switched-off CLI is not spawned and not queried — the PTY run below is
+  // the most expensive thing in the app to do for a CLI the user has hidden.
+  if (!harnessEnabled(DEFAULT_HARNESS)) return { stats: null, usage: {} };
+
   try {
     // Run /stats via PTY (for heatmap/chart data) and fetch usage via API in parallel
     const [, usage] = await Promise.all([
@@ -631,10 +637,24 @@ ipcMain.handle('refresh-stats', async () => {
 
 // --- IPC: get-usage (lightweight, API-only, no PTY) ---
 ipcMain.handle('get-usage', async () => {
+  if (!harnessEnabled(DEFAULT_HARNESS)) return {};
   try {
     return await fetchAndTransformUsage() || {};
   } catch (err) {
     log.error('Error fetching usage:', err);
+    return {};
+  }
+});
+
+// --- IPC: get-codex-usage --- (same idea for the codex account)
+ipcMain.handle('get-codex-usage', async () => {
+  // Nothing is fetched for a CLI the user switched off, or one that was never
+  // signed in — no request, no error surfaced.
+  if (!harnessEnabled('codex')) return {};
+  try {
+    return await codexAuth.fetchAndTransformUsage() || {};
+  } catch (err) {
+    log.error('Error fetching codex usage:', err);
     return {};
   }
 });
@@ -820,7 +840,47 @@ ipcMain.handle('get-setting', (_event, key) => {
 });
 
 ipcMain.handle('set-setting', (_event, key, value) => {
+  const beforeSet = key === 'global' ? disabledHarnessIds() : null;
+  const before = beforeSet ? [...beforeSet].sort().join(',') : null;
+
+  if (key === 'global' && Array.isArray(value?.disabledHarnesses)) {
+    // At least one CLI has to stay on, or the app has nothing to show and no
+    // way to start anything. The settings panel already prevents this; this is
+    // the guard for any other writer. The id that was just switched off is the
+    // one refused, which is what the UI does too.
+    const launchable = allHarnesses().filter(h => h.buildLaunchArgs && h.available()).map(h => h.id);
+    const disabled = new Set(value.disabledHarnesses);
+    if (launchable.length && launchable.every(id => disabled.has(id))) {
+      const justAdded = launchable.filter(id => disabled.has(id) && !beforeSet.has(id));
+      const keep = justAdded[0] || launchable[0];
+      log.warn(`[harness-toggle] refusing to disable every CLI; keeping ${keep} on`);
+      value = { ...value, disabledHarnesses: value.disabledHarnesses.filter(id => id !== keep) };
+    }
+  }
+
   setSetting(key, value);
+
+  if (key === 'global') {
+    const after = [...disabledHarnessIds()].sort().join(',');
+    if (before !== after) {
+      // Something was switched on or off. Watchers follow the new set, and a
+      // reconcile picks up whatever a newly-enabled harness did while it was
+      // being ignored — incremental, because its cached rows were kept and the
+      // folder mtime gate re-reads only what actually changed.
+      stopHarnessWatchers();
+      startHarnessWatchers();
+      try { projectsWatcher?.close(); } catch {}
+      projectsWatcher = null;
+      startProjectsWatcher();
+      try { reconcileCacheFromFilesystem(); } catch (err) { log.error('[harness-toggle]', err.message); }
+      notifyRendererProjectsChanged();
+      // The status bar quota gauge only re-reads on a 5-minute timer, so
+      // without this a switched-off CLI keeps its bars until the next tick.
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('harnesses-changed');
+      }
+    }
+  }
   return { ok: true };
 });
 
@@ -853,11 +913,32 @@ const SETTING_DEFAULTS = {
   codexModel: '',
 };
 
-// --- IPC: harnesses --- (which CLIs can start a session on this machine)
+// --- Harness enablement ---
+//
+// A disabled harness is not scanned, not watched, not listed as something to
+// start, and its sessions are hidden. Its cached rows are deliberately KEPT:
+// re-enabling then costs an incremental reconcile rather than a full re-index,
+// and nothing is lost if the toggle was a mistake.
+function disabledHarnessIds() {
+  const global = getSetting('global') || {};
+  return new Set(global.disabledHarnesses || []);
+}
+
+function harnessEnabled(id) {
+  return !disabledHarnessIds().has(id || DEFAULT_HARNESS);
+}
+
+// --- IPC: harnesses --- (which CLIs this machine has, and which are switched on)
 ipcMain.handle('get-harnesses', () => {
-  return availableHarnesses()
+  const disabled = disabledHarnessIds();
+  return allHarnesses()
     .filter(h => h.buildLaunchArgs)
-    .map(h => ({ id: h.id, label: h.label }));
+    .map(h => ({
+      id: h.id,
+      label: h.label,
+      available: h.available(),
+      enabled: !disabled.has(h.id),
+    }));
 });
 
 ipcMain.handle('get-shell-profiles', () => {
@@ -1171,11 +1252,35 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         const code = m[1];
         const payload = m[2].slice(0, 120);
         // Detect Claude CLI busy state from OSC 0 title (spinner chars = busy, ✳ = idle)
-        if (code === '0') {
-          const firstChar = payload.charAt(0);
-          const isBusy = firstChar.charCodeAt(0) >= 0x2800 && firstChar.charCodeAt(0) <= 0x28FF;
-          const isIdle = firstChar === '\u2733'; // ✳
-          log.debug(`[OSC 0] session=${currentId} char=U+${firstChar.charCodeAt(0).toString(16).toUpperCase()} busy=${isBusy} idle=${isIdle} wasBusy=${!!session._cliBusy}`);
+        if (code === '0' && harness) {
+          // What a title means is the harness's business: Claude marks idle with
+          // ✳, codex drops the spinner prefix and says "Action Required" when
+          // it is blocked on the user.
+          const titleState = harness.parseTitleState(payload);
+          // Remembered for the OSC 9;4 handler below, which trusts the title
+          // over a progress report from any process in the PTY.
+          if (titleState) session._titleBusy = titleState === 'busy';
+          const isBusy = titleState === 'busy';
+          const isIdle = titleState === 'idle' || titleState === 'attention';
+          log.debug(`[OSC 0] session=${currentId} state=${titleState || 'none'} wasBusy=${!!session._cliBusy}`);
+
+          // A blocked session is announced by OSC 9 too, but only when the CLI's
+          // notifications are on — which a session started before Switchboard
+          // began forcing them is not. The title is the signal that is always
+          // there, so it raises attention on its own. Latched, because the title
+          // is rewritten on every repaint.
+          if (titleState === 'attention') {
+            if (!session._titleAttention) {
+              session._titleAttention = true;
+              log.info(`[OSC 0] session=${currentId} → ATTENTION "${payload}"`);
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('terminal-notification', currentId, payload, 'attention');
+              }
+            }
+          } else if (titleState) {
+            session._titleAttention = false;
+          }
+
           if (isBusy && !session._cliBusy) {
             session._cliBusy = true;
             session._oscIdle = false;
@@ -1200,21 +1305,37 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         // OSC 9;4 progress: 4;0; = clear/done, 4;1;N = running at N%, 4;2;N = error, 4;3; = indeterminate
         if (payload.startsWith('4;')) {
           const level = payload.split(';')[1];
-          if (level === '0') continue; // 4;0 is also used for clearing, making it unreliable as an idle signal
-          log.debug(`[OSC 9;4] session=${currentId} level=${level} payload="${payload}" wasBusy=${!!session._cliBusy}`);
-          if ((level === '1' || level === '2' || level === '3') && !session._cliBusy) {
+          const progressState = progressBusyState({ level, titleBusy: !!session._titleBusy });
+          log.debug(`[OSC 9;4] session=${currentId} level=${level} payload="${payload}" state=${progressState || 'none'} titleBusy=${!!session._titleBusy} wasBusy=${!!session._cliBusy}`);
+          if (progressState === 'busy' && !session._cliBusy) {
             session._cliBusy = true;
             session._oscIdle = false;
             log.debug(`[OSC 9;4] session=${currentId} → BUSY`);
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('cli-busy-state', currentId, true);
             }
+          } else if (progressState === 'idle' && session._cliBusy) {
+            // The end of the progress run. Without acting on this, a busy state
+            // raised by 9;4 could only be cleared by a spinner-to-idle title
+            // change, which does not come for a slash command — the session sat
+            // spinning until Claude's "waiting for your input" notice a full
+            // minute later.
+            session._cliBusy = false;
+            session._oscIdle = true;
+            log.debug(`[OSC 9;4] session=${currentId} → IDLE`);
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('cli-busy-state', currentId, false);
+            }
           }
         } else {
-          // Regular notification (attention, permission, etc.)
-          log.info(`[OSC 9] session=${currentId} message="${payload}"`);
+          // Regular notification (attention, permission, etc.). The harness
+          // decides what its own wording means — codex says "Approval
+          // requested: …" where Claude says "needs your permission…" — so the
+          // renderer is handed a kind rather than re-deriving one from text.
+          const kind = harness ? harness.classifyNotification(payload) : null;
+          log.info(`[OSC 9] session=${currentId} kind=${kind || 'none'} message="${payload}"`);
           if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('terminal-notification', currentId, payload);
+            mainWindow.webContents.send('terminal-notification', currentId, payload, kind);
           }
         }
       }
@@ -1343,6 +1464,7 @@ let projectsWatcher = null;
 
 function startProjectsWatcher() {
   if (!fs.existsSync(PROJECTS_DIR)) return;
+  if (!harnessEnabled(DEFAULT_HARNESS)) return;
 
   const pendingFolders = new Set();
   let debounceTimer = null;
@@ -1484,9 +1606,16 @@ function resolveHarnessFolderPath(folder) {
   return h.folderPath(h.folderPrefix ? folder.slice(h.folderPrefix.length) : folder);
 }
 
+function stopHarnessWatchers() {
+  while (harnessWatchers.length) {
+    try { harnessWatchers.pop().close(); } catch {}
+  }
+}
+
 function startHarnessWatchers() {
   for (const h of availableHarnesses()) {
     if (!h.folderPrefix) continue; // Claude's root is startProjectsWatcher's job
+    if (!harnessEnabled(h.id)) continue;
     const root = h.sessionsRoot();
     if (!fs.existsSync(root)) continue;
 

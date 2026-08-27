@@ -17,14 +17,18 @@ function writeSession(folderPath, cwd) {
 
 // In-memory fake of the db layer that init() expects, recording which folders
 // actually got (re)indexed (i.e. had refreshFolder do work and upsert sessions).
-function makeFakeDb(metaMap) {
+function makeFakeDb(metaMap, globalSettings = {}) {
   const indexedFolders = new Set();
+  const cachedRows = [];
   return {
     indexedFolders,
+    cachedRows,
     db: {
       deleteCachedFolder() {},
       getCachedByFolder() { return []; },
-      upsertCachedSessions(sessions) { for (const s of sessions) indexedFolders.add(s.folder); },
+      upsertCachedSessions(sessions) {
+        for (const s of sessions) { indexedFolders.add(s.folder); cachedRows.push(s); }
+      },
       deleteCachedSession() {},
       deleteSearchFolder() {},
       deleteSearchSession() {},
@@ -32,8 +36,8 @@ function makeFakeDb(metaMap) {
       setFolderMeta(folder, projectPath, indexMtimeMs) { metaMap.set(folder, { folder, projectPath, indexMtimeMs }); },
       getAllFolderMeta() { return metaMap; },
       getAllMeta() { return new Map(); },
-      getAllCached() { return []; },
-      getSetting() { return {}; },
+      getAllCached() { return cachedRows; },
+      getSetting(key) { return key === 'global' ? globalSettings : {}; },
       getMeta() { return null; },
       setName() {},
     },
@@ -147,5 +151,108 @@ test('a codex home that does not exist contributes nothing and does not throw', 
   } finally {
     if (prevHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prevHome;
     fs.rmSync(projectsDir, { recursive: true, force: true });
+  }
+});
+
+// --- switching a CLI off and on ---
+
+function setUpBoth(globalSettings) {
+  const projectsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-claude-'));
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-codex-'));
+  process.env.CODEX_HOME = codexHome;
+  writeSession(path.join(projectsDir, 'proj'), '/tmp/proj');
+  writeRollout(path.join(codexHome, 'sessions', '2026', '08', '26'), '/tmp/codex-project');
+  const metaMap = new Map();
+  const fake = makeFakeDb(metaMap, globalSettings);
+  sessionCache.init({
+    PROJECTS_DIR: projectsDir, activeSessions: new Map(),
+    getMainWindow: () => null, log: console, db: fake.db,
+  });
+  return { projectsDir, codexHome, metaMap, fake };
+}
+
+test('a disabled CLI is not scanned at all', () => {
+  const prev = process.env.CODEX_HOME;
+  const { projectsDir, codexHome, fake } = setUpBoth({ disabledHarnesses: ['codex'] });
+  try {
+    sessionCache.reconcileCacheFromFilesystem();
+    assert.ok(fake.indexedFolders.has('proj'), 'the enabled CLI is still scanned');
+    assert.equal([...fake.indexedFolders].filter(f => f.startsWith('codex/')).length, 0,
+      'the disabled CLI is not read from disk');
+  } finally {
+    if (prev === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev;
+    fs.rmSync(projectsDir, { recursive: true, force: true });
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('Claude can be the one switched off', () => {
+  const prev = process.env.CODEX_HOME;
+  const { projectsDir, codexHome, fake } = setUpBoth({ disabledHarnesses: ['claude'] });
+  try {
+    sessionCache.reconcileCacheFromFilesystem();
+    assert.ok(fake.indexedFolders.has('codex/2026/08/26'));
+    assert.ok(!fake.indexedFolders.has('proj'), 'the Claude projects dir is not read');
+  } finally {
+    if (prev === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev;
+    fs.rmSync(projectsDir, { recursive: true, force: true });
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+// The question this whole design turns on: if a disabled CLI is never scanned,
+// does switching it back on actually pick up what it did in the meantime?
+test('switching a CLI back on scans what it missed', () => {
+  const prev = process.env.CODEX_HOME;
+  const settings = { disabledHarnesses: ['codex'] };
+  const { projectsDir, codexHome, metaMap, fake } = setUpBoth(settings);
+  try {
+    sessionCache.reconcileCacheFromFilesystem();
+    assert.equal([...fake.indexedFolders].filter(f => f.startsWith('codex/')).length, 0);
+
+    // A codex session happens while it is switched off.
+    writeRollout(path.join(codexHome, 'sessions', '2026', '08', '27'), '/tmp/while-off');
+
+    // Switch it on and reconcile, exactly as set-setting does.
+    settings.disabledHarnesses = [];
+    const after = makeFakeDb(metaMap, settings);
+    sessionCache.init({
+      PROJECTS_DIR: projectsDir, activeSessions: new Map(),
+      getMainWindow: () => null, log: console, db: after.db,
+    });
+    sessionCache.reconcileCacheFromFilesystem();
+
+    assert.ok(after.indexedFolders.has('codex/2026/08/26'), 'history from before it was switched off');
+    assert.ok(after.indexedFolders.has('codex/2026/08/27'), 'the session it had while switched off');
+  } finally {
+    if (prev === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev;
+    fs.rmSync(projectsDir, { recursive: true, force: true });
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('a disabled CLI\'s sessions are hidden but its cached rows are kept', () => {
+  const prev = process.env.CODEX_HOME;
+  const settings = {};
+  const { projectsDir, codexHome, fake } = setUpBoth(settings);
+  try {
+    sessionCache.reconcileCacheFromFilesystem();
+    const shown = () => sessionCache.buildProjectsFromCache(true)
+      .flatMap(p => p.sessions).map(s => s.runtime || 'claude');
+
+    assert.ok(shown().includes('codex'), 'listed while switched on');
+
+    settings.disabledHarnesses = ['codex'];
+    assert.ok(!shown().includes('codex'), 'hidden while switched off');
+    assert.ok(shown().includes('claude'), 'the other CLI is unaffected');
+    // Nothing was deleted — that is what makes switching back on cheap.
+    assert.ok(fake.cachedRows.some(r => r.runtime === 'codex'), 'rows kept in the cache');
+
+    settings.disabledHarnesses = [];
+    assert.ok(shown().includes('codex'), 'listed again immediately, with no re-index');
+  } finally {
+    if (prev === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev;
+    fs.rmSync(projectsDir, { recursive: true, force: true });
+    fs.rmSync(codexHome, { recursive: true, force: true });
   }
 });

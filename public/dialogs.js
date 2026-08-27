@@ -140,7 +140,11 @@ function showNewSessionPopover(project, anchorEl) {
   // Claude alone until main answers, so the popover never renders empty.
   render([{ id: 'claude', label: 'Claude' }]);
   window.api.getHarnesses()
-    .then(list => { if (popover.isConnected && list?.length) render(list); })
+    .then(list => {
+      // Only CLIs that are installed AND switched on can start a session.
+      const usable = (list || []).filter(h => h.available && h.enabled);
+      if (popover.isConnected && usable.length) render(usable);
+    })
     .catch(() => {});
 
   // Close on click outside

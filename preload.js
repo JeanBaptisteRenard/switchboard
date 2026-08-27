@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('api', {
   getStats: () => ipcRenderer.invoke('get-stats'),
   refreshStats: () => ipcRenderer.invoke('refresh-stats'),
   getUsage: () => ipcRenderer.invoke('get-usage'),
+  getCodexUsage: () => ipcRenderer.invoke('get-codex-usage'),
   getMemories: () => ipcRenderer.invoke('get-memories'),
   readMemory: (filePath) => ipcRenderer.invoke('read-memory', filePath),
   saveMemory: (filePath, content) => ipcRenderer.invoke('save-memory', filePath, content),
@@ -51,12 +52,15 @@ contextBridge.exposeInMainWorld('api', {
   onSessionDetected: (callback) => {
     ipcRenderer.on('session-detected', (_event, tempId, realId) => callback(tempId, realId));
   },
+  onHarnessesChanged: (callback) => {
+    ipcRenderer.on('harnesses-changed', () => callback());
+  },
   onProcessExited: (callback) => {
     ipcRenderer.on('process-exited', (_event, sessionId, exitCode, signal, userStopped) =>
       callback(sessionId, exitCode, signal, userStopped));
   },
   onTerminalNotification: (callback) => {
-    ipcRenderer.on('terminal-notification', (_event, sessionId, message) => callback(sessionId, message));
+    ipcRenderer.on('terminal-notification', (_event, sessionId, message, kind) => callback(sessionId, message, kind));
   },
   onCliBusyState: (callback) => {
     ipcRenderer.on('cli-busy-state', (_event, sessionId, busy) => callback(sessionId, busy));

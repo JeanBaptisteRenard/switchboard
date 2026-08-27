@@ -780,8 +780,14 @@ function buildSessionItem(session) {
     actions.appendChild(launchConfigBtn);
   }
 
-  row.appendChild(pin);
-  row.appendChild(mark);
+  // Logo and pin stack vertically in a single gutter column — the logo beside
+  // the title, the pin beside the meta line under it. Side by side they cost
+  // every row a second column of horizontal space the title needs more.
+  const gutter = document.createElement('div');
+  gutter.className = 'session-gutter';
+  gutter.append(mark, pin);
+
+  row.appendChild(gutter);
   row.appendChild(info);
   row.appendChild(actions);
   item.appendChild(row);

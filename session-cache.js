@@ -56,6 +56,18 @@ function init(ctx) {
 }
 
 /**
+ * Which harnesses the user has switched off in settings.
+ *
+ * A disabled harness is not scanned and its sessions are not listed, but its
+ * cached rows stay in the database — so switching it back on is an incremental
+ * reconcile, not a full re-index.
+ */
+function disabledHarnessIds() {
+  const global = getSetting('global') || {};
+  return new Set(global.disabledHarnesses || []);
+}
+
+/**
  * Every folder key worth indexing, across every harness available here.
  *
  * Claude's come from the injected PROJECTS_DIR rather than its own root, for
@@ -63,14 +75,18 @@ function init(ctx) {
  * home directory is missing contributes nothing and costs one existsSync.
  */
 function listAllFolders() {
+  const disabled = disabledHarnessIds();
   const folders = [];
-  try {
-    for (const d of fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })) {
-      if (d.isDirectory() && d.name !== '.git') folders.push(d.name);
-    }
-  } catch {}
+  if (!disabled.has(DEFAULT_HARNESS)) {
+    try {
+      for (const d of fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })) {
+        if (d.isDirectory() && d.name !== '.git') folders.push(d.name);
+      }
+    } catch {}
+  }
   for (const h of availableHarnesses()) {
     if (!h.folderPrefix) continue; // the unprefixed namespace is PROJECTS_DIR, above
+    if (disabled.has(h.id)) continue;
     try { folders.push(...h.listFolders()); } catch {}
   }
   return folders;
@@ -206,6 +222,7 @@ function buildProjectsFromCache(showArchived) {
   const cachedRows = getAllCached();
   const global = getSetting('global') || {};
   const hiddenProjects = new Set(global.hiddenProjects || []);
+  const disabledHarnesses = new Set(global.disabledHarnesses || []);
 
   // Group by projectPath, not on-disk folder name. Multiple ~/.claude/projects/<folder>/
   // directories can resolve to the same projectPath (Claude Code's folder-name encoding
@@ -218,6 +235,8 @@ function buildProjectsFromCache(showArchived) {
   for (const row of cachedRows) {
     if (!row.projectPath) continue;
     if (hiddenProjects.has(row.projectPath)) continue;
+    // Rows written before the runtime column existed are Claude's.
+    if (disabledHarnesses.has(row.runtime || DEFAULT_HARNESS)) continue;
     const meta = metaMap.get(row.sessionId);
     const s = {
       sessionId: row.sessionId,

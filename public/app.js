@@ -345,19 +345,16 @@ window.api.onProcessExited((sessionId, exitCode, signal, userStopped) => {
 });
 
 // --- Terminal notifications (iTerm2 OSC 9 — "needs attention") ---
-window.api.onTerminalNotification((sessionId, message) => {
-  // Only mark as needing attention for "attention" messages, not "waiting for input"
-  // Matches all four CLI notification types:
-  // 1. "Claude Code needs your attention"         → attention
-  // 2. "Claude Code needs your approval for the plan" → approval, needs your
-  // 3. "Claude needs your permission to use {tool}"   → permission, needs your
-  // 4. "Claude Code wants to enter plan mode"         → wants to enter
-  if (/attention|approval|permission|needs your|wants to enter/i.test(message) && sessionId !== activeSessionId) {
+window.api.onTerminalNotification((sessionId, message, kind) => {
+  // `kind` is classified by the session's harness in main, since the wording is
+  // per-CLI: Claude says "needs your permission to use {tool}", codex says
+  // "Approval requested: <command>".
+  if (kind === 'attention' && sessionId !== activeSessionId) {
     attentionSessions.add(sessionId);
     const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
     if (item) item.classList.add('needs-attention');
-  } else if (/waiting for your input/i.test(message)) {
-    // "Claude is waiting for your input" — delayed idle notification, mark response-ready
+  } else if (kind === 'idle') {
+    // The turn finished — mark the session as having a response to read.
     setActivity(sessionId, false);
   }
 
@@ -1197,6 +1194,9 @@ const quotaGaugeEl = document.getElementById('status-bar-quota');
 // Full labels ("Week (all models)") are too long for a status bar; the tooltip
 // carries them in full.
 function shortQuotaLabel(row) {
+  // codex names its own windows by length, since it reports a duration in
+  // seconds rather than a named bucket like Claude does.
+  if (row.short) return row.short;
   if (row.kind === 'session') return '5h';
   if (row.kind === 'weekly_all') return 'Week';
   return row.model || 'Week';
@@ -1205,6 +1205,8 @@ function shortQuotaLabel(row) {
 function buildQuotaBar(row) {
   const wrap = document.createElement('span');
   wrap.className = 'quota-item';
+
+  if (row.runtime) wrap.classList.add('quota-item-' + row.runtime);
 
   const label = document.createElement('span');
   label.className = 'quota-label';
@@ -1225,27 +1227,69 @@ function buildQuotaBar(row) {
   pctEl.textContent = pct + '%';
   wrap.appendChild(pctEl);
 
-  wrap.title = `${row.label}: ${pct}%` + (row.reset ? ` \u2014 resets ${row.reset}` : '');
+  const who = row.runtime === 'codex' ? 'Codex' : 'Claude';
+  wrap.title = `${who} \u2014 ${row.label}: ${pct}%` + (row.reset ? ` \u2014 resets ${row.reset}` : '');
   return wrap;
+}
+
+function quotaRowsFor(usage, runtime) {
+  // Prefer the API's self-describing rows; fall back to the flat 5-hour keys.
+  const rows = Array.isArray(usage?.limits) && usage.limits.length
+    ? usage.limits
+    : (usage?.session !== undefined
+      ? [{ kind: 'session', label: 'Current session', percent: usage.session, reset: usage.sessionReset }]
+      : []);
+  return rows.map(r => ({ runtime, ...r }));
+}
+
+/**
+ * One CLI's bars behind its logo.
+ *
+ * The logo goes on the group rather than each bar: with two CLIs on the bar a
+ * label like "Week" is ambiguous, but repeating the mark per bar is noise.
+ */
+function buildQuotaGroup(runtime, rows) {
+  const group = document.createElement('span');
+  group.className = 'quota-group quota-group-' + runtime;
+
+  const icon = document.createElement('span');
+  icon.className = 'quota-runtime-icon';
+  icon.innerHTML = runtime === 'codex' ? ICONS.codex(12) : ICONS.claude(12);
+  icon.title = runtime === 'codex' ? 'Codex' : 'Claude';
+  group.appendChild(icon);
+
+  for (const row of rows) group.appendChild(buildQuotaBar(row));
+  return group;
 }
 
 async function refreshQuotaGauge() {
   try {
-    const usage = await window.api.getUsage();
-    // Prefer the API's self-describing rows; fall back to the flat 5-hour keys.
-    const rows = Array.isArray(usage?.limits) && usage.limits.length
-      ? usage.limits
-      : (usage?.session !== undefined
-        ? [{ kind: 'session', label: 'Current session', percent: usage.session, reset: usage.sessionReset }]
-        : []);
-    if (!rows.length) { quotaGaugeEl.style.display = 'none'; return; }
+    // Both CLIs, in parallel and independently: one being signed out or
+    // switched off must not cost the other its bars.
+    const [claudeUsage, codexUsage] = await Promise.all([
+      window.api.getUsage().catch(() => ({})),
+      window.api.getCodexUsage?.().catch(() => ({})) ?? {},
+    ]);
+    const groups = [];
+    for (const [runtime, usage] of [['claude', claudeUsage], ['codex', codexUsage]]) {
+      const rows = quotaRowsFor(usage, runtime);
+      if (rows.length) groups.push(buildQuotaGroup(runtime, rows));
+    }
+    if (!groups.length) { quotaGaugeEl.style.display = 'none'; return; }
 
-    quotaGaugeEl.replaceChildren(...rows.map(buildQuotaBar));
+    quotaGaugeEl.replaceChildren(...groups);
     quotaGaugeEl.style.display = '';
   } catch {}
 }
 refreshQuotaGauge();
 setInterval(refreshQuotaGauge, 5 * 60 * 1000);
+
+// Switching a CLI on or off changes which bars belong on the gauge and which
+// sessions belong in the sidebar. Both are otherwise only refreshed on a timer.
+window.api.onHarnessesChanged?.(() => {
+  refreshQuotaGauge();
+  loadProjects({ resort: true });
+});
 quotaGaugeEl.addEventListener('click', () => {
   document.querySelector('.sidebar-tab[data-tab="stats"]')?.click();
 });
