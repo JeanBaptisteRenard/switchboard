@@ -144,9 +144,12 @@ function showNewSessionPopover(project, anchorEl) {
   render([{ id: 'claude', label: 'Claude' }]);
   window.api.getHarnesses()
     .then(list => {
-      // Only CLIs that are installed AND switched on can start a session.
-      // History alone is not enough — there would be no binary to run.
-      const usable = (list || []).filter(h => h.installed && h.enabled);
+      // Every switched-on CLI is offered, installed or not — the menu is how
+      // people find out Switchboard supports one at all. Picking a CLI that is
+      // not on PATH launches it anyway and shows the shell's "command not
+      // found" in the terminal, which says more than a hidden row would.
+      // Switching it off in settings takes it out of the list.
+      const usable = (list || []).filter(h => h.enabled);
       if (popover.isConnected && usable.length) render(usable);
     })
     .catch(() => {});

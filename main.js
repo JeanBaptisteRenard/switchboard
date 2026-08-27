@@ -848,7 +848,11 @@ ipcMain.handle('set-setting', (_event, key, value) => {
     // way to start anything. The settings panel already prevents this; this is
     // the guard for any other writer. The id that was just switched off is the
     // one refused, which is what the UI does too.
-    const launchable = allHarnesses().filter(h => h.buildLaunchArgs && h.installed()).map(h => h.id);
+    // Prefer the CLIs actually installed; if none are, fall back to every
+    // registered one so there is still a guard on a machine with neither.
+    const startable = allHarnesses().filter(h => h.buildLaunchArgs);
+    const installedIds = startable.filter(h => h.installed()).map(h => h.id);
+    const launchable = installedIds.length ? installedIds : startable.map(h => h.id);
     const disabled = new Set(value.disabledHarnesses);
     if (launchable.length && launchable.every(id => disabled.has(id))) {
       const justAdded = launchable.filter(id => disabled.has(id) && !beforeSet.has(id));

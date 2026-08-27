@@ -74,11 +74,11 @@
             <div class="settings-description">${h.installed
               ? `Scan for <code>${escapeHtml(h.id)}</code> sessions, show them, and offer it when starting one`
               : h.hasHistory
-                ? `Not on PATH \u2014 past <code>${escapeHtml(h.id)}</code> sessions are shown, but new ones cannot be started`
-                : 'Not installed on this machine'}</div>
+                ? `Not on PATH \u2014 past <code>${escapeHtml(h.id)}</code> sessions are shown, but starting one will fail`
+                : `Not installed \u2014 still offered when starting a session, which will fail until <code>${escapeHtml(h.id)}</code> is on PATH`}</div>
           </div>
           <div class="settings-field-control">
-            <label class="settings-toggle"><input type="checkbox" class="sv-harness-toggle" data-harness="${escapeHtml(h.id)}" ${(h.installed || h.hasHistory) ? '' : 'data-unavailable="1"'} ${h.enabled ? 'checked' : ''} ${(h.installed || h.hasHistory) ? '' : 'disabled'}><span class="settings-toggle-slider"></span></label>
+            <label class="settings-toggle"><input type="checkbox" class="sv-harness-toggle" data-harness="${escapeHtml(h.id)}" ${h.enabled ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
           </div>
         </div>`).join('');
 
@@ -333,8 +333,7 @@
     // the "+" menu nothing to offer. The last one still switched on is locked
     // rather than hidden, so the reason is visible. Main refuses an all-off
     // state too, for any writer that does not come through this panel.
-    const harnessToggles = [...settingsViewerBody.querySelectorAll('.sv-harness-toggle')]
-      .filter(t => !t.dataset.unavailable);
+    const harnessToggles = [...settingsViewerBody.querySelectorAll('.sv-harness-toggle')];
     function syncHarnessLock() {
       const on = harnessToggles.filter(t => t.checked);
       for (const t of harnessToggles) {
