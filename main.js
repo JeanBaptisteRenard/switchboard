@@ -1013,6 +1013,7 @@ ipcMain.handle('read-session-jsonl', (_event, sessionId) => {
   // The harness owns its transcript naming — Claude uses <sessionId>.jsonl,
   // others do not — so resolve through it rather than rebuilding the path here.
   const jsonlPath = transcriptPath(row);
+  const harness = getHarness(row.runtime);
   try {
     const content = fs.readFileSync(jsonlPath, 'utf-8');
     const entries = [];
@@ -1020,7 +1021,9 @@ ipcMain.handle('read-session-jsonl', (_event, sessionId) => {
       if (!line.trim()) continue;
       try { entries.push(JSON.parse(line)); } catch {}
     }
-    return { entries };
+    // Normalised here rather than in the renderer, so the viewer never has to
+    // know which CLI wrote the transcript it is showing.
+    return { entries: harness.toViewerEntries(entries) };
   } catch (err) {
     return { error: err.message };
   }

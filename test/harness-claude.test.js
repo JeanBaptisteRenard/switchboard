@@ -218,3 +218,16 @@ test('an unknown progress level changes nothing', () => {
     assert.equal(progressBusyState({ level, titleBusy: false }), null, String(level));
   }
 });
+
+test('Claude transcripts reach the viewer untouched', () => {
+  // The viewer was written against Claude's format, so its normalisation is
+  // identity — it exists so the viewer never has to know which CLI wrote a file.
+  const entries = [{ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'hi' }] } }];
+  assert.equal(claude.toViewerEntries(entries), entries);
+});
+
+test('every harness can feed the viewer', () => {
+  for (const h of require('../harnesses').allHarnesses()) {
+    assert.equal(typeof h.toViewerEntries, 'function', h.id);
+  }
+});

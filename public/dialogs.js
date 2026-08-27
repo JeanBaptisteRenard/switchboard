@@ -31,6 +31,9 @@ async function resolveDefaultSessionOptions(project) {
 async function forkSession(session, project) {
   const options = await resolveDefaultSessionOptions(project);
   options.forkFrom = session.sessionId;
+  // A fork runs on the CLI that wrote the session being forked, not whatever
+  // the default is — `codex fork` cannot continue a Claude transcript.
+  if (session.runtime) options.runtime = session.runtime;
   launchNewSession(project, options);
 }
 

@@ -210,6 +210,17 @@ function readSessionFile(filePath, folder, projectPath) {
   }
 }
 
+/**
+ * Transcript records as the JSONL viewer wants them.
+ *
+ * Claude's own format IS the viewer's format — the viewer was written against
+ * it — so this is identity. It exists so the viewer never has to know which
+ * CLI wrote the file it is showing.
+ */
+function toViewerEntries(entries) {
+  return entries;
+}
+
 // --- Activity signalling ---
 
 // Claude marks a working session by prefixing its terminal title with a braille
@@ -300,7 +311,7 @@ module.exports = {
   available, sessionsRoot, listFolders, folderPath, folderForProject,
   listTranscripts, sessionIdFromPath, transcriptPath,
   deriveProjectPath,
-  readSessionFile,
+  readSessionFile, toViewerEntries,
   parseTitleState, classifyNotification,
   buildLaunchArgs,
 };

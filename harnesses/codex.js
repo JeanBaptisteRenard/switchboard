@@ -236,6 +236,75 @@ function readSessionFile(filePath, folder) {
   }
 }
 
+/** Text out of codex's {type, text} content arrays, which vary by record. */
+function partsText(parts) {
+  if (typeof parts === 'string') return parts;
+  if (!Array.isArray(parts)) return '';
+  return parts.map(p => (p && typeof p.text === 'string' ? p.text : '')).join('');
+}
+
+/**
+ * A rollout rewritten as the records the JSONL viewer renders.
+ *
+ * The viewer speaks Claude's transcript format, so rather than teaching it a
+ * second one, codex's records are mapped onto it: a tool call becomes a
+ * tool_use block, its output a tool_result keyed by the same call id, and a
+ * reasoning summary a thinking block.
+ *
+ * Developer-role messages and tag-wrapped user turns are dropped for the same
+ * reason readSessionFile drops them — they are the CLI talking to the model,
+ * not conversation.
+ */
+function toViewerEntries(entries) {
+  const out = [];
+  for (const entry of entries || []) {
+    if (!entry || entry.type !== 'response_item') continue;
+    const p = entry.payload;
+    if (!p) continue;
+    const timestamp = entry.timestamp;
+
+    if (p.type === 'message') {
+      const role = p.role;
+      if (role !== 'user' && role !== 'assistant') continue;
+      const text = partsText(p.content);
+      if (!text) continue;
+      if (role === 'user' && INJECTED_RE.test(text)) continue;
+      out.push({ type: role, timestamp, message: { role, content: [{ type: 'text', text }] } });
+      continue;
+    }
+
+    if (p.type === 'reasoning') {
+      // Usually empty: the real chain of thought is in encrypted_content, which
+      // only the API can read. Rendered when a plain summary is present.
+      const text = partsText(p.summary);
+      if (!text) continue;
+      out.push({ type: 'assistant', timestamp,
+        message: { role: 'assistant', content: [{ type: 'thinking', thinking: text }] } });
+      continue;
+    }
+
+    if (p.type === 'custom_tool_call' || p.type === 'function_call') {
+      out.push({ type: 'assistant', timestamp, message: { role: 'assistant', content: [{
+        type: 'tool_use',
+        // The viewer pairs a result to its call through this id.
+        id: p.call_id || p.id || null,
+        name: p.name || 'tool',
+        input: p.input ?? p.arguments ?? '',
+      }] } });
+      continue;
+    }
+
+    if (p.type === 'custom_tool_call_output' || p.type === 'function_call_output') {
+      out.push({ type: 'user', timestamp, message: { role: 'user', content: [{
+        type: 'tool_result',
+        tool_use_id: p.call_id || p.id || null,
+        content: partsText(p.output),
+      }] } });
+    }
+  }
+  return out;
+}
+
 // --- New-session detection ---
 //
 // codex will not accept a pre-assigned session id, and writes no transcript at
@@ -444,5 +513,5 @@ module.exports = {
   available, codexHome, sessionsRoot, listFolders, folderPath, folderForProject,
   listTranscripts, sessionIdFromPath, transcriptPath, isSubagentMeta,
   deriveProjectPath,
-  readSessionFile,
+  readSessionFile, toViewerEntries,
 };

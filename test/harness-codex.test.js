@@ -468,3 +468,100 @@ test('the subcommand stays first, ahead of the config overrides', () => {
   assert.equal(codex.buildLaunchArgs({ sessionId: 'n', isNew: true, options: { forkFrom: ID } })[0], 'fork');
   assert.equal(codex.buildLaunchArgs({ sessionId: ID, isNew: true, options: {} })[0], '-c');
 });
+
+// --- viewer normalisation ---
+//
+// The JSONL viewer speaks Claude's transcript format, so a rollout is mapped
+// onto it rather than the viewer learning a second one.
+
+function responseItem(payload, timestamp = '2026-08-26T10:00:00Z') {
+  return { timestamp, type: 'response_item', payload };
+}
+
+test('user and assistant text become viewer messages', () => {
+  const out = codex.toViewerEntries([
+    responseItem({ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] }),
+    responseItem({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'hi back' }] }),
+  ]);
+  assert.equal(out.length, 2);
+  assert.equal(out[0].type, 'user');
+  assert.equal(out[0].message.content[0].type, 'text');
+  assert.equal(out[0].message.content[0].text, 'hello');
+  assert.equal(out[1].message.role, 'assistant');
+  assert.equal(out[1].message.content[0].text, 'hi back');
+});
+
+test('CLI scaffolding is left out of the viewer too', () => {
+  const out = codex.toViewerEntries([
+    responseItem({ type: 'message', role: 'developer', content: [{ type: 'input_text', text: '<skills_instructions>…' }] }),
+    responseItem({ type: 'message', role: 'user', content: [{ type: 'input_text', text: '<environment_context>\n x\n</environment_context>' }] }),
+    responseItem({ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'the real question' }] }),
+  ]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].message.content[0].text, 'the real question');
+});
+
+test('a tool call and its output are paired by call id', () => {
+  // The viewer nests a result inside its call by matching tool_use.id against
+  // tool_result.tool_use_id, so both have to carry codex's call_id.
+  const out = codex.toViewerEntries([
+    responseItem({ type: 'custom_tool_call', id: 'ctc_1', call_id: 'call_abc', name: 'exec', input: 'ls -la' }),
+    responseItem({ type: 'custom_tool_call_output', id: 'ctco_1', call_id: 'call_abc',
+      output: [{ type: 'input_text', text: 'total 0\n' }, { type: 'input_text', text: 'a.txt\n' }] }),
+  ]);
+  const call = out[0].message.content[0];
+  const result = out[1].message.content[0];
+  assert.equal(call.type, 'tool_use');
+  assert.equal(call.id, 'call_abc');
+  assert.equal(call.name, 'exec');
+  assert.equal(call.input, 'ls -la');
+  assert.equal(result.type, 'tool_result');
+  assert.equal(result.tool_use_id, 'call_abc', 'must match the call, or the result renders detached');
+  assert.equal(result.content, 'total 0\na.txt\n', 'output parts are joined');
+});
+
+test('the older function_call shape maps the same way', () => {
+  const out = codex.toViewerEntries([
+    responseItem({ type: 'function_call', call_id: 'c1', name: 'shell', arguments: '{"cmd":"ls"}' }),
+    responseItem({ type: 'function_call_output', call_id: 'c1', output: 'ok' }),
+  ]);
+  assert.equal(out[0].message.content[0].name, 'shell');
+  assert.equal(out[0].message.content[0].input, '{"cmd":"ls"}');
+  assert.equal(out[1].message.content[0].content, 'ok');
+});
+
+test('reasoning renders only when a readable summary exists', () => {
+  // The real chain of thought sits in encrypted_content, which only the API can
+  // read, and summary is empty in most rollouts.
+  const empty = codex.toViewerEntries([
+    responseItem({ type: 'reasoning', summary: [], encrypted_content: 'gAAAA…' }),
+  ]);
+  assert.equal(empty.length, 0);
+
+  const withSummary = codex.toViewerEntries([
+    responseItem({ type: 'reasoning', summary: [{ type: 'summary_text', text: 'Checking the parser' }] }),
+  ]);
+  assert.equal(withSummary[0].message.content[0].type, 'thinking');
+  assert.equal(withSummary[0].message.content[0].thinking, 'Checking the parser');
+});
+
+test('non-conversation records are skipped, and junk does not throw', () => {
+  const out = codex.toViewerEntries([
+    { timestamp: 't', type: 'session_meta', payload: { cwd: '/p' } },
+    { timestamp: 't', type: 'event_msg', payload: { type: 'token_count' } },
+    { type: 'response_item' },
+    null,
+    responseItem({ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'kept' }] }),
+  ]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].message.content[0].text, 'kept');
+  assert.deepEqual(codex.toViewerEntries(null), []);
+  assert.deepEqual(codex.toViewerEntries([]), []);
+});
+
+test('timestamps are carried through for the viewer to show', () => {
+  const out = codex.toViewerEntries([
+    responseItem({ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'x' }] }, '2026-08-26T12:34:56Z'),
+  ]);
+  assert.equal(out[0].timestamp, '2026-08-26T12:34:56Z');
+});
