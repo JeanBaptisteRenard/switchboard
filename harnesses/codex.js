@@ -132,6 +132,19 @@ function transcriptPath({ sessionFile }) {
 // said on their behalf.
 const INJECTED_RE = /^\s*<[a-z_]+>/;
 
+/**
+ * Is this rollout a sub-agent thread rather than a conversation the user had?
+ *
+ * Any one of these is conclusive; they do not all appear together, and older
+ * rollouts carry none of them (correctly, since multi-agent postdates them).
+ */
+function isSubagentMeta(payload) {
+  return payload.thread_source === 'subagent'
+    || !!payload.parent_thread_id
+    || !!payload.agent_path
+    || !!payload.agent_nickname;
+}
+
 function messageText(payload) {
   const content = payload?.content;
   if (typeof content === 'string') return content;
@@ -178,6 +191,13 @@ function readSessionFile(filePath, folder) {
       if (!payload) continue;
 
       if (entry.type === 'session_meta') {
+        // Sub-agent threads are recorded as ordinary rollouts, but codex refuses
+        // to resume one directly ("cannot resume an unloaded multi-agent v2
+        // sub-agent through its parent"). Showing them would mean offering a
+        // resume that always fails. Claude's subagent transcripts are already
+        // excluded — they live in a subagents/ subdirectory the indexer never
+        // scans — so this keeps the two consistent.
+        if (isSubagentMeta(payload)) return null;
         projectPath = projectPath || payload.cwd || null;
         continue;
       }
@@ -216,10 +236,63 @@ function readSessionFile(filePath, folder) {
   }
 }
 
+// --- Launch ---
+
+const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
+const APPROVAL_POLICIES = new Set(['on-request', 'never']);
+
+/**
+ * Argv for the codex binary.
+ *
+ * `codex resume <id>` accepts the same flags as a fresh launch, so the option
+ * mapping is shared. Claude-only keys in the options bag (permissionMode,
+ * worktree, chrome, appendSystemPrompt) are ignored rather than translated —
+ * codex has no equivalent, and passing an unknown flag fails the launch.
+ *
+ * Enumerated values are checked against what the CLI accepts instead of being
+ * interpolated blind: these come from stored settings, which can outlive the
+ * codex version that understood them.
+ */
+function buildLaunchArgs({ sessionId, isNew, options }) {
+  const args = [];
+  if (options?.forkFrom) {
+    args.push('fork', String(options.forkFrom));
+  } else if (!isNew) {
+    args.push('resume', String(sessionId));
+  }
+  // A new session takes no subcommand — and no id, because codex will not let
+  // one be pre-assigned. See harnesses/codex.js header and the detection step.
+
+  if (options) {
+    if (options.dangerouslySkipPermissions) {
+      args.push('--dangerously-bypass-approvals-and-sandbox');
+    } else {
+      if (SANDBOX_MODES.has(options.codexSandbox)) {
+        args.push('--sandbox', options.codexSandbox);
+      }
+      if (APPROVAL_POLICIES.has(options.codexApproval)) {
+        args.push('--ask-for-approval', options.codexApproval);
+      }
+    }
+    if (options.codexModel) {
+      args.push('--model', String(options.codexModel));
+    }
+    if (options.addDirs) {
+      const dirs = String(options.addDirs).split(',').map(d => d.trim()).filter(Boolean);
+      for (const dir of dirs) {
+        args.push('--add-dir', dir);
+      }
+    }
+  }
+
+  return args;
+}
+
 module.exports = {
   id, label, binary, folderPrefix, groupsByProject,
+  buildLaunchArgs,
   available, codexHome, sessionsRoot, listFolders, folderPath, folderForProject,
-  listTranscripts, sessionIdFromPath, transcriptPath,
+  listTranscripts, sessionIdFromPath, transcriptPath, isSubagentMeta,
   deriveProjectPath,
   readSessionFile,
 };

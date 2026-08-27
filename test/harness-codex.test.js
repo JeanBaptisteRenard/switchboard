@@ -9,10 +9,10 @@ const codex = require('../harnesses/codex');
 // A rollout in the shape codex actually writes. Both event families are present
 // because real transcripts carry both: `response_item` messages hold the text,
 // and older codex versions ALSO emit `event_msg` copies of the same turns.
-function rollout({ id, cwd, turns }) {
+function rollout({ id, cwd, turns, meta }) {
   const lines = [
     { timestamp: '2026-08-26T10:00:00.000Z', type: 'session_meta',
-      payload: { session_id: 'lineage-root', id: 'lineage-root', cwd, cli_version: '0.149.1' } },
+      payload: { session_id: 'lineage-root', id: 'lineage-root', cwd, cli_version: '0.149.1', ...meta } },
     { timestamp: '2026-08-26T10:00:00.100Z', type: 'event_msg',
       payload: { type: 'task_started', turn_id: 't1' } },
     { timestamp: '2026-08-26T10:00:01.000Z', type: 'response_item',
@@ -158,4 +158,119 @@ test('CODEX_HOME relocates the sessions root', () => {
   } finally {
     if (prev === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev;
   }
+});
+
+// --- launch ---
+
+test('resuming names the session id as a subcommand argument', () => {
+  assert.deepEqual(
+    codex.buildLaunchArgs({ sessionId: ID, isNew: false, options: {} }),
+    ['resume', ID]
+  );
+});
+
+test('forking uses the fork subcommand against the source session', () => {
+  assert.deepEqual(
+    codex.buildLaunchArgs({ sessionId: 'new', isNew: true, options: { forkFrom: ID } }),
+    ['fork', ID]
+  );
+});
+
+test('a new session passes no id — codex will not accept a pre-assigned one', () => {
+  assert.deepEqual(codex.buildLaunchArgs({ sessionId: ID, isNew: true, options: {} }), []);
+});
+
+test("Claude-only options are ignored, not translated", () => {
+  // These reach every harness because the renderer sends one options bag. codex
+  // has no equivalent flags, and an unknown flag would fail the launch outright.
+  const args = codex.buildLaunchArgs({
+    sessionId: ID, isNew: false,
+    options: { permissionMode: 'plan', worktree: true, worktreeName: 'wt', chrome: true,
+      appendSystemPrompt: 'hi', mcpEmulation: true },
+  });
+  assert.deepEqual(args, ['resume', ID]);
+});
+
+test('enumerated options are validated against what the CLI accepts', () => {
+  // Stored settings outlive the codex version that understood them, and they
+  // reach a shell command line — neither a stale nor a hostile value may pass.
+  for (const bad of ['--dangerously-bypass-approvals-and-sandbox', 'full-access', '', null, 'x; rm -rf /']) {
+    assert.deepEqual(
+      codex.buildLaunchArgs({ sessionId: ID, isNew: false, options: { codexSandbox: bad, codexApproval: bad } }),
+      ['resume', ID], String(bad)
+    );
+  }
+  assert.deepEqual(
+    codex.buildLaunchArgs({ sessionId: ID, isNew: false,
+      options: { codexSandbox: 'workspace-write', codexApproval: 'never' } }),
+    ['resume', ID, '--sandbox', 'workspace-write', '--ask-for-approval', 'never']
+  );
+});
+
+test('skipping permissions replaces the sandbox and approval flags', () => {
+  // Passing both a bypass and a sandbox policy is contradictory.
+  const args = codex.buildLaunchArgs({
+    sessionId: ID, isNew: false,
+    options: { dangerouslySkipPermissions: true, codexSandbox: 'read-only', codexApproval: 'never' },
+  });
+  assert.deepEqual(args, ['resume', ID, '--dangerously-bypass-approvals-and-sandbox']);
+});
+
+test('addDirs splits and trims the same way Claude does', () => {
+  assert.deepEqual(
+    codex.buildLaunchArgs({ sessionId: ID, isNew: false, options: { addDirs: ' /one , , /two ' } }),
+    ['resume', ID, '--add-dir', '/one', '--add-dir', '/two']
+  );
+});
+
+test('every flag codex is launched with is one the CLI declares', () => {
+  // Guards against a flag being invented here that codex does not have.
+  const KNOWN = new Set(['--sandbox', '--ask-for-approval', '--model', '--add-dir',
+    '--dangerously-bypass-approvals-and-sandbox']);
+  const args = codex.buildLaunchArgs({
+    sessionId: ID, isNew: false,
+    options: { codexSandbox: 'read-only', codexApproval: 'on-request', codexModel: 'gpt-5', addDirs: '/x' },
+  });
+  for (const a of args) {
+    if (a.startsWith('--')) assert.ok(KNOWN.has(a), `unknown flag ${a}`);
+  }
+});
+
+// --- sub-agent threads ---
+//
+// codex records sub-agent threads as ordinary rollouts, but refuses to resume
+// one: "cannot resume an unloaded multi-agent v2 sub-agent through its parent".
+// Indexing them would put rows in the sidebar whose only action always fails.
+
+test('a sub-agent rollout is not indexed, however it is marked', () => {
+  const markers = [
+    { thread_source: 'subagent' },
+    { parent_thread_id: '01a03d4c-b489-7181-b611-9e3f161866a0' },
+    { agent_path: '/root/researcher' },
+    { agent_nickname: 'Feynman' },
+  ];
+  for (const meta of markers) {
+    withFixture({ [NAME]: rollout({ cwd: '/p', turns: [['user', 'hi']], meta }) }, (dir) => {
+      assert.equal(codex.readSessionFile(path.join(dir, NAME), 'f'), null, JSON.stringify(meta));
+    });
+  }
+});
+
+test('a top-level session is still indexed when the markers are absent', () => {
+  // thread_source is missing entirely on older rollouts, and 'user' on new ones.
+  for (const meta of [{}, { thread_source: 'user' }]) {
+    withFixture({ [NAME]: rollout({ cwd: '/p', turns: [['user', 'hi']], meta }) }, (dir) => {
+      const s = codex.readSessionFile(path.join(dir, NAME), 'f');
+      assert.ok(s, JSON.stringify(meta));
+      assert.equal(s.sessionId, ID);
+    });
+  }
+});
+
+test('a fork is a real session — forked_from_id alone is not a sub-agent marker', () => {
+  withFixture({ [NAME]: rollout({
+    cwd: '/p', turns: [['user', 'hi']], meta: { forked_from_id: 'some-parent' },
+  }) }, (dir) => {
+    assert.ok(codex.readSessionFile(path.join(dir, NAME), 'f'));
+  });
 });

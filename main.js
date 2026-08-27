@@ -840,6 +840,12 @@ const SETTING_DEFAULTS = {
   terminalTheme: 'switchboard',
   mcpEmulation: false,
   shellProfile: 'auto',
+  // Codex equivalents of the permission settings above. Kept separate because
+  // the vocabularies do not map: codex has no permission modes, and Claude has
+  // no sandbox policy. An empty value means "leave it to codex's own config".
+  codexSandbox: '',
+  codexApproval: '',
+  codexModel: '',
 };
 
 ipcMain.handle('get-shell-profiles', () => {
@@ -969,6 +975,25 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
 
   const isPlainTerminal = sessionOptions?.type === 'terminal';
 
+  // Which CLI drives this session. The cached row is authoritative for anything
+  // that already exists on disk; the caller only gets to say for a brand-new
+  // session, which has no row yet.
+  const runtimeId = isPlainTerminal
+    ? null
+    : (getCachedSession(sessionId)?.runtime || sessionOptions?.runtime || DEFAULT_HARNESS);
+  const harness = runtimeId ? getHarness(runtimeId) : null;
+  const isClaudeSession = runtimeId === DEFAULT_HARNESS;
+
+  if (harness && !harness.buildLaunchArgs) {
+    return { ok: false, error: `${harness.label} sessions cannot be launched yet` };
+  }
+  if (harness && isNew && harness.id !== DEFAULT_HARNESS) {
+    // Codex will not accept a pre-assigned session id, so a new session has to
+    // be matched to its transcript after the fact. Until that lands, refuse
+    // rather than strand a row that can never be resumed.
+    return { ok: false, error: `new ${harness.label} sessions are not supported yet` };
+  }
+
   // Resolve shell profile from effective settings
   const effectiveProfileId = (() => {
     const global = getSetting('global') || {};
@@ -1000,7 +1025,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   let sessionSlug = null;
   let projectFolder = null;
 
-  if (!isPlainTerminal) {
+  if (isClaudeSession) {
     // Snapshot existing .jsonl files before spawning (for new session + fork/plan detection)
     projectFolder = encodeProjectPath(projectPath);
     const claudeProjectDir = path.join(PROJECTS_DIR, projectFolder);
@@ -1058,11 +1083,12 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     } else {
       // Argv is built by the harness and quoted here, so a value can never be
       // spliced into the command line as shell syntax.
-      const claudeArgs = claudeHarness.buildLaunchArgs({
+      const cliArgs = harness.buildLaunchArgs({
         sessionId, isNew, options: sessionOptions,
       });
 
-      let claudeCmd = claudeHarness.binary + ' ' + quoteArgvForShell(shell, claudeArgs);
+      let claudeCmd = harness.binary;
+      if (cliArgs.length) claudeCmd += ' ' + quoteArgvForShell(shell, cliArgs);
 
       // preLaunchCmd is raw shell by design (e.g. "aws-vault exec profile --") — block newlines only
       if (sessionOptions?.preLaunchCmd) {
@@ -1075,7 +1101,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
 
       // Start MCP server for this session so Claude CLI sends diffs/file opens to Switchboard
       // (skip if user disabled IDE emulation in global settings)
-      if (sessionOptions?.mcpEmulation !== false) {
+      if (isClaudeSession && sessionOptions?.mcpEmulation !== false) {
         try {
           mcpServer = await startMcpServer(sessionId, [projectPath], mainWindow, log);
           claudeCmd += ' --ide';
@@ -1114,7 +1140,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     outputBuffer: [], outputBufferSize: 0, altScreen: false,
     projectPath, firstResize: true,
     projectFolder, knownJsonlFiles, sessionSlug,
-    isPlainTerminal, forkFrom: sessionOptions?.forkFrom || null,
+    isPlainTerminal, runtime: runtimeId, forkFrom: sessionOptions?.forkFrom || null,
     mcpServer, _openedAt: Date.now(),
   };
   activeSessions.set(sessionId, session);

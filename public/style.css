@@ -3763,3 +3763,22 @@ body { display: flex; flex-direction: column; }
   margin-right: 5px;
   vertical-align: middle;
 }
+
+/* Runtime badge: marks sessions belonging to a CLI other than Claude. */
+.runtime-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 5px;
+  vertical-align: middle;
+  position: relative;
+  top: -1px;
+  opacity: 0.85;
+}
+
+.runtime-badge-codex {
+  color: #10a37f;
+}
+
+.session-item.is-codex .session-status-dot.running {
+  background: #10a37f;
+}

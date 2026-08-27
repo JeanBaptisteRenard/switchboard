@@ -665,6 +665,7 @@ function buildSessionItem(session) {
   item.className = 'session-item';
   item.id = 'si-' + session.sessionId;
   if (session.type === 'terminal') item.classList.add('is-terminal');
+  if (session.runtime && session.runtime !== 'claude') item.classList.add('is-' + session.runtime);
   if (session.archived) item.classList.add('archived-item');
   if (activePtyIds.has(session.sessionId)) item.classList.add('has-running-pty');
   if (attentionSessions.has(session.sessionId)) item.classList.add('needs-attention');
@@ -712,10 +713,19 @@ function buildSessionItem(session) {
   shortIdEl.textContent = session.sessionId.split('-')[0];
   metaEl.append(timeEl, shortIdEl);
 
+  // Which CLI this session belongs to. Claude is the unmarked default, so only
+  // the others carry a badge — otherwise every row in an all-Claude sidebar
+  // would gain noise for no information.
   if (session.type === 'terminal') {
     const badge = document.createElement('span');
     badge.className = 'terminal-badge';
     badge.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>';
+    summaryEl.prepend(badge);
+  } else if (session.runtime === 'codex') {
+    const badge = document.createElement('span');
+    badge.className = 'runtime-badge runtime-badge-codex';
+    badge.title = 'Codex session';
+    badge.innerHTML = ICONS.codex(14);
     summaryEl.prepend(badge);
   }
   info.appendChild(summaryEl);

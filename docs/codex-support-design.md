@@ -19,6 +19,7 @@ installed locally, not read from docs.
 | Pre-assign session id | `claude --session-id <uuid>` | **not possible** |
 | Resume | `claude --resume <id>` | `codex resume <id>` |
 | Fork | `claude --resume <id> --fork-session` | `codex fork <id>` |
+| Sub-agent transcripts | in a `subagents/` subdirectory | mixed in with the rest |
 | Transcript written at launch | yes | **no — only on the first turn** |
 | Resume writes | same file | same file (appends, id preserved) |
 
@@ -77,6 +78,26 @@ message — a launched-but-unused Codex session leaves no trace on disk at all.
 
 So a new Codex session must be **launched under a temporary id and promoted to
 its real id later**.
+
+### Sub-agent rollouts are not sessions
+
+Codex records sub-agent threads as ordinary rollout files, but refuses to resume
+one:
+
+```
+cannot resume an unloaded multi-agent v2 sub-agent through its parent;
+resume the parent first, or use thread/read to inspect it
+```
+
+They are marked in `session_meta` by any of `thread_source: 'subagent'`,
+`parent_thread_id`, `agent_path`, `agent_nickname` — not all together, and older
+rollouts carry none. `forked_from_id` is **not** one of them: a fork is a real
+session.
+
+The indexer skips them. Claude's subagent transcripts are already excluded (they
+live in a `subagents/` subdirectory the indexer never scans), so this keeps the
+two consistent, and it avoids sidebar rows whose only action always fails. Of 54
+rollouts here, 23 are dropped this way or for having no user turn, leaving 31.
 
 ### The handshake
 
@@ -245,8 +266,8 @@ dialog fields rather than reusing Claude's permission modes:
 |---|---|---|
 | permission | `--permission-mode <m>` | `--ask-for-approval on-request\|never` |
 | skip safety | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` |
+| model | — | `--model <m>` (`codexModel`) |
 | sandbox | — | `--sandbox read-only\|workspace-write\|danger-full-access` |
-| model | — | `--model <m>` |
 | extra dirs | `--add-dir` | `--add-dir` (same) |
 | pre-launch cmd | prepended | prepended (same) |
 | worktree | `--worktree` | not supported — hide the field |
@@ -307,7 +328,12 @@ Each step leaves the app working.
 3. **Codex indexer.** `harnesses/codex.js readSessionFile`, folder listing,
    watcher on `$CODEX_HOME/sessions`. Past Codex sessions appear, read-only.
 4. **Resume.** `codex resume <id>` from a sidebar click. This is the first
-   point the feature is useful.
+   point the feature is useful. `codex resume` accepts the same flags as a
+   fresh launch, so one option mapping covers both. Enumerated values are
+   validated against what the CLI accepts rather than interpolated — they come
+   from stored settings, which outlive the codex version that understood them.
+   The sidebar badge moves here from step 6: without it there is no way to tell
+   which row is which, so resume cannot be tested by hand.
 5. **New session + originator handshake.** Temp id, `session-detected`,
    the cwd/mtime fallback.
 6. **UI.** Agent picker in the popover, icon in the sidebar, Codex fields in

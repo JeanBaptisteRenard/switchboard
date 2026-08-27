@@ -825,7 +825,10 @@ async function openSession(session, customOptions) {
   const entry = createTerminalEntry(session);
 
   // Open terminal in main process
-  const resumeOptions = customOptions || await resolveDefaultSessionOptions({ projectPath });
+  const resumeOptions = { ...(customOptions || await resolveDefaultSessionOptions({ projectPath })) };
+  // Which CLI to resume with. Main re-reads this from the cached row and only
+  // trusts the hint for sessions it has never indexed.
+  if (session.runtime) resumeOptions.runtime = session.runtime;
   const result = await window.api.openTerminal(sessionId, projectPath, false, resumeOptions);
   if (!result.ok) {
     entry.terminal.write(`\r\nError: ${result.error}\r\n`);

@@ -20,6 +20,11 @@ async function resolveDefaultSessionOptions(project) {
   if (effective.preLaunchCmd) options.preLaunchCmd = effective.preLaunchCmd;
   if (effective.addDirs) options.addDirs = effective.addDirs;
   if (effective.mcpEmulation === false) options.mcpEmulation = false;
+  // Passed through for every session; each harness reads only the keys it
+  // understands and ignores the rest (see buildLaunchArgs).
+  if (effective.codexSandbox) options.codexSandbox = effective.codexSandbox;
+  if (effective.codexApproval) options.codexApproval = effective.codexApproval;
+  if (effective.codexModel) options.codexModel = effective.codexModel;
   return options;
 }
 
