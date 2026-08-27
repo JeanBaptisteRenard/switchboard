@@ -71,12 +71,14 @@
         <div class="settings-field">
           <div class="settings-field-info">
             <span class="settings-label">${escapeHtml(h.label)}</span>
-            <div class="settings-description">${h.available
+            <div class="settings-description">${h.installed
               ? `Scan for <code>${escapeHtml(h.id)}</code> sessions, show them, and offer it when starting one`
-              : 'Not installed on this machine'}</div>
+              : h.hasHistory
+                ? `Not on PATH \u2014 past <code>${escapeHtml(h.id)}</code> sessions are shown, but new ones cannot be started`
+                : 'Not installed on this machine'}</div>
           </div>
           <div class="settings-field-control">
-            <label class="settings-toggle"><input type="checkbox" class="sv-harness-toggle" data-harness="${escapeHtml(h.id)}" ${h.available ? '' : 'data-unavailable="1"'} ${h.enabled ? 'checked' : ''} ${h.available ? '' : 'disabled'}><span class="settings-toggle-slider"></span></label>
+            <label class="settings-toggle"><input type="checkbox" class="sv-harness-toggle" data-harness="${escapeHtml(h.id)}" ${(h.installed || h.hasHistory) ? '' : 'data-unavailable="1"'} ${h.enabled ? 'checked' : ''} ${(h.installed || h.hasHistory) ? '' : 'disabled'}><span class="settings-toggle-slider"></span></label>
           </div>
         </div>`).join('');
 

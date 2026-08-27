@@ -848,7 +848,7 @@ ipcMain.handle('set-setting', (_event, key, value) => {
     // way to start anything. The settings panel already prevents this; this is
     // the guard for any other writer. The id that was just switched off is the
     // one refused, which is what the UI does too.
-    const launchable = allHarnesses().filter(h => h.buildLaunchArgs && h.available()).map(h => h.id);
+    const launchable = allHarnesses().filter(h => h.buildLaunchArgs && h.installed()).map(h => h.id);
     const disabled = new Set(value.disabledHarnesses);
     if (launchable.length && launchable.every(id => disabled.has(id))) {
       const justAdded = launchable.filter(id => disabled.has(id) && !beforeSet.has(id));
@@ -936,7 +936,10 @@ ipcMain.handle('get-harnesses', () => {
     .map(h => ({
       id: h.id,
       label: h.label,
-      available: h.available(),
+      // Starting a session needs the binary; showing history only needs the
+      // transcripts. A CLI can have either without the other.
+      installed: h.installed(),
+      hasHistory: h.hasHistory(),
       enabled: !disabled.has(h.id),
     }));
 });

@@ -13,6 +13,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { onPath } = require('./on-path');
 const { encodeProjectPath } = require('../encode-project-path');
 
 const id = 'claude';
@@ -35,8 +36,26 @@ function sessionsRoot() {
   return path.join(os.homedir(), '.claude', 'projects');
 }
 
-function available() {
+/** Is the CLI itself runnable here? Governs whether a session can be started. */
+function installed() {
+  return onPath(binary);
+}
+
+/** Has it left transcripts behind? Governs whether there is history to index. */
+function hasHistory() {
   return fs.existsSync(sessionsRoot());
+}
+
+/**
+ * Relevant on this machine at all.
+ *
+ * Either half is enough: a freshly installed CLI has no transcript directory
+ * yet — keying only on that made it impossible to start the first session,
+ * since the directory does not appear until one has been run — and an
+ * uninstalled one still has history worth showing.
+ */
+function available() {
+  return installed() || hasHistory();
 }
 
 /** Folder keys under sessionsRoot(). For Claude these are encoded project paths. */
@@ -308,7 +327,7 @@ function buildLaunchArgs({ sessionId, isNew, options }) {
 
 module.exports = {
   id, label, binary, folderPrefix, groupsByProject,
-  available, sessionsRoot, listFolders, folderPath, folderForProject,
+  available, installed, hasHistory, sessionsRoot, listFolders, folderPath, folderForProject,
   listTranscripts, sessionIdFromPath, transcriptPath,
   deriveProjectPath,
   readSessionFile, toViewerEntries,

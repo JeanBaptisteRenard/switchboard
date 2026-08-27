@@ -13,6 +13,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { onPath } = require('./on-path');
 
 const id = 'codex';
 const label = 'Codex';
@@ -40,8 +41,26 @@ function sessionsRoot() {
   return path.join(codexHome(), 'sessions');
 }
 
-function available() {
+/** Is the CLI itself runnable here? Governs whether a session can be started. */
+function installed() {
+  return onPath(binary);
+}
+
+/** Has it left transcripts behind? Governs whether there is history to index. */
+function hasHistory() {
   return fs.existsSync(sessionsRoot());
+}
+
+/**
+ * Relevant on this machine at all.
+ *
+ * Either half is enough: a freshly installed CLI has no transcript directory
+ * yet — keying only on that made it impossible to start the first session,
+ * since the directory does not appear until one has been run — and an
+ * uninstalled one still has history worth showing.
+ */
+function available() {
+  return installed() || hasHistory();
 }
 
 function subdirs(dir) {
@@ -510,7 +529,7 @@ module.exports = {
   id, label, binary, folderPrefix, groupsByProject,
   parseTitleState, classifyNotification,
   buildLaunchArgs, launchEnv, originatorTag, readLaunchSignals, matchesLaunch,
-  available, codexHome, sessionsRoot, listFolders, folderPath, folderForProject,
+  available, installed, hasHistory, codexHome, sessionsRoot, listFolders, folderPath, folderForProject,
   listTranscripts, sessionIdFromPath, transcriptPath, isSubagentMeta,
   deriveProjectPath,
   readSessionFile, toViewerEntries,

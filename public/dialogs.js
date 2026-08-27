@@ -145,7 +145,8 @@ function showNewSessionPopover(project, anchorEl) {
   window.api.getHarnesses()
     .then(list => {
       // Only CLIs that are installed AND switched on can start a session.
-      const usable = (list || []).filter(h => h.available && h.enabled);
+      // History alone is not enough — there would be no binary to run.
+      const usable = (list || []).filter(h => h.installed && h.enabled);
       if (popover.isConnected && usable.length) render(usable);
     })
     .catch(() => {});
