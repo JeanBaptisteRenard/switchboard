@@ -210,6 +210,39 @@ function readSessionFile(filePath, folder, projectPath) {
   }
 }
 
+// --- Activity signalling ---
+
+// Claude marks a working session by prefixing its terminal title with a braille
+// spinner frame, and an idle one with U+2733.
+const SPINNER_MIN = 0x2800, SPINNER_MAX = 0x28FF;
+const IDLE_MARK = '\u2733'; // ✳
+
+/** What an OSC 0 title says about the session: 'busy', 'idle', or nothing. */
+function parseTitleState(title) {
+  const first = String(title || '').charAt(0);
+  if (!first) return null;
+  const code = first.charCodeAt(0);
+  if (code >= SPINNER_MIN && code <= SPINNER_MAX) return 'busy';
+  if (first === IDLE_MARK) return 'idle';
+  return null;
+}
+
+/**
+ * What an OSC 9 notification means.
+ *
+ * 'attention' — the session is blocked on the user
+ * 'idle'      — the turn finished and a response is waiting to be read
+ */
+function classifyNotification(message) {
+  const text = String(message || '');
+  // "Claude Code needs your attention", "…needs your approval for the plan",
+  // "Claude needs your permission to use {tool}", "…wants to enter plan mode"
+  if (/attention|approval|permission|needs your|wants to enter/i.test(text)) return 'attention';
+  // "Claude is waiting for your input" — a delayed idle notification
+  if (/waiting for your input/i.test(text)) return 'idle';
+  return null;
+}
+
 // --- Launch ---
 
 /**
@@ -268,5 +301,6 @@ module.exports = {
   listTranscripts, sessionIdFromPath, transcriptPath,
   deriveProjectPath,
   readSessionFile,
+  parseTitleState, classifyNotification,
   buildLaunchArgs,
 };

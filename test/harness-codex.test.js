@@ -162,28 +162,37 @@ test('CODEX_HOME relocates the sessions root', () => {
 
 // --- launch ---
 
+// Every launch carries the forced [tui] overrides that make activity visible
+// (see the activity tests below). They are asserted once, there; stripping them
+// here keeps these assertions exact about the part each test is describing.
+const FORCED_CONFIG = /^tui\.(notifications|notification_method|notification_condition|terminal_title)=/;
+
+function argsWithoutForcedConfig(over) {
+  const args = codex.buildLaunchArgs(over);
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-c' && FORCED_CONFIG.test(args[i + 1] || '')) { i++; continue; }
+    out.push(args[i]);
+  }
+  return out;
+}
+
 test('resuming names the session id as a subcommand argument', () => {
-  assert.deepEqual(
-    codex.buildLaunchArgs({ sessionId: ID, isNew: false, options: {} }),
-    ['resume', ID]
-  );
+  assert.deepEqual(argsWithoutForcedConfig({ sessionId: ID, isNew: false, options: {} }), ['resume', ID]);
 });
 
 test('forking uses the fork subcommand against the source session', () => {
-  assert.deepEqual(
-    codex.buildLaunchArgs({ sessionId: 'new', isNew: true, options: { forkFrom: ID } }),
-    ['fork', ID]
-  );
+  assert.deepEqual(argsWithoutForcedConfig({ sessionId: 'new', isNew: true, options: { forkFrom: ID } }), ['fork', ID]);
 });
 
 test('a new session passes no id — codex will not accept a pre-assigned one', () => {
-  assert.deepEqual(codex.buildLaunchArgs({ sessionId: ID, isNew: true, options: {} }), []);
+  assert.deepEqual(argsWithoutForcedConfig({ sessionId: ID, isNew: true, options: {} }), []);
 });
 
 test("Claude-only options are ignored, not translated", () => {
   // These reach every harness because the renderer sends one options bag. codex
   // has no equivalent flags, and an unknown flag would fail the launch outright.
-  const args = codex.buildLaunchArgs({
+  const args = argsWithoutForcedConfig({
     sessionId: ID, isNew: false,
     options: { permissionMode: 'plan', worktree: true, worktreeName: 'wt', chrome: true,
       appendSystemPrompt: 'hi', mcpEmulation: true },
@@ -196,12 +205,12 @@ test('enumerated options are validated against what the CLI accepts', () => {
   // reach a shell command line — neither a stale nor a hostile value may pass.
   for (const bad of ['--dangerously-bypass-approvals-and-sandbox', 'full-access', '', null, 'x; rm -rf /']) {
     assert.deepEqual(
-      codex.buildLaunchArgs({ sessionId: ID, isNew: false, options: { codexSandbox: bad, codexApproval: bad } }),
+      argsWithoutForcedConfig({ sessionId: ID, isNew: false, options: { codexSandbox: bad, codexApproval: bad } }),
       ['resume', ID], String(bad)
     );
   }
   assert.deepEqual(
-    codex.buildLaunchArgs({ sessionId: ID, isNew: false,
+    argsWithoutForcedConfig({ sessionId: ID, isNew: false,
       options: { codexSandbox: 'workspace-write', codexApproval: 'never' } }),
     ['resume', ID, '--sandbox', 'workspace-write', '--ask-for-approval', 'never']
   );
@@ -209,7 +218,7 @@ test('enumerated options are validated against what the CLI accepts', () => {
 
 test('skipping permissions replaces the sandbox and approval flags', () => {
   // Passing both a bypass and a sandbox policy is contradictory.
-  const args = codex.buildLaunchArgs({
+  const args = argsWithoutForcedConfig({
     sessionId: ID, isNew: false,
     options: { dangerouslySkipPermissions: true, codexSandbox: 'read-only', codexApproval: 'never' },
   });
@@ -218,7 +227,7 @@ test('skipping permissions replaces the sandbox and approval flags', () => {
 
 test('addDirs splits and trims the same way Claude does', () => {
   assert.deepEqual(
-    codex.buildLaunchArgs({ sessionId: ID, isNew: false, options: { addDirs: ' /one , , /two ' } }),
+    argsWithoutForcedConfig({ sessionId: ID, isNew: false, options: { addDirs: ' /one , , /two ' } }),
     ['resume', ID, '--add-dir', '/one', '--add-dir', '/two']
   );
 });
@@ -227,6 +236,7 @@ test('every flag codex is launched with is one the CLI declares', () => {
   // Guards against a flag being invented here that codex does not have.
   const KNOWN = new Set(['--sandbox', '--ask-for-approval', '--model', '--add-dir',
     '--dangerously-bypass-approvals-and-sandbox']);
+  // -c is codex's own config-override flag, verified against `codex resume --help`.
   const args = codex.buildLaunchArgs({
     sessionId: ID, isNew: false,
     options: { codexSandbox: 'read-only', codexApproval: 'on-request', codexModel: 'gpt-5', addDirs: '/x' },
@@ -373,4 +383,88 @@ test('a file whose first line is not session_meta is not a launch', () => {
   withFixture({ [NAME]: '{"type":"event_msg","payload":{"type":"task_started"}}\n' }, (dir) => {
     assert.equal(codex.readLaunchSignals(path.join(dir, NAME)), null);
   });
+});
+
+// --- activity signalling ---
+//
+// Switchboard shows a session as working, idle-with-a-response, or blocked on
+// the user. codex reports the first through its terminal title and the other
+// two through OSC 9, with different wording from Claude.
+
+test('a braille spinner in the title means the session is working', () => {
+  for (const frame of ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']) {
+    assert.equal(codex.parseTitleState(frame + ' myproject'), 'busy', frame);
+  }
+});
+
+test('"Action Required" in the title means the session is blocked on the user', () => {
+  // The signal the user sees. It must not depend on OSC 9, which only fires
+  // when the CLI's notifications are on — a session started before Switchboard
+  // began forcing them has none.
+  assert.equal(codex.parseTitleState('[ . ] Action Required | MyClaude'), 'attention');
+  assert.equal(codex.parseTitleState('[ ! ] Action Required | Open link'), 'attention');
+  assert.equal(codex.parseTitleState('[ ! ] action required'), 'attention');
+});
+
+test('the title is scanned whole, since its item order is configurable', () => {
+  // [tui].terminal_title is a user-configured list of items, so the spinner is
+  // not necessarily first. Reading only charAt(0) would call a working session
+  // idle for anyone who reordered it.
+  assert.equal(codex.parseTitleState('myproject ⠹'), 'busy');
+  assert.equal(codex.parseTitleState('main | myproject | [ . ] Action Required'), 'attention');
+});
+
+test('blocked beats working when a title somehow carries both', () => {
+  assert.equal(codex.parseTitleState('⠹ [ . ] Action Required'), 'attention');
+});
+
+test('a title without a spinner means idle — codex has no idle glyph', () => {
+  // Claude marks idle with ✳; codex just drops the prefix, so the absence of a
+  // spinner is the only signal. Reading it as "no information" would leave the
+  // session spinning in the sidebar forever.
+  assert.equal(codex.parseTitleState('myproject'), 'idle');
+  assert.equal(codex.parseTitleState('~/dev/api-service'), 'idle');
+});
+
+test('an empty title says nothing either way', () => {
+  assert.equal(codex.parseTitleState(''), null);
+  assert.equal(codex.parseTitleState(null), null);
+  assert.equal(codex.parseTitleState(undefined), null);
+});
+
+test('an approval request is what blocks a session on the user', () => {
+  assert.equal(codex.classifyNotification('Approval requested: /bin/zsh -lc "rm -rf x"'), 'attention');
+  assert.equal(codex.classifyNotification('approval requested: something'), 'attention');
+});
+
+test('any other notification is a finished turn', () => {
+  // codex sends the agent's final message when a turn completes, so the text is
+  // arbitrary — anything that is not an approval request means "come read this".
+  assert.equal(codex.classifyNotification('beta'), 'idle');
+  assert.equal(codex.classifyNotification('I fixed the parser and ran the tests.'), 'idle');
+  assert.equal(codex.classifyNotification(''), null);
+  assert.equal(codex.classifyNotification(null), null);
+});
+
+test('launching always turns codex notifications on', () => {
+  // No OSC 9 without them, and 'unfocused' would suppress exactly the case that
+  // matters — the user looking at a different session.
+  for (const opts of [{}, { forkFrom: 'x' }, { codexSandbox: 'read-only' }]) {
+    const args = codex.buildLaunchArgs({ sessionId: ID, isNew: false, options: opts });
+    const joined = args.join(' ');
+    assert.ok(joined.includes('tui.notifications=true'), joined);
+    assert.ok(joined.includes('tui.notification_method="osc9"'), joined);
+    assert.ok(joined.includes('tui.notification_condition="always"'), joined);
+    // Without pinning the item list, a user whose title omits `activity` would
+    // give Switchboard no way to see the session working or blocked.
+    assert.ok(joined.includes('tui.terminal_title=["activity","project-name"]'), joined);
+  }
+});
+
+test('the subcommand stays first, ahead of the config overrides', () => {
+  // `codex -c ... resume <id>` is not valid; the subcommand has to lead.
+  assert.equal(codex.buildLaunchArgs({ sessionId: ID, isNew: false, options: {} })[0], 'resume');
+  assert.equal(codex.buildLaunchArgs({ sessionId: ID, isNew: false, options: {} })[1], ID);
+  assert.equal(codex.buildLaunchArgs({ sessionId: 'n', isNew: true, options: { forkFrom: ID } })[0], 'fork');
+  assert.equal(codex.buildLaunchArgs({ sessionId: ID, isNew: true, options: {} })[0], '-c');
 });

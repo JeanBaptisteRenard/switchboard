@@ -69,8 +69,24 @@ function transcriptPath(row) {
   return getHarness(row.runtime).transcriptPath(row);
 }
 
+/**
+ * What an OSC 9;4 progress report means for a session's busy state.
+ *
+ * `4;1/2/3` start or update progress, `4;0` ends it. The catch is that `4;0`
+ * also arrives when nothing was running, and any child process in the PTY can
+ * emit these — so it only clears a busy state the terminal title does not
+ * currently contradict. The title comes from the CLI itself and is the more
+ * trustworthy signal; a subprocess's progress bar must never be able to report
+ * the CLI as idle while it is visibly working.
+ */
+function progressBusyState({ level, titleBusy }) {
+  if (level === '0') return titleBusy ? null : 'idle';
+  if (level === '1' || level === '2' || level === '3') return 'busy';
+  return null;
+}
+
 module.exports = {
-  HARNESSES, DEFAULT_HARNESS,
+  HARNESSES, DEFAULT_HARNESS, progressBusyState,
   getHarness, allHarnesses, availableHarnesses,
   harnessForFolder, transcriptPath,
 };

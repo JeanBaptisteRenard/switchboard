@@ -319,6 +319,58 @@ function matchesLaunch(signals, { tag, projectPath, spawnedAt }) {
   return Number.isFinite(started) && started >= spawnedAt - SPAWN_SKEW_MS;
 }
 
+// --- Activity signalling ---
+
+// codex builds its terminal title from a configurable list of items
+// ([tui].terminal_title). The one that matters is `activity`, documented in the
+// binary as "Spinner while working, action-required message while blocked" — a
+// braille spinner frame while a turn runs, and "[ ! ] Action Required" or
+// "[ . ] Action Required" while it is waiting on the user.
+//
+// The launch pins that list (see buildLaunchArgs) so the format is ours rather
+// than whatever the user configured. Even so, this scans the whole title
+// instead of just its first character: the item order is configurable, and a
+// title that is merely in an unexpected shape must not silently read as idle
+// and leave a blocked session looking finished.
+const SPINNER_MIN = 0x2800, SPINNER_MAX = 0x28FF;
+const ACTION_REQUIRED_RE = /action required/i;
+
+function hasSpinnerFrame(text) {
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    if (code >= SPINNER_MIN && code <= SPINNER_MAX) return true;
+  }
+  return false;
+}
+
+/**
+ * What an OSC 0 title says about the session.
+ *
+ * 'busy' | 'attention' | 'idle' | null. Unlike Claude there is no idle glyph —
+ * an idle title is just the project name — so anything that is neither working
+ * nor blocked is idle.
+ */
+function parseTitleState(title) {
+  const text = String(title || '');
+  if (!text) return null;
+  if (ACTION_REQUIRED_RE.test(text)) return 'attention';
+  if (hasSpinnerFrame(text)) return 'busy';
+  return 'idle';
+}
+
+/**
+ * What an OSC 9 notification means.
+ *
+ * codex sends exactly two kinds: "Approval requested: <command>" when it is
+ * blocked on the user, and the agent's final message when a turn completes.
+ */
+function classifyNotification(message) {
+  const text = String(message || '').trim();
+  if (!text) return null;
+  if (/^approval requested\b/i.test(text)) return 'attention';
+  return 'idle';
+}
+
 // --- Launch ---
 
 const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
@@ -337,11 +389,25 @@ const APPROVAL_POLICIES = new Set(['on-request', 'never']);
  * codex version that understood them.
  */
 function buildLaunchArgs({ sessionId, isNew, options }) {
-  const args = [];
+  // Switchboard needs OSC 9 to know when a session finishes a turn or blocks on
+  // the user, and codex only emits it when notifications are on. Forced for the
+  // same reason main.js forces TERM_PROGRAM=iTerm.app for Claude: the signal is
+  // what drives the sidebar, and 'unfocused' would suppress it. Passed as -c
+  // overrides so the user's own config.toml is untouched.
+  const args = [
+    '-c', 'tui.notifications=true',
+    '-c', 'tui.notification_method="osc9"',
+    '-c', 'tui.notification_condition="always"',
+    // Pin the title to [activity, project-name]. `activity` is the item that
+    // carries the spinner and the "Action Required" message, and the list is
+    // otherwise whatever the user configured — a title without it would leave
+    // Switchboard unable to see a session working or blocked at all.
+    '-c', 'tui.terminal_title=["activity","project-name"]',
+  ];
   if (options?.forkFrom) {
-    args.push('fork', String(options.forkFrom));
+    args.unshift('fork', String(options.forkFrom));
   } else if (!isNew) {
-    args.push('resume', String(sessionId));
+    args.unshift('resume', String(sessionId));
   }
   // A new session takes no subcommand — and no id, because codex will not let
   // one be pre-assigned. See harnesses/codex.js header and the detection step.
@@ -373,6 +439,7 @@ function buildLaunchArgs({ sessionId, isNew, options }) {
 
 module.exports = {
   id, label, binary, folderPrefix, groupsByProject,
+  parseTitleState, classifyNotification,
   buildLaunchArgs, launchEnv, originatorTag, readLaunchSignals, matchesLaunch,
   available, codexHome, sessionsRoot, listFolders, folderPath, folderForProject,
   listTranscripts, sessionIdFromPath, transcriptPath, isSubagentMeta,

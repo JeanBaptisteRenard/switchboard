@@ -151,3 +151,70 @@ test('an unprefixed folder key resolves to Claude', () => {
   assert.equal(harnessForFolder('-Users-me-proj').id, 'claude');
   assert.equal(harnessForFolder('').id, 'claude');
 });
+
+// --- activity signalling ---
+
+test('Claude reports working with a spinner and idle with U+2733', () => {
+  assert.equal(claude.parseTitleState('⠹ doing a thing'), 'busy');
+  assert.equal(claude.parseTitleState('✳ idle'), 'idle');
+});
+
+test('an ordinary Claude title is not read as idle', () => {
+  // Unlike codex, Claude sets plain titles that mean nothing about activity, so
+  // treating "not a spinner" as idle would end a busy state early.
+  assert.equal(claude.parseTitleState('my-project'), null);
+  assert.equal(claude.parseTitleState(''), null);
+});
+
+test('Claude notification wording maps to the two states', () => {
+  for (const m of [
+    'Claude Code needs your attention',
+    'Claude Code needs your approval for the plan',
+    'Claude needs your permission to use Bash',
+    'Claude Code wants to enter plan mode',
+  ]) assert.equal(claude.classifyNotification(m), 'attention', m);
+  assert.equal(claude.classifyNotification('Claude is waiting for your input'), 'idle');
+  assert.equal(claude.classifyNotification('some other message'), null);
+});
+
+test('every harness can report activity', () => {
+  for (const h of require('../harnesses').allHarnesses()) {
+    assert.equal(typeof h.parseTitleState, 'function', h.id);
+    assert.equal(typeof h.classifyNotification, 'function', h.id);
+  }
+});
+
+// --- OSC 9;4 progress ---
+//
+// Claude emits these when its `terminalProgressBarEnabled` setting is on
+// (default). A slash command produces `4;3;` then `4;0;` ~200ms later without
+// ever touching the title, so the busy state it raises can only be cleared by
+// honouring `4;0` — otherwise the session spins until Claude's "waiting for
+// your input" notice a full minute later.
+
+test('progress start marks a session busy', () => {
+  const { progressBusyState } = require('../harnesses');
+  for (const level of ['1', '2', '3']) {
+    assert.equal(progressBusyState({ level, titleBusy: false }), 'busy', level);
+  }
+});
+
+test('progress end clears busy when the title does not say otherwise', () => {
+  const { progressBusyState } = require('../harnesses');
+  assert.equal(progressBusyState({ level: '0', titleBusy: false }), 'idle');
+});
+
+test('progress end is ignored while the title shows a spinner', () => {
+  // Any child process in the PTY can emit 9;4. The title comes from the CLI
+  // itself, so a subprocess finishing its progress bar must not report the CLI
+  // as idle while it is visibly still working.
+  const { progressBusyState } = require('../harnesses');
+  assert.equal(progressBusyState({ level: '0', titleBusy: true }), null);
+});
+
+test('an unknown progress level changes nothing', () => {
+  const { progressBusyState } = require('../harnesses');
+  for (const level of ['9', '', undefined]) {
+    assert.equal(progressBusyState({ level, titleBusy: false }), null, String(level));
+  }
+});
