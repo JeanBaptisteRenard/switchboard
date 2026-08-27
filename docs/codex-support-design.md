@@ -360,9 +360,9 @@ So classification moves into the harness too, and main hands the renderer a
 busy at 7.5s, idle + `kind=idle` at 13.2s carrying the answer, `kind=attention`
 at 30.3s carrying the approval request.
 
-**JSONL viewer** needs a real Codex path, not a gate: map `user_message` /
-`agent_message` / `custom_tool_call` to the viewer's existing user / assistant /
-tool blocks. Worth doing in v1 — the "View messages" button is on every row.
+**JSONL viewer** has a real Codex path rather than a gate — see step 7. The
+mapping is exact enough that all 96 tool calls in a real rollout pair with their
+results, and the existing renderer needed no change.
 
 ---
 
@@ -389,7 +389,13 @@ Each step leaves the app working.
    so the temp id kept being re-injected as a phantom row — fixed alongside.
 6. **UI.** Agent picker in the popover, icon in the sidebar, Codex fields in
    the config dialog.
-7. **Fork + JSONL viewer.**
+7. **Fork + JSONL viewer.** A fork runs on the CLI that wrote the session it
+   forks, not the default — `codex fork` cannot continue a Claude transcript.
+   The viewer is fed by a per-harness `toViewerEntries`, so it never learns a
+   second transcript format: a codex tool call becomes a `tool_use` block, its
+   output a `tool_result` keyed by the same call id, and a reasoning summary a
+   `thinking` block. Claude's is identity. Normalising in main rather than the
+   renderer keeps the viewer ignorant of which CLI wrote the file.
 
 ### Tests worth writing
 
