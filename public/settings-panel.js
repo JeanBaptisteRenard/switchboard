@@ -64,6 +64,9 @@
     }
 
     const permModeValue = fieldValue('permissionMode', '');
+    const codexSandboxValue = fieldValue('codexSandbox', '');
+    const codexApprovalValue = fieldValue('codexApproval', '');
+    const codexModelValue = fieldValue('codexModel', '');
     const worktreeValue = fieldValue('worktree', false);
     const worktreeNameValue = fieldValue('worktreeName', '');
     const chromeValue = fieldValue('chrome', false);
@@ -151,6 +154,53 @@
           </div>
           <div class="settings-field-control">
             <input type="text" class="settings-input" id="sv-add-dirs" placeholder="/path/to/dir1, /path/to/dir2" value="${escapeHtml(addDirsValue)}" ${fieldDisabled('addDirs')}>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Codex CLI Options</div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <div class="settings-field-header">
+              <span class="settings-label">Sandbox</span>
+              ${useGlobalCheckbox('codexSandbox')}
+            </div>
+            <div class="settings-description">What <code>codex</code> is allowed to touch. Leave on Default to use codex's own config.</div>
+          </div>
+          <div class="settings-field-control">
+            <select class="settings-select" id="sv-codex-sandbox" ${fieldDisabled('codexSandbox')}>
+              ${CODEX_SANDBOX_MODES.map(m => `<option value="${m.value}" ${codexSandboxValue === m.value ? 'selected' : ''}>${escapeHtml(m.label)}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <div class="settings-field-header">
+              <span class="settings-label">Approval</span>
+              ${useGlobalCheckbox('codexApproval')}
+            </div>
+            <div class="settings-description">When codex stops to ask before running a command</div>
+          </div>
+          <div class="settings-field-control">
+            <select class="settings-select" id="sv-codex-approval" ${fieldDisabled('codexApproval')}>
+              ${CODEX_APPROVAL_POLICIES.map(m => `<option value="${m.value}" ${codexApprovalValue === m.value ? 'selected' : ''}>${escapeHtml(m.label)}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <div class="settings-field-header">
+              <span class="settings-label">Model</span>
+              ${useGlobalCheckbox('codexModel')}
+            </div>
+            <div class="settings-description">Passed as <code>--model</code>; blank uses codex's default</div>
+          </div>
+          <div class="settings-field-control">
+            <input type="text" class="settings-input" id="sv-codex-model" placeholder="default" value="${escapeHtml(codexModelValue)}" ${fieldDisabled('codexModel')} style="width:140px">
           </div>
         </div>
       </div>
@@ -267,6 +317,9 @@
           chrome: 'sv-chrome',
           preLaunchCmd: 'sv-pre-launch',
           addDirs: 'sv-add-dirs',
+          codexSandbox: 'sv-codex-sandbox',
+          codexApproval: 'sv-codex-approval',
+          codexModel: 'sv-codex-model',
         };
         const input = settingsViewerBody.querySelector('#' + fieldMap[field]);
         if (input) input.disabled = cb.checked;
@@ -289,6 +342,9 @@
               chrome: () => settingsViewerBody.querySelector('#sv-chrome').checked,
               preLaunchCmd: () => settingsViewerBody.querySelector('#sv-pre-launch').value.trim(),
               addDirs: () => settingsViewerBody.querySelector('#sv-add-dirs').value.trim(),
+              codexSandbox: () => settingsViewerBody.querySelector('#sv-codex-sandbox').value,
+              codexApproval: () => settingsViewerBody.querySelector('#sv-codex-approval').value,
+              codexModel: () => settingsViewerBody.querySelector('#sv-codex-model').value.trim(),
             };
             if (fieldMap[field]) settings[field] = fieldMap[field]();
           }
@@ -300,6 +356,9 @@
         settings.chrome = settingsViewerBody.querySelector('#sv-chrome').checked;
         settings.preLaunchCmd = settingsViewerBody.querySelector('#sv-pre-launch').value.trim();
         settings.addDirs = settingsViewerBody.querySelector('#sv-add-dirs').value.trim();
+        settings.codexSandbox = settingsViewerBody.querySelector('#sv-codex-sandbox').value;
+        settings.codexApproval = settingsViewerBody.querySelector('#sv-codex-approval').value;
+        settings.codexModel = settingsViewerBody.querySelector('#sv-codex-model').value.trim();
         settings.visibleSessionCount = parseInt(settingsViewerBody.querySelector('#sv-visible-count').value) || 10;
         settings.sessionMaxAgeDays = parseInt(settingsViewerBody.querySelector('#sv-max-age').value) || 3;
         settings.terminalTheme = settingsViewerBody.querySelector('#sv-terminal-theme').value || 'switchboard';

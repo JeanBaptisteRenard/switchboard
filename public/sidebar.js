@@ -687,9 +687,29 @@ function buildSessionItem(session) {
     ? '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M9.828.722a.5.5 0 0 1 .354.146l4.95 4.95a.5.5 0 0 1-.707.707c-.28-.28-.576-.49-.888-.656L10.073 9.333l-.07 3.181a.5.5 0 0 1-.853.354l-3.535-3.536-4.243 4.243a.5.5 0 1 1-.707-.707l4.243-4.243L1.372 5.11a.5.5 0 0 1 .354-.854l3.18-.07L8.37 .722A3.37 3.37 0 0 1 9.12.074a.5.5 0 0 1 .708.002l-.707.707z"/></svg>'
     : '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M9.828.722a.5.5 0 0 1 .354.146l4.95 4.95a.5.5 0 0 1-.707.707c-.28-.28-.576-.49-.888-.656L10.073 9.333l-.07 3.181a.5.5 0 0 1-.853.354l-3.535-3.536-4.243 4.243a.5.5 0 1 1-.707-.707l4.243-4.243L1.372 5.11a.5.5 0 0 1 .354-.854l3.18-.07L8.37 .722A3.37 3.37 0 0 1 9.12.074a.5.5 0 0 1 .708.002l-.707.707z"/></svg>';
 
-  // Running status dot
+  // Which CLI this session belongs to, and whether it is running — one mark in
+  // the gutter rather than a badge inline with the title, which pushed titles
+  // out of alignment with rows that had none. The dot keeps its own element so
+  // the busy/attention/response-ready states still drive it.
+  const mark = document.createElement('span');
+  mark.className = 'session-mark';
+
+  const markIcon = document.createElement('span');
+  markIcon.className = 'session-mark-icon';
+  if (session.type === 'terminal') {
+    markIcon.innerHTML = ICONS.terminal(14);
+    mark.title = 'Terminal session';
+  } else if (session.runtime === 'codex') {
+    markIcon.innerHTML = ICONS.codex(14);
+    mark.title = 'Codex session';
+  } else {
+    markIcon.innerHTML = ICONS.claude(14);
+    mark.title = 'Claude session';
+  }
+
   const dot = document.createElement('span');
   dot.className = 'session-status-dot' + (activePtyIds.has(session.sessionId) ? ' running' : '');
+  mark.append(markIcon, dot);
 
   // Info block
   const info = document.createElement('div');
@@ -713,21 +733,6 @@ function buildSessionItem(session) {
   shortIdEl.textContent = session.sessionId.split('-')[0];
   metaEl.append(timeEl, shortIdEl);
 
-  // Which CLI this session belongs to. Claude is the unmarked default, so only
-  // the others carry a badge — otherwise every row in an all-Claude sidebar
-  // would gain noise for no information.
-  if (session.type === 'terminal') {
-    const badge = document.createElement('span');
-    badge.className = 'terminal-badge';
-    badge.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>';
-    summaryEl.prepend(badge);
-  } else if (session.runtime === 'codex') {
-    const badge = document.createElement('span');
-    badge.className = 'runtime-badge runtime-badge-codex';
-    badge.title = 'Codex session';
-    badge.innerHTML = ICONS.codex(14);
-    summaryEl.prepend(badge);
-  }
   info.appendChild(summaryEl);
   info.appendChild(metaEl);
 
@@ -776,7 +781,7 @@ function buildSessionItem(session) {
   }
 
   row.appendChild(pin);
-  row.appendChild(dot);
+  row.appendChild(mark);
   row.appendChild(info);
   row.appendChild(actions);
   item.appendChild(row);
