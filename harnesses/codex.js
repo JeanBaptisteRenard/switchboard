@@ -236,6 +236,89 @@ function readSessionFile(filePath, folder) {
   }
 }
 
+// --- New-session detection ---
+//
+// codex will not accept a pre-assigned session id, and writes no transcript at
+// all until the first turn. So a new session is launched under a temporary id
+// and matched to its rollout afterwards.
+//
+// The handshake is CODEX_INTERNAL_ORIGINATOR_OVERRIDE, which codex copies
+// verbatim into session_meta.originator. That gives an exact match even when
+// several codex sessions start in the same directory at once.
+
+/**
+ * Env tag identifying a session we launched.
+ *
+ * Restricted to [a-z0-9_]: the value ends up in an HTTP header, and the binary
+ * carries an "ignoring invalid thread originator header value" path. The
+ * hyphens of a uuid are stripped rather than risk it.
+ */
+function originatorTag(tempId) {
+  return 'switchboard_' + String(tempId).replace(/[^a-zA-Z0-9]/g, '');
+}
+
+function launchEnv(tempId) {
+  return { CODEX_INTERNAL_ORIGINATOR_OVERRIDE: originatorTag(tempId) };
+}
+
+/**
+ * Read just enough of a rollout's first line to decide whether it is ours.
+ *
+ * Cheap on purpose — this runs for every file the watcher reports, including
+ * appends to large transcripts.
+ */
+function readLaunchSignals(filePath) {
+  let head;
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buf = Buffer.alloc(65536);
+      const bytes = fs.readSync(fd, buf, 0, buf.length, 0);
+      head = buf.toString('utf8', 0, bytes);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch { return null; }
+
+  const newline = head.indexOf('\n');
+  if (newline === -1) return null; // line 1 still being written
+  let entry;
+  try { entry = JSON.parse(head.slice(0, newline)); } catch { return null; }
+  if (!entry || entry.type !== 'session_meta') return null;
+
+  const payload = entry.payload || {};
+  return {
+    sessionId: sessionIdFromPath(filePath),
+    originator: payload.originator || null,
+    cwd: payload.cwd || null,
+    startedAt: payload.timestamp || entry.timestamp || null,
+    isSubagent: isSubagentMeta(payload),
+  };
+}
+
+// A rollout created slightly before the spawn timestamp is still plausibly ours:
+// clocks and the two timestamps involved are not the same source.
+const SPAWN_SKEW_MS = 5000;
+
+/**
+ * Does this rollout belong to a session we just launched?
+ *
+ * The originator match is exact and needs no other evidence. The fallback
+ * exists because the override is an internal variable that may stop working:
+ * same directory, created after we spawned. It deliberately refuses a rollout
+ * tagged for a DIFFERENT switchboard launch, which would otherwise be the one
+ * case where two concurrent new sessions could steal each other's transcript.
+ */
+function matchesLaunch(signals, { tag, projectPath, spawnedAt }) {
+  if (!signals || signals.isSubagent || !signals.sessionId) return false;
+  if (tag && signals.originator === tag) return true;
+  if (signals.originator && /^switchboard_/.test(signals.originator)) return false;
+  if (!projectPath || signals.cwd !== projectPath) return false;
+  if (!signals.startedAt) return false;
+  const started = Date.parse(signals.startedAt);
+  return Number.isFinite(started) && started >= spawnedAt - SPAWN_SKEW_MS;
+}
+
 // --- Launch ---
 
 const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
@@ -290,7 +373,7 @@ function buildLaunchArgs({ sessionId, isNew, options }) {
 
 module.exports = {
   id, label, binary, folderPrefix, groupsByProject,
-  buildLaunchArgs,
+  buildLaunchArgs, launchEnv, originatorTag, readLaunchSignals, matchesLaunch,
   available, codexHome, sessionsRoot, listFolders, folderPath, folderForProject,
   listTranscripts, sessionIdFromPath, transcriptPath, isSubagentMeta,
   deriveProjectPath,

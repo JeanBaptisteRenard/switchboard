@@ -120,12 +120,21 @@ Step 4 needs no new renderer code — `app.js:208 onSessionDetected` already
 re-keys `openSessions`, `activeSessionId`, and the header. It is currently dead
 code (nothing in main emits it). This revives it.
 
+The tag is `switchboard_<uuid with hyphens stripped>`. The charset matters: the
+value is forwarded as an HTTP header, and the binary carries an "ignoring
+invalid thread originator header value" path, so it is kept to `[a-z0-9_]`.
+
 **Fallback, required.** The env var is internal and may be removed. If no
-rollout matches the originator, fall back to: newest rollout whose `cwd` equals
-the session's `projectPath` and whose birthtime is after the spawn timestamp.
-That is what `session-transitions.js` already does for Claude forks, and it
-degrades to the same accuracy. Concurrent Codex sessions in one directory are
-the case it can get wrong, which is exactly why the originator match goes first.
+rollout matches the originator, fall back to: a rollout whose `cwd` equals the
+session's `projectPath`, started after the spawn (with a few seconds of clock
+skew allowed). It explicitly refuses a rollout tagged for a *different*
+switchboard launch, which is the one case two concurrent new sessions could
+steal each other's transcript.
+
+**Backstops.** The watcher is the fast path, but a dropped `fs.watch` event
+would strand a session under its temporary id forever, so `get-projects` also
+sweeps — only while something is actually waiting, and only over transcripts
+touched since the launch.
 
 ---
 
@@ -287,9 +296,15 @@ and only overrides defined values.
 `type === 'terminal'`. Same slot, driven by `session.runtime`: Claude glyph,
 Codex glyph, or the terminal glyph. Add `is-codex` next to `is-terminal`.
 
-**New-session popover.** `showNewSessionPopover` currently hardcodes three
-buttons. Generate the harness rows from `availableHarnesses()`, each with a plain
-and a "Configure…" variant, then the Terminal row.
+**New-session popover.** Rows are generated from a `get-harnesses` IPC rather
+than hardcoded, so a machine without codex installed simply never sees it. It
+renders Claude immediately and re-renders when main answers, so it never appears
+empty.
+
+**Config dialog.** Takes a runtime. Codex gets sandbox / approval / model;
+Claude keeps permission mode / worktree / Chrome. They are not translations of
+each other — showing Claude's controls for a codex session would offer settings
+that are silently dropped at launch.
 
 **Resume.** No UI change. `openSession` reads `session.runtime` from the row and
 main dispatches on it.
@@ -335,7 +350,9 @@ Each step leaves the app working.
    The sidebar badge moves here from step 6: without it there is no way to tell
    which row is which, so resume cannot be tested by hand.
 5. **New session + originator handshake.** Temp id, `session-detected`,
-   the cwd/mtime fallback.
+   the cwd/mtime fallback. `onSessionDetected` in the renderer already existed
+   but was dead code (nothing emitted it) and did not re-key `pendingSessions`,
+   so the temp id kept being re-injected as a phantom row — fixed alongside.
 6. **UI.** Agent picker in the popover, icon in the sidebar, Codex fields in
    the config dialog.
 7. **Fork + JSONL viewer.**

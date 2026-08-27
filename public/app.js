@@ -216,8 +216,22 @@ window.api.onSessionDetected((tempId, realId) => {
   openSessions.delete(tempId);
   openSessions.set(realId, entry);
 
+  // Re-key file panel state for the new session ID
+  if (typeof rekeyFilePanelState === 'function') rekeyFilePanelState(tempId, realId);
+
+  // Re-key the pending entry so the sidebar row survives until the DB has real
+  // data. Without this the temp id keeps being re-injected by loadProjects and
+  // the session appears twice.
+  const pendingEntry = pendingSessions.get(tempId);
+  pendingSessions.delete(tempId);
+  if (pendingEntry) {
+    pendingEntry.sessionId = realId;
+    pendingSessions.set(realId, pendingEntry);
+  }
+  sessionMap.delete(tempId);
+  sessionMap.set(realId, entry.session);
+
   terminalHeaderId.textContent = realId;
-  terminalHeaderName.textContent = 'New session';
 
   // Refresh sidebar to show the new session, then select it
   loadProjects().then(() => {
@@ -726,13 +740,18 @@ async function loadProjects({ resort = false } = {}) {
 
 
 async function launchNewSession(project, sessionOptions) {
+  // A temporary id. Claude is told to use it (--session-id); codex cannot be,
+  // so main watches for its transcript and sends session-detected with the real
+  // one, which re-keys everything below.
   const sessionId = crypto.randomUUID();
   const projectPath = project.projectPath;
+  const runtime = sessionOptions?.runtime || 'claude';
   const session = {
     sessionId,
     summary: 'New session',
     firstPrompt: '',
     projectPath,
+    runtime,
     name: null,
     starred: 0,
     archived: 0,

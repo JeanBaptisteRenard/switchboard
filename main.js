@@ -72,7 +72,8 @@ const {
   closeDb,
 } = require('./db');
 
-const { getHarness, DEFAULT_HARNESS, transcriptPath, availableHarnesses } = require('./harnesses');
+const { getHarness, DEFAULT_HARNESS, transcriptPath, availableHarnesses,
+        harnessForFolder: getHarnessForFolder } = require('./harnesses');
 const claudeHarness = getHarness(DEFAULT_HARNESS);
 const PROJECTS_DIR = claudeHarness.sessionsRoot();
 const PLANS_DIR = path.join(os.homedir(), '.claude', 'plans');
@@ -431,6 +432,10 @@ ipcMain.handle('get-projects', (_event, showArchived) => {
     // older build, so sessions/worktrees don't silently go missing. Stat-gated,
     // so it's cheap when nothing has changed.
     reconcileCacheFromFilesystem();
+    // Backstop for a dropped fs.watch event: a session waiting for its
+    // transcript would otherwise stay stuck under its temporary id. Only runs
+    // while something is actually waiting.
+    if (hasPendingLaunches()) sweepPendingLaunches();
     return buildProjectsFromCache(showArchived);
   } catch (err) {
     console.error('Error listing projects:', err);
@@ -848,6 +853,13 @@ const SETTING_DEFAULTS = {
   codexModel: '',
 };
 
+// --- IPC: harnesses --- (which CLIs can start a session on this machine)
+ipcMain.handle('get-harnesses', () => {
+  return availableHarnesses()
+    .filter(h => h.buildLaunchArgs)
+    .map(h => ({ id: h.id, label: h.label }));
+});
+
 ipcMain.handle('get-shell-profiles', () => {
   _shellProfiles = null; // refresh on each request
   return getShellProfiles();
@@ -987,12 +999,6 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   if (harness && !harness.buildLaunchArgs) {
     return { ok: false, error: `${harness.label} sessions cannot be launched yet` };
   }
-  if (harness && isNew && harness.id !== DEFAULT_HARNESS) {
-    // Codex will not accept a pre-assigned session id, so a new session has to
-    // be matched to its transcript after the fact. Until that lands, refuse
-    // rather than strand a row that can never be resumed.
-    return { ok: false, error: `new ${harness.label} sessions are not supported yet` };
-  }
 
   // Resolve shell profile from effective settings
   const effectiveProfileId = (() => {
@@ -1115,6 +1121,9 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         TERM: 'xterm-256color', COLORTERM: 'truecolor',
         TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
       };
+      // A harness that cannot be told its session id up front gets to stamp the
+      // environment instead, so its transcript can be recognised afterwards.
+      if (isNew && harness.launchEnv) Object.assign(ptyEnv, harness.launchEnv(sessionId));
       if (mcpServer) {
         ptyEnv.CLAUDE_CODE_SSE_PORT = String(mcpServer.port);
       }
@@ -1141,6 +1150,13 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     projectPath, firstResize: true,
     projectFolder, knownJsonlFiles, sessionSlug,
     isPlainTerminal, runtime: runtimeId, forkFrom: sessionOptions?.forkFrom || null,
+    // Set for a harness whose real session id only appears once its transcript
+    // does; cleared by resolvePendingLaunches when the transcript is matched.
+    pendingLaunch: (isNew && harness?.matchesLaunch) ? {
+      tag: harness.originatorTag(sessionId),
+      projectPath,
+      spawnedAt: Date.now(),
+    } : null,
     mcpServer, _openedAt: Date.now(),
   };
   activeSessions.set(sessionId, session);
@@ -1384,12 +1400,89 @@ function startProjectsWatcher() {
   }
 }
 
+/**
+ * Adopt a just-written transcript as the real identity of a pending session.
+ *
+ * A harness that cannot be told its session id up front (codex) is launched
+ * under a temporary uuid. When its transcript appears, the session is re-keyed
+ * onto the real id — everything downstream (terminal data, exit, the renderer's
+ * sidebar row) follows session.realSessionId, exactly as fork detection does.
+ */
+function resolvePendingLaunches(candidatePaths) {
+  for (const [tempId, session] of [...activeSessions]) {
+    if (session.exited || !session.pendingLaunch || session.realSessionId) continue;
+    const harness = getHarness(session.runtime);
+    if (!harness.matchesLaunch) continue;
+
+    for (const filePath of candidatePaths) {
+      const signals = harness.readLaunchSignals(filePath);
+      if (!harness.matchesLaunch(signals, session.pendingLaunch)) continue;
+      // Another live session already owns this transcript.
+      if (activeSessions.has(signals.sessionId)) continue;
+
+      const realId = signals.sessionId;
+      log.info(`[launch-detect] ${tempId} → ${realId} (originator=${signals.originator || 'none'})`);
+      session.realSessionId = realId;
+      session.pendingLaunch = null;
+      activeSessions.delete(tempId);
+      activeSessions.set(realId, session);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('session-detected', tempId, realId);
+      }
+      break;
+    }
+  }
+}
+
+/**
+ * Look through every folder a pending session could have landed in.
+ *
+ * Only the folders that changed since the launch are worth reading, which in
+ * practice is today's date directory.
+ */
+function sweepPendingLaunches() {
+  const roots = new Map(); // harness → earliest spawn time still waiting
+  for (const session of activeSessions.values()) {
+    if (session.exited || !session.pendingLaunch || session.realSessionId) continue;
+    const h = getHarness(session.runtime);
+    if (!h.matchesLaunch || !h.folderPrefix) continue;
+    const at = session.pendingLaunch.spawnedAt;
+    roots.set(h, Math.min(roots.get(h) ?? at, at));
+  }
+
+  for (const [h, since] of roots) {
+    const candidates = [];
+    for (const folder of h.listFolders()) {
+      const dir = h.folderPath(folder.slice(h.folderPrefix.length));
+      for (const filePath of h.listTranscripts(dir)) {
+        try {
+          if (fs.statSync(filePath).mtimeMs >= since - 60000) candidates.push(filePath);
+        } catch {}
+      }
+    }
+    resolvePendingLaunches(candidates);
+  }
+}
+
+/** Is any session still waiting for its transcript to appear? */
+function hasPendingLaunches() {
+  for (const session of activeSessions.values()) {
+    if (!session.exited && session.pendingLaunch && !session.realSessionId) return true;
+  }
+  return false;
+}
+
 // --- fs.watch on each non-Claude harness's sessions directory ---
 //
 // Separate from startProjectsWatcher because the path shape is different: a
 // Claude event names <project-folder>/<file>, a codex event names
 // <YYYY>/<MM>/<DD>/<file>. Both end up calling refreshFolder with a folder key.
 const harnessWatchers = [];
+
+function resolveHarnessFolderPath(folder) {
+  const h = getHarnessForFolder(folder);
+  return h.folderPath(h.folderPrefix ? folder.slice(h.folderPrefix.length) : folder);
+}
 
 function startHarnessWatchers() {
   for (const h of availableHarnesses()) {
@@ -1404,6 +1497,17 @@ function startHarnessWatchers() {
       debounceTimer = null;
       const folders = new Set(pendingFolders);
       pendingFolders.clear();
+
+      // Claim transcripts before indexing them, so the renderer learns the real
+      // session id in the same beat the row appears.
+      if (hasPendingLaunches()) {
+        const candidates = [];
+        for (const folder of folders) {
+          try { candidates.push(...h.listTranscripts(resolveHarnessFolderPath(folder))); } catch {}
+        }
+        resolvePendingLaunches(candidates);
+      }
+
       for (const folder of folders) {
         try { refreshFolder(folder); } catch (err) { log.error('[harness-watch]', folder, err.message); }
       }

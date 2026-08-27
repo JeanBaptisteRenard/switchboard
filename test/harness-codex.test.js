@@ -274,3 +274,103 @@ test('a fork is a real session — forked_from_id alone is not a sub-agent marke
     assert.ok(codex.readSessionFile(path.join(dir, NAME), 'f'));
   });
 });
+
+// --- new-session detection ---
+//
+// codex refuses a pre-assigned session id and writes nothing until the first
+// turn, so a new session is launched under a temporary uuid and matched to its
+// transcript afterwards.
+
+const TAG = codex.originatorTag('3f0c8a1e-1111-4222-8333-444455556666');
+
+test('the originator tag is safe to put in an HTTP header', () => {
+  // codex forwards this value as a header and drops it if it is malformed.
+  assert.match(TAG, /^switchboard_[a-z0-9]+$/);
+  assert.equal(codex.launchEnv('a-b-c').CODEX_INTERNAL_ORIGINATOR_OVERRIDE, 'switchboard_abc');
+});
+
+function signals(over = {}) {
+  return {
+    sessionId: ID, originator: TAG, cwd: '/Users/me/proj',
+    startedAt: '2026-08-26T10:00:00.000Z', isSubagent: false, ...over,
+  };
+}
+const AT = Date.parse('2026-08-26T10:00:00.000Z');
+
+test('an exact originator match needs no other evidence', () => {
+  // Different directory, launched later — the tag alone settles it.
+  assert.equal(codex.matchesLaunch(signals(), { tag: TAG, projectPath: '/elsewhere', spawnedAt: AT + 60000 }), true);
+});
+
+test('a transcript tagged for a different launch is never stolen', () => {
+  // Two new codex sessions starting in one directory at the same moment is the
+  // only case the cwd fallback could get wrong, so it refuses outright.
+  assert.equal(codex.matchesLaunch(
+    signals({ originator: 'switchboard_someoneelse' }),
+    { tag: TAG, projectPath: '/Users/me/proj', spawnedAt: AT }
+  ), false);
+});
+
+test('without the tag, a same-directory transcript started after the spawn matches', () => {
+  // The fallback for if CODEX_INTERNAL_ORIGINATOR_OVERRIDE ever stops working.
+  assert.equal(codex.matchesLaunch(
+    signals({ originator: 'codex_cli_rs' }),
+    { tag: TAG, projectPath: '/Users/me/proj', spawnedAt: AT }
+  ), true);
+});
+
+test('the fallback rejects another directory, or a transcript predating the launch', () => {
+  const base = { tag: TAG, projectPath: '/Users/me/proj', spawnedAt: AT };
+  assert.equal(codex.matchesLaunch(signals({ originator: 'x', cwd: '/other' }), base), false);
+  assert.equal(codex.matchesLaunch(
+    signals({ originator: 'x', startedAt: '2026-08-26T09:00:00.000Z' }), base), false);
+});
+
+test('a small clock skew does not lose the match', () => {
+  assert.equal(codex.matchesLaunch(
+    signals({ originator: 'x', startedAt: '2026-08-26T09:59:58.000Z' }),
+    { tag: TAG, projectPath: '/Users/me/proj', spawnedAt: AT }
+  ), true);
+});
+
+test('a sub-agent transcript is never adopted as a launch', () => {
+  assert.equal(codex.matchesLaunch(signals({ isSubagent: true }), { tag: TAG, projectPath: '/p', spawnedAt: AT }), false);
+});
+
+test('unusable signals never match', () => {
+  const c = { tag: TAG, projectPath: '/Users/me/proj', spawnedAt: AT };
+  assert.equal(codex.matchesLaunch(null, c), false);
+  assert.equal(codex.matchesLaunch(signals({ sessionId: null }), c), false);
+  assert.equal(codex.matchesLaunch(signals({ originator: 'x', startedAt: null }), c), false);
+});
+
+test('readLaunchSignals reads a real rollout head', () => {
+  withFixture({ [NAME]: rollout({
+    cwd: '/Users/me/proj', turns: [['user', 'hi']],
+    meta: { originator: TAG, timestamp: '2026-08-26T10:00:00.000Z' },
+  }) }, (dir) => {
+    const s = codex.readLaunchSignals(path.join(dir, NAME));
+    assert.equal(s.sessionId, ID);
+    assert.equal(s.originator, TAG);
+    assert.equal(s.cwd, '/Users/me/proj');
+    assert.equal(s.isSubagent, false);
+  });
+});
+
+test('a half-written first line yields nothing rather than a wrong match', () => {
+  // The watcher fires the moment the file is created; codex may still be
+  // writing session_meta. Returning null means "try again on the next event".
+  withFixture({ [NAME]: '{"type":"session_meta","payload":{"cwd":"/Users' }, (dir) => {
+    assert.equal(codex.readLaunchSignals(path.join(dir, NAME)), null);
+  });
+  withFixture({ [NAME]: '' }, (dir) => {
+    assert.equal(codex.readLaunchSignals(path.join(dir, NAME)), null);
+  });
+  assert.equal(codex.readLaunchSignals('/definitely/not/here.jsonl'), null);
+});
+
+test('a file whose first line is not session_meta is not a launch', () => {
+  withFixture({ [NAME]: '{"type":"event_msg","payload":{"type":"task_started"}}\n' }, (dir) => {
+    assert.equal(codex.readLaunchSignals(path.join(dir, NAME)), null);
+  });
+});
