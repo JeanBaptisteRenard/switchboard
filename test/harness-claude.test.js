@@ -231,3 +231,70 @@ test('every harness can feed the viewer', () => {
     assert.equal(typeof h.toViewerEntries, 'function', h.id);
   }
 });
+
+// --- fork id detection ---
+//
+// A fresh Claude session is told its id with --session-id, but --fork-session
+// makes Claude mint its own. So a fork is launched under a temporary id and
+// matched to its transcript afterwards, exactly as codex sessions are.
+
+test('only a fork needs its real id discovered', () => {
+  assert.equal(claude.needsIdDetection({ isNew: true, options: {} }), false);
+  assert.equal(claude.needsIdDetection({ isNew: false, options: {} }), false);
+  assert.equal(claude.needsIdDetection({ isNew: true, options: { forkFrom: 'p' } }), true);
+});
+
+const AT = Date.parse('2026-08-28T07:00:00Z');
+function forkSignals(over = {}) {
+  return { sessionId: 'new-id', forkedFrom: 'parent-id',
+    startedAt: '2026-08-28T07:00:01Z', cwd: '/p', isSubagent: false, ...over };
+}
+
+test('a fork is claimed by the parent it records', () => {
+  assert.equal(claude.matchesLaunch(forkSignals(), { forkFrom: 'parent-id', spawnedAt: AT }), true);
+  assert.equal(claude.matchesLaunch(forkSignals(), { forkFrom: 'other', spawnedAt: AT }), false);
+});
+
+test('an older fork of the same parent is not claimed', () => {
+  // Forking the same session twice must not hand the second launch the first
+  // one's transcript.
+  assert.equal(claude.matchesLaunch(
+    forkSignals({ startedAt: '2026-08-01T00:00:00Z' }), { forkFrom: 'parent-id', spawnedAt: AT }), false);
+});
+
+test('a small clock skew still matches', () => {
+  assert.equal(claude.matchesLaunch(
+    forkSignals({ startedAt: '2026-08-28T06:59:58Z' }), { forkFrom: 'parent-id', spawnedAt: AT }), true);
+});
+
+test('a transcript that is not a fork is never claimed', () => {
+  assert.equal(claude.matchesLaunch(forkSignals({ forkedFrom: null }), { forkFrom: 'parent-id', spawnedAt: AT }), false);
+  assert.equal(claude.matchesLaunch(null, { forkFrom: 'parent-id', spawnedAt: AT }), false);
+  // No fork in flight: nothing should match, whatever the transcript says.
+  assert.equal(claude.matchesLaunch(forkSignals(), { forkFrom: null, spawnedAt: AT }), false);
+});
+
+test('readLaunchSignals survives a truncated final line', () => {
+  const fs2 = require('fs'), os2 = require('os'), path2 = require('path');
+  const dir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'claude-fork-'));
+  try {
+    const file = path2.join(dir, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl');
+    fs2.writeFileSync(file, [
+      // A snapshot line first, which is what the head of a real fork looks like.
+      JSON.stringify({ type: 'file-history-snapshot', snapshot: 'x'.repeat(400) }),
+      JSON.stringify({ type: 'user', cwd: '/proj', timestamp: '2026-08-28T07:00:01Z',
+        forkedFrom: { sessionId: 'parent-id' }, message: { role: 'user', content: 'hi' } }),
+      '{"type":"assistant","mess',   // torn write, still being appended
+    ].join('\n') + '\n');
+    const sig = claude.readLaunchSignals(file);
+    assert.equal(sig.forkedFrom, 'parent-id');
+    assert.equal(sig.cwd, '/proj');
+    assert.equal(sig.sessionId, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  } finally {
+    fs2.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a missing file yields nothing rather than throwing', () => {
+  assert.equal(claude.readLaunchSignals('/definitely/not/here.jsonl'), null);
+});

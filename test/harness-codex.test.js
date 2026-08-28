@@ -620,3 +620,25 @@ test('onPath finds a real binary and rejects a made-up one', () => {
   assert.equal(onPath(''), false);
   assert.equal(onPath(undefined), false);
 });
+
+test('a codex fork is matched by its parent, not the inherited tag', () => {
+  // `codex fork` copies the originator from the thread it forks, so a fork we
+  // launched carries the tag of whichever launch created its PARENT. Matching
+  // on the tag there fails outright — this is the bug that left a forked
+  // session showing twice in the sidebar.
+  const parentsTag = codex.originatorTag('6cbe58fa-835d-4b02-8a9c-80cb425995bf');
+  const ourTag = codex.originatorTag('d1d86b61-17a7-404e-9633-d1b9feb032be');
+  const at = Date.parse('2026-08-28T07:44:57Z');
+  const sig = {
+    sessionId: '01a048d4-c2c6-74d1-af73-000000000000',
+    originator: parentsTag,
+    forkedFrom: '01a04413-6dfd-7a21-a862-2af7d8b02f33',
+    cwd: '/p', startedAt: '2026-08-28T07:44:58Z', isSubagent: false,
+  };
+  assert.notEqual(sig.originator, ourTag, 'the fork does not carry our tag');
+  assert.equal(codex.matchesLaunch(sig, { tag: ourTag, forkFrom: sig.forkedFrom, projectPath: '/p', spawnedAt: at }), true);
+  assert.equal(codex.matchesLaunch(sig, { tag: ourTag, forkFrom: 'a-different-parent', projectPath: '/p', spawnedAt: at }), false);
+  // And an existing fork of the same parent, from before this launch, is not taken.
+  assert.equal(codex.matchesLaunch({ ...sig, startedAt: '2026-08-01T00:00:00Z' },
+    { tag: ourTag, forkFrom: sig.forkedFrom, projectPath: '/p', spawnedAt: at }), false);
+});

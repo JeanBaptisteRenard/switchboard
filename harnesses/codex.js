@@ -335,6 +335,14 @@ function toViewerEntries(entries) {
 // several codex sessions start in the same directory at once.
 
 /**
+ * codex never accepts a pre-assigned id, so every new session — fresh or
+ * forked — has to be matched to its transcript afterwards.
+ */
+function needsIdDetection({ isNew }) {
+  return !!isNew;
+}
+
+/**
  * Env tag identifying a session we launched.
  *
  * Restricted to [a-z0-9_]: the value ends up in an HTTP header, and the binary
@@ -378,6 +386,8 @@ function readLaunchSignals(filePath) {
   return {
     sessionId: sessionIdFromPath(filePath),
     originator: payload.originator || null,
+    // Set when this rollout is a fork, naming the thread it came from.
+    forkedFrom: payload.forked_from_id || null,
     cwd: payload.cwd || null,
     startedAt: payload.timestamp || entry.timestamp || null,
     isSubagent: isSubagentMeta(payload),
@@ -388,23 +398,39 @@ function readLaunchSignals(filePath) {
 // clocks and the two timestamps involved are not the same source.
 const SPAWN_SKEW_MS = 5000;
 
-/**
- * Does this rollout belong to a session we just launched?
- *
- * The originator match is exact and needs no other evidence. The fallback
- * exists because the override is an internal variable that may stop working:
- * same directory, created after we spawned. It deliberately refuses a rollout
- * tagged for a DIFFERENT switchboard launch, which would otherwise be the one
- * case where two concurrent new sessions could steal each other's transcript.
- */
-function matchesLaunch(signals, { tag, projectPath, spawnedAt }) {
-  if (!signals || signals.isSubagent || !signals.sessionId) return false;
-  if (tag && signals.originator === tag) return true;
-  if (signals.originator && /^switchboard_/.test(signals.originator)) return false;
-  if (!projectPath || signals.cwd !== projectPath) return false;
+/** Was this rollout written after we spawned, allowing for clock skew? */
+function startedAfterSpawn(signals, spawnedAt) {
   if (!signals.startedAt) return false;
   const started = Date.parse(signals.startedAt);
   return Number.isFinite(started) && started >= spawnedAt - SPAWN_SKEW_MS;
+}
+
+/**
+ * Does this rollout belong to a session we just launched?
+ *
+ * A fork is matched by forked_from_id, NOT by the originator: `codex fork`
+ * copies the originator from the thread it forks, so a fork we started carries
+ * the tag of whichever launch created its parent. Matching on the tag there
+ * either fails or, worse, claims the wrong session.
+ *
+ * For a fresh session the originator tag is exact and needs no other evidence.
+ * The cwd fallback exists because the override is an internal variable that may
+ * stop working. It refuses a rollout tagged for a DIFFERENT switchboard launch,
+ * which is the one case two concurrent new sessions could steal each other's
+ * transcript — a fork is exempt because its inherited tag says nothing about
+ * which launch wrote it.
+ */
+function matchesLaunch(signals, { tag, forkFrom, projectPath, spawnedAt }) {
+  if (!signals || signals.isSubagent || !signals.sessionId) return false;
+
+  if (forkFrom) {
+    return signals.forkedFrom === forkFrom && startedAfterSpawn(signals, spawnedAt);
+  }
+
+  if (tag && signals.originator === tag) return true;
+  if (signals.originator && /^switchboard_/.test(signals.originator)) return false;
+  if (!projectPath || signals.cwd !== projectPath) return false;
+  return startedAfterSpawn(signals, spawnedAt);
 }
 
 // --- Activity signalling ---
@@ -528,7 +554,7 @@ function buildLaunchArgs({ sessionId, isNew, options }) {
 module.exports = {
   id, label, binary, folderPrefix, groupsByProject,
   parseTitleState, classifyNotification,
-  buildLaunchArgs, launchEnv, originatorTag, readLaunchSignals, matchesLaunch,
+  buildLaunchArgs, launchEnv, originatorTag, readLaunchSignals, matchesLaunch, needsIdDetection,
   available, installed, hasHistory, codexHome, sessionsRoot, listFolders, folderPath, folderForProject,
   listTranscripts, sessionIdFromPath, transcriptPath, isSubagentMeta,
   deriveProjectPath,

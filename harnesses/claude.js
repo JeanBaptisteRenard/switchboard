@@ -156,6 +156,81 @@ function deriveProjectPath(folderPath) {
   return null;
 }
 
+// --- New-session detection ---
+//
+// A fresh Claude session is told its id up front (--session-id), so nothing has
+// to be detected. A FORK is not: `--fork-session` makes Claude mint its own id,
+// so the session is launched under a temporary one and matched to the
+// transcript afterwards, exactly as codex sessions are.
+
+/** Only a fork needs its real id discovered; everything else pre-assigns one. */
+function needsIdDetection({ options }) {
+  return !!options?.forkFrom;
+}
+
+/**
+ * Read the head of a transcript for the signals that identify a fork.
+ *
+ * Reads a bounded chunk rather than the file: a fork's first lines can include
+ * file-history snapshots tens of kilobytes long, and this runs for every file
+ * the watcher reports.
+ */
+function readLaunchSignals(filePath) {
+  let head;
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buf = Buffer.alloc(524288);
+      const bytes = fs.readSync(fd, buf, 0, buf.length, 0);
+      head = buf.toString('utf8', 0, bytes);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch { return null; }
+
+  let forkedFrom = null;
+  let cwd = null;
+  let startedAt = null;
+  for (const line of head.split('\n')) {
+    if (!line) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; } // a truncated tail line
+    if (entry.type === 'file-history-snapshot') continue;
+    if (!forkedFrom && entry.forkedFrom?.sessionId) forkedFrom = entry.forkedFrom.sessionId;
+    if (!cwd && entry.cwd) cwd = entry.cwd;
+    if (!startedAt && entry.timestamp) startedAt = entry.timestamp;
+    if (entry.type === 'user' || entry.type === 'assistant') break;
+  }
+
+  return {
+    sessionId: sessionIdFromPath(filePath),
+    originator: null, // Claude has no equivalent of codex's originator tag
+    forkedFrom,
+    cwd,
+    startedAt,
+    isSubagent: false, // subagent transcripts live in a subdirectory we never scan
+  };
+}
+
+// A transcript written slightly before the spawn timestamp is still plausibly
+// ours: the two clocks are not the same source.
+const SPAWN_SKEW_MS = 5000;
+
+/**
+ * Does this transcript belong to the fork we just launched?
+ *
+ * Matched on the parent id it records, which is unambiguous — unlike a
+ * heuristic on file mtime, several forks of one parent stay distinguishable by
+ * the spawn time, and a pre-existing fork of the same parent is excluded.
+ */
+function matchesLaunch(signals, { forkFrom, spawnedAt }) {
+  if (!signals || !signals.sessionId || !forkFrom) return false;
+  if (signals.forkedFrom !== forkFrom) return false;
+  if (!signals.startedAt) return false;
+  const started = Date.parse(signals.startedAt);
+  return Number.isFinite(started) && started >= spawnedAt - SPAWN_SKEW_MS;
+}
+
 // --- Transcript parsing ---
 
 /** Parse a single .jsonl file into a session object (or null if invalid) */
@@ -331,6 +406,7 @@ module.exports = {
   listTranscripts, sessionIdFromPath, transcriptPath,
   deriveProjectPath,
   readSessionFile, toViewerEntries,
+  needsIdDetection, readLaunchSignals, matchesLaunch,
   parseTitleState, classifyNotification,
   buildLaunchArgs,
 };

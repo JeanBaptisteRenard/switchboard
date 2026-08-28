@@ -1243,8 +1243,11 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     isPlainTerminal, runtime: runtimeId, forkFrom: sessionOptions?.forkFrom || null,
     // Set for a harness whose real session id only appears once its transcript
     // does; cleared by resolvePendingLaunches when the transcript is matched.
-    pendingLaunch: (isNew && harness?.matchesLaunch) ? {
-      tag: harness.originatorTag(sessionId),
+    pendingLaunch: (harness?.needsIdDetection?.({ isNew, options: sessionOptions })) ? {
+      tag: harness.originatorTag ? harness.originatorTag(sessionId) : null,
+      // A fork is identified by its parent, not by our env tag — codex copies
+      // the originator from the thread being forked.
+      forkFrom: sessionOptions?.forkFrom || null,
       projectPath,
       spawnedAt: Date.now(),
     } : null,
@@ -1484,6 +1487,18 @@ function startProjectsWatcher() {
     const folders = new Set(pendingFolders);
     pendingFolders.clear();
 
+    // Claim a fork's transcript before indexing it, so the renderer learns the
+    // real id in the same beat the row appears. A Claude fork mints its own id
+    // (--fork-session ignores --session-id), so it needs this exactly as codex
+    // sessions do.
+    if (hasPendingLaunches()) {
+      const candidates = [];
+      for (const folder of folders) {
+        try { candidates.push(...claudeHarness.listTranscripts(path.join(PROJECTS_DIR, folder))); } catch {}
+      }
+      resolvePendingLaunches(candidates);
+    }
+
     let changed = false;
     for (const folder of folders) {
       const folderPath = path.join(PROJECTS_DIR, folder);
@@ -1577,15 +1592,18 @@ function sweepPendingLaunches() {
   for (const session of activeSessions.values()) {
     if (session.exited || !session.pendingLaunch || session.realSessionId) continue;
     const h = getHarness(session.runtime);
-    if (!h.matchesLaunch || !h.folderPrefix) continue;
+    if (!h.matchesLaunch) continue;
     const at = session.pendingLaunch.spawnedAt;
     roots.set(h, Math.min(roots.get(h) ?? at, at));
   }
 
   for (const [h, since] of roots) {
     const candidates = [];
-    for (const folder of h.listFolders()) {
-      const dir = h.folderPath(folder.slice(h.folderPrefix.length));
+    // Claude's folders live under the injected PROJECTS_DIR, not its own root.
+    const dirs = h.folderPrefix
+      ? h.listFolders().map(f => h.folderPath(f.slice(h.folderPrefix.length)))
+      : h.listFolders().map(f => path.join(PROJECTS_DIR, f));
+    for (const dir of dirs) {
       for (const filePath of h.listTranscripts(dir)) {
         try {
           if (fs.statSync(filePath).mtimeMs >= since - 60000) candidates.push(filePath);
