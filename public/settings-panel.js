@@ -71,11 +71,7 @@
         <div class="settings-field">
           <div class="settings-field-info">
             <span class="settings-label">${escapeHtml(h.label)}</span>
-            <div class="settings-description">${h.installed
-              ? `Scan for <code>${escapeHtml(h.id)}</code> sessions, show them, and offer it when starting one`
-              : h.hasHistory
-                ? `Not on PATH \u2014 past <code>${escapeHtml(h.id)}</code> sessions are shown, but starting one will fail`
-                : `Not installed \u2014 still offered when starting a session, which will fail until <code>${escapeHtml(h.id)}</code> is on PATH`}</div>
+            <div class="settings-description">Scan for <code>${escapeHtml(h.id)}</code> sessions, show them, and offer it when starting one</div>
           </div>
           <div class="settings-field-control">
             <label class="settings-toggle"><input type="checkbox" class="sv-harness-toggle" data-harness="${escapeHtml(h.id)}" ${h.enabled ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>

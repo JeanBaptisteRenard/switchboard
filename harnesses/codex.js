@@ -13,7 +13,6 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { onPath } = require('./on-path');
 
 const id = 'codex';
 const label = 'Codex';
@@ -41,26 +40,18 @@ function sessionsRoot() {
   return path.join(codexHome(), 'sessions');
 }
 
-/** Is the CLI itself runnable here? Governs whether a session can be started. */
-function installed() {
-  return onPath(binary);
-}
-
-/** Has it left transcripts behind? Governs whether there is history to index. */
-function hasHistory() {
-  return fs.existsSync(sessionsRoot());
-}
-
 /**
- * Relevant on this machine at all.
+ * Is there anything to index here?
  *
- * Either half is enough: a freshly installed CLI has no transcript directory
- * yet — keying only on that made it impossible to start the first session,
- * since the directory does not appear until one has been run — and an
- * uninstalled one still has history worth showing.
+ * Deliberately NOT a check for the binary on PATH: the packaged app inherits a
+ * minimal environment from the Dock, while sessions are launched through a
+ * login shell that sources the user's profile — so the main process's PATH is
+ * not the PATH a session actually runs under, and probing it reported every CLI
+ * as missing. Whether a CLI can be started is left to the launch itself, which
+ * surfaces the shell's own error.
  */
 function available() {
-  return installed() || hasHistory();
+  return fs.existsSync(sessionsRoot());
 }
 
 function subdirs(dir) {
@@ -555,7 +546,7 @@ module.exports = {
   id, label, binary, folderPrefix, groupsByProject,
   parseTitleState, classifyNotification,
   buildLaunchArgs, launchEnv, originatorTag, readLaunchSignals, matchesLaunch, needsIdDetection,
-  available, installed, hasHistory, codexHome, sessionsRoot, listFolders, folderPath, folderForProject,
+  available, codexHome, sessionsRoot, listFolders, folderPath, folderForProject,
   listTranscripts, sessionIdFromPath, transcriptPath, isSubagentMeta,
   deriveProjectPath,
   readSessionFile, toViewerEntries,

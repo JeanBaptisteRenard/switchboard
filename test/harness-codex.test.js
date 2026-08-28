@@ -566,60 +566,6 @@ test('timestamps are carried through for the viewer to show', () => {
   assert.equal(out[0].timestamp, '2026-08-26T12:34:56Z');
 });
 
-// --- install state ---
-//
-// "The CLI is installed" and "the CLI has left transcripts" are different
-// facts, and keying on the wrong one is what made a freshly installed codex
-// impossible to start from Switchboard: its sessions directory does not exist
-// until a session has been run, and a session could not be run because the
-// directory did not exist.
-
-const fsx = require('fs');
-const osx = require('os');
-
-function withCodexHome(setup, fn) {
-  const prev = process.env.CODEX_HOME;
-  const dir = fsx.mkdtempSync(path.join(osx.tmpdir(), 'codex-home-'));
-  try {
-    setup(dir);
-    process.env.CODEX_HOME = dir;
-    return fn(dir);
-  } finally {
-    if (prev === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev;
-    fsx.rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-test('a CLI that has never been run still counts as available', () => {
-  // The regression this guards: no sessions/ directory yet.
-  withCodexHome(dir => fsx.writeFileSync(path.join(dir, 'config.toml'), ''), () => {
-    assert.equal(codex.hasHistory(), false, 'no transcripts yet');
-    // available() must not depend on hasHistory alone.
-    assert.equal(codex.available(), codex.installed() || codex.hasHistory());
-  });
-});
-
-test('history alone makes a CLI available, even uninstalled', () => {
-  withCodexHome(dir => fsx.mkdirSync(path.join(dir, 'sessions'), { recursive: true }), () => {
-    assert.equal(codex.hasHistory(), true);
-    assert.equal(codex.available(), true, 'its past sessions are still worth showing');
-  });
-});
-
-test('nothing installed and nothing recorded is not available', () => {
-  withCodexHome(dir => fsx.rmSync(dir, { recursive: true, force: true }), () => {
-    assert.equal(codex.hasHistory(), false);
-    if (!codex.installed()) assert.equal(codex.available(), false);
-  });
-});
-
-test('onPath finds a real binary and rejects a made-up one', () => {
-  const { onPath } = require('../harnesses/on-path');
-  assert.equal(onPath(process.platform === 'win32' ? 'cmd' : 'sh'), true);
-  assert.equal(onPath('definitely-not-a-real-binary-xyz'), false);
-  assert.equal(onPath(''), false);
-  assert.equal(onPath(undefined), false);
-});
 
 test('a codex fork is matched by its parent, not the inherited tag', () => {
   // `codex fork` copies the originator from the thread it forks, so a fork we

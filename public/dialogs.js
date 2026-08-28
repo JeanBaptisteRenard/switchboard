@@ -100,9 +100,9 @@ function showNewSessionPopover(project, anchorEl) {
     return btn;
   }
 
-  // One pair of rows per CLI that can start a session here. Built from what main
-  // reports rather than hardcoded, so a machine without codex installed simply
-  // does not see it.
+  // One pair of rows per CLI, built from what main reports rather than
+  // hardcoded, so a CLI added later appears without a change here. Switching
+  // one off in settings is what takes it out of the list.
   function render(harnesses) {
     popover.replaceChildren();
     for (const h of harnesses) {
@@ -144,11 +144,10 @@ function showNewSessionPopover(project, anchorEl) {
   render([{ id: 'claude', label: 'Claude' }]);
   window.api.getHarnesses()
     .then(list => {
-      // Every switched-on CLI is offered, installed or not — the menu is how
-      // people find out Switchboard supports one at all. Picking a CLI that is
-      // not on PATH launches it anyway and shows the shell's "command not
-      // found" in the terminal, which says more than a hidden row would.
-      // Switching it off in settings takes it out of the list.
+      // Every switched-on CLI is offered. Whether its binary is actually
+      // installed is not something the main process can tell — sessions run
+      // through a login shell with a different PATH — so launching is what
+      // finds out, and the shell's own error lands in the terminal.
       const usable = (list || []).filter(h => h.enabled);
       if (popover.isConnected && usable.length) render(usable);
     })
