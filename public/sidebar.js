@@ -586,7 +586,10 @@ function rebindSidebarEvents(projects) {
     if (stopBtn) {
       stopBtn.onclick = (e) => {
         e.stopPropagation();
-        confirmAndStopSession(session.sessionId);
+        // Nothing to stop on a session that never started: the same control
+        // clears the row instead, which is otherwise unremovable.
+        if (isDismissibleSession(session.sessionId)) dismissSession(session.sessionId);
+        else confirmAndStopSession(session.sessionId);
       };
     }
 
@@ -741,9 +744,12 @@ function buildSessionItem(session) {
   actions.className = 'session-actions';
 
   const stopBtn = document.createElement('button');
-  stopBtn.className = 'session-stop-btn';
-  stopBtn.title = 'Stop session';
-  stopBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><rect x="2" y="2" width="8" height="8" rx="1"/></svg>';
+  const dismissible = typeof isDismissibleSession === 'function' && isDismissibleSession(session.sessionId);
+  stopBtn.className = 'session-stop-btn' + (dismissible ? ' session-dismiss-btn' : '');
+  stopBtn.title = dismissible ? 'Dismiss session' : 'Stop session';
+  stopBtn.innerHTML = dismissible
+    ? '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 3l6 6M9 3l-6 6"/></svg>'
+    : '<svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><rect x="2" y="2" width="8" height="8" rx="1"/></svg>';
 
   const archiveBtn = document.createElement('button');
   archiveBtn.className = 'session-archive-btn';

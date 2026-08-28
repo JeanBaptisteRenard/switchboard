@@ -539,6 +539,37 @@ searchInput.addEventListener('input', () => {
 });
 
 // --- Stop session helper ---
+/**
+ * A row for a session that never produced a transcript, and is not running.
+ *
+ * These exist so a session that died on launch can be relaunched or read, but
+ * nothing on disk backs them — so nothing else can ever clear them, and without
+ * a way out they sit in the sidebar for good.
+ */
+function isDismissibleSession(sessionId) {
+  return pendingSessions.has(sessionId) && !activePtyIds.has(sessionId);
+}
+
+/** Drop such a row. Purely renderer state, so it cannot come back. */
+function dismissSession(sessionId) {
+  pendingSessions.delete(sessionId);
+  sessionMap.delete(sessionId);
+  for (const projList of [cachedProjects, cachedAllProjects]) {
+    for (const proj of projList) {
+      proj.sessions = proj.sessions.filter(s => s.sessionId !== sessionId);
+    }
+  }
+  if (openSessions.has(sessionId)) destroySession(sessionId);
+  if (activeSessionId === sessionId) {
+    setActiveSession(null);
+    terminalHeader.style.display = 'none';
+    placeholder.style.display = '';
+  }
+  attentionSessions.delete(sessionId);
+  responseReadySessions.delete(sessionId);
+  refreshSidebar();
+}
+
 async function confirmAndStopSession(sessionId) {
   if (!confirm('Stop this session?')) return;
   await window.api.stopSession(sessionId);

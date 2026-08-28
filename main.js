@@ -1066,6 +1066,17 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
 
   const isPlainTerminal = sessionOptions?.type === 'terminal';
 
+  // A session that never wrote a transcript cannot be resumed — the CLI has no
+  // record of the id, and asking it to resume one produces an error the user
+  // can do nothing about ("No saved session found with ID ..."). Start it
+  // fresh instead, which is what re-opening a session that never got going
+  // means in practice.
+  let startFresh = isNew;
+  if (!isNew && !isPlainTerminal && !getCachedSession(sessionId)) {
+    log.info(`[open-terminal] ${sessionId} has no transcript; starting a new session instead of resuming`);
+    startFresh = true;
+  }
+
   // Which CLI drives this session. The cached row is authoritative for anything
   // that already exists on disk; the caller only gets to say for a brand-new
   // session, which has no row yet.
@@ -1123,7 +1134,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     }
 
     // Read slug from the session's jsonl file (for plan-accept detection)
-    if (!isNew) {
+    if (!startFresh) {
       try {
         const jsonlPath = path.join(claudeProjectDir, sessionId + '.jsonl');
         const head = fs.readFileSync(jsonlPath, 'utf8').slice(0, 8000);
@@ -1169,7 +1180,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       // Argv is built by the harness and quoted here, so a value can never be
       // spliced into the command line as shell syntax.
       const cliArgs = harness.buildLaunchArgs({
-        sessionId, isNew, options: sessionOptions,
+        sessionId, isNew: startFresh, options: sessionOptions,
       });
 
       let claudeCmd = harness.binary;
@@ -1202,7 +1213,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       };
       // A harness that cannot be told its session id up front gets to stamp the
       // environment instead, so its transcript can be recognised afterwards.
-      if (isNew && harness.launchEnv) Object.assign(ptyEnv, harness.launchEnv(sessionId));
+      if (startFresh && harness.launchEnv) Object.assign(ptyEnv, harness.launchEnv(sessionId));
       if (mcpServer) {
         ptyEnv.CLAUDE_CODE_SSE_PORT = String(mcpServer.port);
       }
@@ -1231,7 +1242,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     isPlainTerminal, runtime: runtimeId, forkFrom: sessionOptions?.forkFrom || null,
     // Set for a harness whose real session id only appears once its transcript
     // does; cleared by resolvePendingLaunches when the transcript is matched.
-    pendingLaunch: (harness?.needsIdDetection?.({ isNew, options: sessionOptions })) ? {
+    pendingLaunch: (harness?.needsIdDetection?.({ isNew: startFresh, options: sessionOptions })) ? {
       tag: harness.originatorTag ? harness.originatorTag(sessionId) : null,
       // A fork is identified by its parent, not by our env tag — codex copies
       // the originator from the thread being forked.

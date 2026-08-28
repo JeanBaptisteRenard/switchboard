@@ -3877,3 +3877,9 @@ body { display: flex; flex-direction: column; }
   text-align: right;
   opacity: 0.85;
 }
+
+/* A session that never started shows a dismiss cross where the stop square
+   would be — there is no process to stop, only a row to clear. */
+.session-dismiss-btn:hover {
+  color: #e5714d;
+}
