@@ -615,13 +615,36 @@ body { display: flex; flex-direction: column; }
   user-select: none;
   transition: all 0.15s;
   border-radius: 5px;
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   background: rgba(255,255,255,0.03);
 }
 
 .sessions-more-toggle:hover {
   color: #8088ff;
   background: rgba(120,130,255,0.08);
+}
+
+.sessions-older-archive-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin: -3px -6px -3px 0;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #7a7a90;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.sessions-older-archive-btn:hover {
+  color: #8088ff;
+  background: rgba(120,130,255,0.16);
 }
 
 /* ---- Slug groups ---- */

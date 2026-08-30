@@ -261,12 +261,28 @@ function renderProjects(projects, resort) {
       const moreBtn = document.createElement('div');
       moreBtn.className = 'sessions-more-toggle';
       moreBtn.id = 'older-' + fId;
-      moreBtn.textContent = `+ ${older.length} older`;
+
+      const moreLabel = document.createElement('span');
+      moreLabel.className = 'sessions-more-label';
+
+      const archiveOlderBtn = document.createElement('button');
+      archiveOlderBtn.className = 'sessions-older-archive-btn';
+      archiveOlderBtn.title = 'Archive all older sessions';
+      archiveOlderBtn.setAttribute('aria-label', 'Archive all older sessions');
+      archiveOlderBtn.innerHTML = ICONS.archive(14);
+
+      moreBtn.appendChild(moreLabel);
+      moreBtn.appendChild(archiveOlderBtn);
       const olderList = document.createElement('div');
       olderList.className = 'sessions-older';
       olderList.id = 'older-list-' + fId;
       olderList.style.display = 'none';
       for (const item of older) olderList.appendChild(item.element);
+      // An older render item can be a slug group containing several sessions.
+      // Count the actual unarchived session rows so this label matches the
+      // archive confirmation and the work the archive button will perform.
+      const olderSessionCount = olderList.querySelectorAll('.session-item:not(.archived-item)').length;
+      moreLabel.textContent = `+ ${olderSessionCount} older`;
       sessionsList.appendChild(moreBtn);
       sessionsList.appendChild(olderList);
     }
@@ -415,7 +431,8 @@ function renderProjects(projects, resort) {
       }
       if (fromEl.classList.contains('sessions-more-toggle') && fromEl.classList.contains('expanded')) {
         toEl.classList.add('expanded');
-        toEl.textContent = '- hide older';
+        const label = toEl.querySelector('.sessions-more-label');
+        if (label) label.textContent = '- hide older';
       }
       if (fromEl.classList.contains('slug-group-older') && fromEl.style.display !== 'none') {
         toEl.style.display = '';
@@ -551,13 +568,36 @@ function rebindSidebarEvents(projects) {
   sidebarContent.querySelectorAll('.sessions-more-toggle').forEach(moreBtn => {
     const olderList = moreBtn.nextElementSibling;
     if (!olderList || !olderList.classList.contains('sessions-older')) return;
-    const count = olderList.children.length;
-    moreBtn.onclick = () => {
+    const count = olderList.querySelectorAll('.session-item:not(.archived-item)').length;
+    const moreLabel = moreBtn.querySelector('.sessions-more-label');
+    moreBtn.onclick = (e) => {
+      if (e.target.closest('.sessions-older-archive-btn')) return;
       const showing = olderList.style.display !== 'none';
       olderList.style.display = showing ? 'none' : '';
       moreBtn.classList.toggle('expanded', !showing);
-      moreBtn.textContent = showing ? `+ ${count} older` : '- hide older';
+      if (moreLabel) moreLabel.textContent = showing ? `+ ${count} older` : '- hide older';
     };
+
+    const archiveOlderBtn = moreBtn.querySelector('.sessions-older-archive-btn');
+    if (archiveOlderBtn) {
+      archiveOlderBtn.onclick = async (e) => {
+        e.stopPropagation();
+        const sessions = [...olderList.querySelectorAll('.session-item')]
+          .map(item => sessionMap.get(item.dataset.sessionId))
+          .filter(session => session && !session.archived);
+        if (sessions.length === 0) return;
+        if (!confirm(`Archive all ${sessions.length} older session${sessions.length > 1 ? 's' : ''}?`)) return;
+        for (const session of sessions) {
+          if (activePtyIds.has(session.sessionId)) {
+            await window.api.stopSession(session.sessionId);
+          }
+          await window.api.archiveSession(session.sessionId, 1);
+          session.archived = 1;
+        }
+        pollActiveSessions();
+        loadProjects();
+      };
+    }
   });
 
   sidebarContent.querySelectorAll('.session-item').forEach(item => {
