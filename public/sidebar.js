@@ -310,6 +310,9 @@ function renderProjects(projects, resort) {
     const shortName = shortProjectPath(project.projectPath);
     header.innerHTML = `<span class="arrow">&#9660;</span> <span class="project-name">${shortName}</span>`;
 
+    const taskBtn = createProjectTaskButton(project);
+    if (taskBtn) header.appendChild(taskBtn);
+
     const scheduleBtn = document.createElement('button');
     scheduleBtn.className = 'project-schedule-btn';
     scheduleBtn.title = 'Create scheduled task';
@@ -373,6 +376,9 @@ function renderProjects(projects, resort) {
       wtHideBtn.title = 'Hide worktree';
       wtHideBtn.innerHTML = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
       wtHeader.appendChild(wtHideBtn);
+
+      const wtTaskBtn = createProjectTaskButton(wt, true);
+      if (wtTaskBtn) wtHeader.appendChild(wtTaskBtn);
 
       const wtNewBtn = document.createElement('button');
       wtNewBtn.className = 'project-new-btn worktree-new-btn';
@@ -470,6 +476,10 @@ function rebindSidebarEvents(projects) {
     if (newBtn) {
       newBtn.onclick = (e) => { e.stopPropagation(); showNewSessionPopover(project, newBtn); };
     }
+    const taskBtn = header.querySelector('.project-task-btn');
+    if (taskBtn) {
+      taskBtn.onclick = (e) => { e.stopPropagation(); showTaskPopover(project, taskBtn); };
+    }
     const scheduleBtn = header.querySelector('.project-schedule-btn');
     if (scheduleBtn) {
       scheduleBtn.onclick = (e) => { e.stopPropagation(); launchScheduleCreator(project); };
@@ -498,7 +508,7 @@ function rebindSidebarEvents(projects) {
       };
     }
     header.onclick = (e) => {
-      if (e.target.closest('.project-new-btn') || e.target.closest('.project-archive-btn') || e.target.closest('.project-settings-btn') || e.target.closest('.project-schedule-btn')) return;
+      if (e.target.closest('.project-new-btn') || e.target.closest('.project-archive-btn') || e.target.closest('.project-settings-btn') || e.target.closest('.project-schedule-btn') || e.target.closest('.project-task-btn')) return;
       header.classList.toggle('collapsed');
     };
   }
@@ -513,6 +523,10 @@ function rebindSidebarEvents(projects) {
     if (wtNewBtn) {
       wtNewBtn.onclick = (e) => { e.stopPropagation(); showNewSessionPopover(wtProject, wtNewBtn); };
     }
+    const wtTaskBtn = wtHeader.querySelector('.worktree-task-btn');
+    if (wtTaskBtn) {
+      wtTaskBtn.onclick = (e) => { e.stopPropagation(); showTaskPopover(wtProject, wtTaskBtn); };
+    }
     const wtHideBtn = wtHeader.querySelector('.worktree-hide-btn');
     if (wtHideBtn) {
       wtHideBtn.onclick = async (e) => {
@@ -524,7 +538,7 @@ function rebindSidebarEvents(projects) {
       };
     }
     wtHeader.onclick = (e) => {
-      if (e.target.closest('.worktree-new-btn') || e.target.closest('.worktree-hide-btn')) return;
+      if (e.target.closest('.worktree-new-btn') || e.target.closest('.worktree-hide-btn') || e.target.closest('.project-task-btn')) return;
       wtHeader.classList.toggle('collapsed');
     };
   });

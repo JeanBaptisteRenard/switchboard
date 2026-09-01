@@ -40,6 +40,13 @@ function makeFakeDb(metaMap, globalSettings = {}) {
       getSetting(key) { return key === 'global' ? globalSettings : {}; },
       getMeta() { return null; },
       setName() {},
+      updateCachedAiTitle(sessionId, aiTitle, runtime) {
+        const row = cachedRows.find(r => r.sessionId === sessionId && r.runtime === runtime);
+        if (!row) return 0;
+        row.aiTitle = aiTitle;
+        return 1;
+      },
+      updateSearchTitle() {},
     },
   };
 }
@@ -124,6 +131,44 @@ test('reconcile indexes codex date folders even though they have no folder proje
     });
     sessionCache.reconcileCacheFromFilesystem();
     assert.equal(second.indexedFolders.size, 0, 'up-to-date codex folder should be skipped');
+  } finally {
+    if (prevHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prevHome;
+    fs.rmSync(projectsDir, { recursive: true, force: true });
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('reconcile captures Codex auto-titles and rename changes without a transcript change', () => {
+  const projectsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-claude-'));
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-codex-'));
+  const prevHome = process.env.CODEX_HOME;
+  try {
+    process.env.CODEX_HOME = codexHome;
+    writeRollout(path.join(codexHome, 'sessions', '2026', '08', '26'), '/tmp/titled-project');
+    const indexPath = path.join(codexHome, 'session_index.jsonl');
+    fs.writeFileSync(indexPath, JSON.stringify({
+      id: '01a03f6c-fdf9-7c83-86e3-c388f81d765c',
+      thread_name: 'Automatic title', updated_at: '2026-08-26T10:01:00Z',
+    }) + '\n');
+
+    const fake = makeFakeDb(new Map());
+    sessionCache.init({
+      PROJECTS_DIR: projectsDir, activeSessions: new Map(),
+      getMainWindow: () => null, log: console, db: fake.db,
+    });
+
+    sessionCache.reconcileCacheFromFilesystem();
+    assert.equal(fake.cachedRows[0].aiTitle, 'Automatic title');
+
+    fs.appendFileSync(indexPath, JSON.stringify({
+      id: '01a03f6c-fdf9-7c83-86e3-c388f81d765c',
+      thread_name: 'Renamed in Codex', updated_at: '2026-08-26T10:02:00Z',
+    }) + '\n');
+    fake.indexedFolders.clear();
+
+    sessionCache.reconcileCacheFromFilesystem();
+    assert.equal(fake.indexedFolders.size, 0, 'the unchanged rollout stays behind the mtime gate');
+    assert.equal(fake.cachedRows[0].aiTitle, 'Renamed in Codex');
   } finally {
     if (prevHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prevHome;
     fs.rmSync(projectsDir, { recursive: true, force: true });

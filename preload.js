@@ -34,6 +34,14 @@ contextBridge.exposeInMainWorld('api', {
   runScheduleNow: (filePath) => ipcRenderer.invoke('run-schedule-now', filePath),
   getShellProfiles: () => ipcRenderer.invoke('get-shell-profiles'),
 
+  // Project/worktree tasks
+  listProjectTasks: (projectPath) => ipcRenderer.invoke('list-project-tasks', projectPath),
+  listTasksForProjects: (projectPaths) => ipcRenderer.invoke('list-tasks-for-projects', projectPaths),
+  getTaskRun: (projectPath, label) => ipcRenderer.invoke('get-task-run', projectPath, label),
+  startTask: (projectPath, label) => ipcRenderer.invoke('start-task', projectPath, label),
+  stopTask: (projectPath, label) => ipcRenderer.invoke('stop-task', projectPath, label),
+  restartTask: (projectPath, label) => ipcRenderer.invoke('restart-task', projectPath, label),
+
   browseFolder: () => ipcRenderer.invoke('browse-folder'),
   addProject: (projectPath) => ipcRenderer.invoke('add-project', projectPath),
   removeProject: (projectPath) => ipcRenderer.invoke('remove-project', projectPath),
@@ -44,6 +52,8 @@ contextBridge.exposeInMainWorld('api', {
   sendInput: (id, data) => ipcRenderer.send('terminal-input', id, data),
   resizeTerminal: (id, cols, rows) => ipcRenderer.send('terminal-resize', id, cols, rows),
   closeTerminal: (id) => ipcRenderer.send('close-terminal', id),
+  sendTaskInput: (projectPath, label, data) => ipcRenderer.send('task-input', projectPath, label, data),
+  resizeTask: (projectPath, label, cols, rows) => ipcRenderer.send('task-resize', projectPath, label, cols, rows),
 
   // Listeners (main → renderer)
   onTerminalData: (callback) => {
@@ -73,6 +83,15 @@ contextBridge.exposeInMainWorld('api', {
   },
   onStatusUpdate: (callback) => {
     ipcRenderer.on('status-update', (_event, text, type) => callback(text, type));
+  },
+  onTaskOutput: (callback) => {
+    ipcRenderer.on('task-output', (_event, projectPath, label, data) => callback(projectPath, label, data));
+  },
+  onTaskStateChanged: (callback) => {
+    ipcRenderer.on('task-state-changed', (_event, run) => callback(run));
+  },
+  onProjectTasksChanged: (callback) => {
+    ipcRenderer.on('project-tasks-changed', (_event, projectPath) => callback(projectPath));
   },
 
   // File drag-and-drop

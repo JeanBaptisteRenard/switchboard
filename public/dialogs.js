@@ -73,6 +73,7 @@ async function launchScheduleCreator(project) {
   const entry = createTerminalEntry(session);
   // Resume the pre-seeded session
   options.appendSystemPrompt = result.systemPrompt;
+  options.resumeExisting = true;
   const openResult = await window.api.openTerminal(result.sessionId, project.projectPath, false, options);
   if (!openResult.ok) {
     entry.terminal.write(`\r\nError: ${openResult.error}\r\n`);

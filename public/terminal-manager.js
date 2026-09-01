@@ -378,6 +378,7 @@ function destroySession(sessionId) {
 function showSession(sessionId) {
   const entry = openSessions.get(sessionId);
   const session = sessionMap.get(sessionId) || (entry && entry.session);
+  if (typeof leaveTaskLogView === 'function') leaveTaskLogView();
 
   // Update sidebar active state
   document.querySelectorAll('.session-item.active').forEach(el => el.classList.remove('active'));

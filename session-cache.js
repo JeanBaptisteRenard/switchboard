@@ -32,6 +32,7 @@ let PROJECTS_DIR, activeSessions, getMainWindow, log;
 let deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession;
 let deleteSearchFolder, deleteSearchSession, upsertSearchEntries;
 let setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName;
+let updateCachedAiTitle, updateSearchTitle;
 
 function init(ctx) {
   PROJECTS_DIR = ctx.PROJECTS_DIR;
@@ -53,6 +54,37 @@ function init(ctx) {
   getSetting = ctx.db.getSetting;
   getMeta = ctx.db.getMeta;
   setName = ctx.db.setName;
+  updateCachedAiTitle = ctx.db.updateCachedAiTitle;
+  updateSearchTitle = ctx.db.updateSearchTitle;
+}
+
+/**
+ * Pull titles stored outside transcripts into the shared cache.
+ *
+ * Codex writes automatic names and `/rename` changes to session_index.jsonl,
+ * not to a rollout. Keeping them in aiTitle preserves the established title
+ * precedence: a name set in Switchboard still wins, while Codex's latest title
+ * wins over the first-prompt summary.
+ */
+function refreshHarnessTitles(harness) {
+  if (!harness?.readSessionTitles || !updateCachedAiTitle) return 0;
+  const titles = harness.readSessionTitles();
+  if (!(titles instanceof Map)) return 0; // unreadable: retain the last good data
+
+  const metaMap = getAllMeta();
+  let changed = 0;
+  for (const row of getAllCached()) {
+    if ((row.runtime || DEFAULT_HARNESS) !== harness.id) continue;
+    const title = titles.get(row.sessionId) || null;
+    if ((row.aiTitle || null) === title) continue;
+
+    changed += updateCachedAiTitle(row.sessionId, title, harness.id);
+    if (updateSearchTitle) {
+      const displayTitle = metaMap.get(row.sessionId)?.name || title || '';
+      updateSearchTitle(row.sessionId, 'session', (displayTitle ? displayTitle + ' ' : '') + (row.summary || ''));
+    }
+  }
+  return changed;
 }
 
 /**
@@ -213,6 +245,13 @@ function reconcileCacheFromFilesystem() {
       // per-harness, a single bad directory aborted the whole pass.
       console.error('Error reconciling folder', folder, err);
     }
+  }
+
+  // Some harness metadata changes without touching a transcript. This remains
+  // necessary even when every folder above was skipped by the mtime gate.
+  const disabled = disabledHarnessIds();
+  for (const h of availableHarnesses()) {
+    if (!disabled.has(h.id)) refreshHarnessTitles(h);
   }
 }
 
@@ -438,4 +477,5 @@ module.exports = {
   notifyRendererProjectsChanged,
   sendStatus,
   populateCacheViaWorker,
+  refreshHarnessTitles,
 };

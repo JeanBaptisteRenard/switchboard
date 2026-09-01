@@ -24,6 +24,8 @@
 //   sessionIdFromPath(file)    transcript path → session id, without reading it
 //   transcriptPath(row)        cached row → absolute transcript path
 //   readSessionFile(file, folder, projectPath) → session row, or null
+//   titleIndexPath()           optional external title-index path
+//   readSessionTitles()        optional Map<sessionId, title> from that index
 //   buildLaunchArgs({ sessionId, isNew, options }) → argv after the binary
 
 const claude = require('./claude');

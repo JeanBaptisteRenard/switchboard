@@ -595,6 +595,7 @@ async function confirmAndStopSession(sessionId) {
 
 // --- Terminal header controls ---
 terminalStopBtn.addEventListener('click', () => {
+  if (activeTaskView) return;
   if (activeSessionId) confirmAndStopSession(activeSessionId);
 });
 
@@ -769,6 +770,7 @@ async function loadProjects({ resort = false } = {}) {
     }
   } catch {}
 
+  await hydrateProjectTasks([cachedProjects, cachedAllProjects]);
   await pollActiveSessions();
   refreshSidebar({ resort });
   renderDefaultStatus();
@@ -1123,9 +1125,10 @@ setTimeout(() => {
   }
 })();
 
-loadProjects().then(() => {
+loadProjects().then(async () => {
+  await restoreActiveTaskView();
   // Restore grid view preference before opening sessions so they enter grid mode
-  if (localStorage.getItem('gridViewActive') === '1') {
+  if (!activeTaskView && localStorage.getItem('gridViewActive') === '1') {
     showGridView();
   }
   // Restore active session after reload

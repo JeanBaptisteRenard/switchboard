@@ -41,6 +41,60 @@ function sessionsRoot() {
 }
 
 /**
+ * Codex keeps thread names outside the rollout transcript. Both its automatic
+ * title and a later `/rename` are appended here as { id, thread_name,
+ * updated_at } records, with the newest record for an id winning.
+ */
+function titleIndexPath() {
+  return path.join(codexHome(), 'session_index.jsonl');
+}
+
+let cachedTitleIndex = null;
+
+function readSessionTitles() {
+  const filePath = titleIndexPath();
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch (err) {
+    // A missing index is a valid empty state (for example before Codex has
+    // named its first thread). Other read errors must not erase cached titles.
+    if (err?.code === 'ENOENT') return new Map();
+    return null;
+  }
+
+  if (cachedTitleIndex
+      && cachedTitleIndex.filePath === filePath
+      && cachedTitleIndex.mtimeMs === stat.mtimeMs
+      && cachedTitleIndex.ctimeMs === stat.ctimeMs
+      && cachedTitleIndex.ino === stat.ino
+      && cachedTitleIndex.size === stat.size) {
+    return cachedTitleIndex.titles;
+  }
+
+  let body;
+  try { body = fs.readFileSync(filePath, 'utf8'); } catch { return null; }
+
+  const titles = new Map();
+  for (const line of body.split('\n')) {
+    if (!line.trim()) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (typeof entry?.id !== 'string' || typeof entry?.thread_name !== 'string') continue;
+    const title = entry.thread_name.trim();
+    // Keep an empty newest record too: it means the title was cleared and must
+    // supersede any older non-empty entry for the same id.
+    titles.set(entry.id, title || null);
+  }
+
+  cachedTitleIndex = {
+    filePath, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, ino: stat.ino,
+    size: stat.size, titles,
+  };
+  return titles;
+}
+
+/**
  * Is there anything to index here?
  *
  * Deliberately NOT a check for the binary on PATH: the packaged app inherits a
@@ -544,6 +598,7 @@ function buildLaunchArgs({ sessionId, isNew, options }) {
 
 module.exports = {
   id, label, binary, folderPrefix, groupsByProject,
+  titleIndexPath, readSessionTitles,
   parseTitleState, classifyNotification,
   buildLaunchArgs, launchEnv, originatorTag, readLaunchSignals, matchesLaunch, needsIdDetection,
   available, codexHome, sessionsRoot, listFolders, folderPath, folderForProject,

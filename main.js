@@ -28,12 +28,14 @@ try { require('electron-reloader')(module, { watchRenderer: true }); } catch {};
 // LC_CTYPE when the launch environment has no locale. See pty-env.js.
 const { buildPtyEnv } = require('./pty-env');
 const cleanPtyEnv = buildPtyEnv(process.env);
+const { shouldStartFresh } = require('./session-launch');
 
 // Shell profiles → shell-profiles.js
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgvForShell } = require('./shell-profiles');
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 const { listProjectDirectory, readProjectFile } = require('./project-files');
+const { createTaskManager } = require('./task-manager');
 
 
 // --- Auto-updater (only in packaged builds) ---
@@ -66,6 +68,7 @@ if (app.isPackaged || process.env.FORCE_UPDATER) {
 const {
   getMeta, getAllMeta, toggleStar, setName, setArchived,
   isCachePopulated, getAllCached, getCachedByFolder, getCachedSession, upsertCachedSessions,
+  updateCachedAiTitle,
   deleteCachedSession, deleteCachedFolder,
   getFolderMeta, getAllFolderMeta, setFolderMeta,
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
@@ -209,6 +212,7 @@ function createWindow() {
       }
       activeSessions.delete(id);
     }
+    taskManager.shutdown();
     mainWindow = null;
   });
 }
@@ -270,10 +274,12 @@ sessionCache.init({
     deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession,
     deleteSearchFolder, deleteSearchSession, upsertSearchEntries,
     setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName,
+    updateCachedAiTitle, updateSearchTitle,
   },
 });
 const { refreshFolder, reconcileCacheFromFilesystem, buildProjectsFromCache,
-        notifyRendererProjectsChanged, sendStatus, populateCacheViaWorker } = sessionCache;
+        notifyRendererProjectsChanged, sendStatus, populateCacheViaWorker,
+        refreshHarnessTitles } = sessionCache;
 
 // --- IPC: browse-folder ---
 ipcMain.handle('browse-folder', async () => {
@@ -958,7 +964,7 @@ ipcMain.handle('get-shell-profiles', () => {
   return getShellProfiles();
 });
 
-ipcMain.handle('get-effective-settings', (_event, projectPath) => {
+function effectiveSettings(projectPath) {
   const global = getSetting('global') || {};
   const project = projectPath ? (getSetting('project:' + projectPath) || {}) : {};
   const effective = { ...SETTING_DEFAULTS };
@@ -971,7 +977,29 @@ ipcMain.handle('get-effective-settings', (_event, projectPath) => {
     }
   }
   return effective;
+}
+
+ipcMain.handle('get-effective-settings', (_event, projectPath) => effectiveSettings(projectPath));
+
+// Task processes deliberately live outside activeSessions. A server can be
+// stopped, restarted, or reattached without changing an AI session lifecycle.
+const taskManager = createTaskManager({
+  baseEnv: cleanPtyEnv,
+  getShellProfile: (projectPath) => resolveShell(effectiveSettings(projectPath).shellProfile),
+  log,
+  send: (channel, ...args) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, ...args);
+  },
 });
+
+ipcMain.handle('list-project-tasks', (_event, projectPath) => taskManager.listTasks(projectPath));
+ipcMain.handle('list-tasks-for-projects', (_event, projectPaths) => taskManager.listTasksForProjects(projectPaths));
+ipcMain.handle('get-task-run', (_event, projectPath, label) => taskManager.getRun(projectPath, label));
+ipcMain.handle('start-task', (_event, projectPath, label) => taskManager.startTask(projectPath, label));
+ipcMain.handle('stop-task', (_event, projectPath, label) => taskManager.stopTask(projectPath, label));
+ipcMain.handle('restart-task', (_event, projectPath, label) => taskManager.restartTask(projectPath, label));
+ipcMain.on('task-input', (_event, projectPath, label, data) => taskManager.sendInput(projectPath, label, data));
+ipcMain.on('task-resize', (_event, projectPath, label, cols, rows) => taskManager.resize(projectPath, label, cols, rows));
 
 // --- IPC: get-active-sessions ---
 ipcMain.handle('get-active-sessions', () => {
@@ -1088,10 +1116,15 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   // can do nothing about ("No saved session found with ID ..."). Start it
   // fresh instead, which is what re-opening a session that never got going
   // means in practice.
-  let startFresh = isNew;
-  if (!isNew && !isPlainTerminal && !getCachedSession(sessionId)) {
+  const cachedSession = getCachedSession(sessionId);
+  const startFresh = shouldStartFresh({
+    isNew,
+    isPlainTerminal,
+    hasCachedSession: !!cachedSession,
+    resumeExisting: !!sessionOptions?.resumeExisting,
+  });
+  if (startFresh && !isNew && !isPlainTerminal) {
     log.info(`[open-terminal] ${sessionId} has no transcript; starting a new session instead of resuming`);
-    startFresh = true;
   }
 
   // Which CLI drives this session. The cached row is authoritative for anything
@@ -1099,7 +1132,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   // session, which has no row yet.
   const runtimeId = isPlainTerminal
     ? null
-    : (getCachedSession(sessionId)?.runtime || sessionOptions?.runtime || DEFAULT_HARNESS);
+    : (cachedSession?.runtime || sessionOptions?.runtime || DEFAULT_HARNESS);
   const harness = runtimeId ? getHarness(runtimeId) : null;
   const isClaudeSession = runtimeId === DEFAULT_HARNESS;
 
@@ -1684,7 +1717,8 @@ function startHarnessWatchers() {
       for (const folder of folders) {
         try { refreshFolder(folder); } catch (err) { log.error('[harness-watch]', folder, err.message); }
       }
-      if (folders.size) notifyRendererProjectsChanged();
+      const titlesChanged = refreshHarnessTitles(h);
+      if (folders.size || titlesChanged) notifyRendererProjectsChanged();
     }
 
     try {
@@ -1703,6 +1737,32 @@ function startHarnessWatchers() {
       log.info(`[harness-watch] watching ${h.id} at ${root}`);
     } catch (err) {
       log.error(`[harness-watch] failed to watch ${h.id}:`, err.message);
+    }
+
+    // Codex names live next to sessions/, not underneath it, so the recursive
+    // transcript watcher above can never observe an auto-title or `/rename`.
+    // Watch the containing directory so atomic replacement of the index is
+    // handled as well as ordinary appends.
+    if (h.titleIndexPath && h.readSessionTitles) {
+      const indexPath = h.titleIndexPath();
+      const indexDir = path.dirname(indexPath);
+      const indexName = path.basename(indexPath);
+      let titleTimer = null;
+      try {
+        const titleWatcher = fs.watch(indexDir, (_eventType, filename) => {
+          if (filename && String(filename) !== indexName) return;
+          if (titleTimer) clearTimeout(titleTimer);
+          titleTimer = setTimeout(() => {
+            titleTimer = null;
+            if (refreshHarnessTitles(h)) notifyRendererProjectsChanged();
+          }, 300);
+        });
+        titleWatcher.on('error', (err) => log.error(`[harness-title-watch] ${h.id}:`, err.message));
+        harnessWatchers.push(titleWatcher);
+        log.info(`[harness-title-watch] watching ${h.id} at ${indexPath}`);
+      } catch (err) {
+        log.error(`[harness-title-watch] failed to watch ${h.id}:`, err.message);
+      }
     }
   }
 }
@@ -1808,6 +1868,7 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   // Shut down all MCP servers
   shutdownAllMcp();
+  taskManager.shutdown();
 
   // Close filesystem watcher
   if (projectsWatcher) {

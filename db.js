@@ -220,6 +220,7 @@ const stmts = {
   `),
   cacheGetByFolder: db.prepare('SELECT sessionId, fileMtime FROM session_cache WHERE folder = ?'),
   cacheGetSession: db.prepare('SELECT * FROM session_cache WHERE sessionId = ?'),
+  cacheUpdateAiTitle: db.prepare('UPDATE session_cache SET aiTitle = ? WHERE sessionId = ? AND runtime = ?'),
   cacheDeleteSession: db.prepare('DELETE FROM session_cache WHERE sessionId = ?'),
   cacheDeleteFolder: db.prepare('DELETE FROM session_cache WHERE folder = ?'),
   // Cache meta statements
@@ -318,6 +319,10 @@ function getCachedByFolder(folder) {
 
 function getCachedSession(sessionId) {
   return stmts.cacheGetSession.get(sessionId) || null;
+}
+
+function updateCachedAiTitle(sessionId, aiTitle, runtime) {
+  return stmts.cacheUpdateAiTitle.run(aiTitle, sessionId, runtime).changes;
 }
 
 function deleteCachedSession(sessionId) {
@@ -429,6 +434,7 @@ function closeDb() {
 module.exports = {
   getMeta, getAllMeta, setName, toggleStar, setArchived,
   isCachePopulated, getAllCached, getCachedByFolder, getCachedSession, upsertCachedSessions,
+  updateCachedAiTitle,
   deleteCachedSession, deleteCachedFolder,
   getFolderMeta, getAllFolderMeta, setFolderMeta,
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
