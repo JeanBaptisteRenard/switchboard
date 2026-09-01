@@ -100,7 +100,8 @@ let searchMatchProjectPaths = null; // Set<string> of project paths matched by n
 // --- Activity tracking ---
 //
 // Activity is determined by two signals:
-//   1. OSC 0 braille spinner (authoritative: Claude CLI sets title to spinner chars)
+//   1. OSC 0 spinner (authoritative: Claude CLI prefixes the title with a
+//      braille or half-circle spinner frame)
 //   2. Noise-filtered terminal output (fallback: non-noise, non-TUI-repaint data)
 //
 // Both feed into setActivity(sessionId, active):
@@ -114,6 +115,16 @@ const sessionBusyState = new Map(); // sessionId → boolean (currently active)
 
 // Central activity dispatcher
 function setActivity(sessionId, active) {
+  // response-ready normally stays latched until the user looks at the session.
+  // A fresh busy signal is stronger evidence, though: OSC progress clear can
+  // briefly report idle between progress runs, and the next title frame or
+  // progress start must be able to put the session straight back into running.
+  if (active && responseReadySessions.has(sessionId)) {
+    responseReadySessions.delete(sessionId);
+    const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
+    if (item) item.classList.remove('response-ready');
+  }
+
   if (responseReadySessions.has(sessionId)) {
     return;
   }
@@ -365,7 +376,7 @@ window.api.onTerminalNotification((sessionId, message, kind) => {
   }
 });
 
-// --- CLI busy state (OSC 0 title spinner detection) ---
+// --- CLI busy state (OSC 0 title spinner and OSC 9;4 progress detection) ---
 window.api.onCliBusyState((sessionId, busy) => {
   setActivity(sessionId, busy);
 });

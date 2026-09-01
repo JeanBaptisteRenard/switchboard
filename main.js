@@ -33,6 +33,7 @@ const cleanPtyEnv = buildPtyEnv(process.env);
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgvForShell } = require('./shell-profiles');
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
+const { listProjectDirectory, readProjectFile } = require('./project-files');
 
 
 // --- Auto-updater (only in packaged builds) ---
@@ -370,6 +371,22 @@ ipcMain.handle('read-file-for-panel', async (_event, filePath) => {
   try {
     const content = fs.readFileSync(filePath, 'utf8');
     return { ok: true, content };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('list-project-directory', async (_event, projectPath, relativePath) => {
+  try {
+    return { ok: true, entries: listProjectDirectory(projectPath, relativePath) };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('read-project-file', async (_event, projectPath, relativePath) => {
+  try {
+    return { ok: true, ...readProjectFile(projectPath, relativePath) };
   } catch (err) {
     return { ok: false, error: err.message };
   }

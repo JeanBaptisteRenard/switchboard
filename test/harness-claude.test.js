@@ -154,8 +154,11 @@ test('an unprefixed folder key resolves to Claude', () => {
 
 // --- activity signalling ---
 
-test('Claude reports working with a spinner and idle with U+2733', () => {
+test('Claude reports working with old and new spinner frames and idle with U+2733', () => {
   assert.equal(claude.parseTitleState('⠹ doing a thing'), 'busy');
+  for (const frame of ['◐', '◑', '◒', '◓']) {
+    assert.equal(claude.parseTitleState(`${frame} doing a thing`), 'busy', frame);
+  }
   assert.equal(claude.parseTitleState('✳ idle'), 'idle');
 });
 

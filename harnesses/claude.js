@@ -308,9 +308,11 @@ function toViewerEntries(entries) {
 
 // --- Activity signalling ---
 
-// Claude marks a working session by prefixing its terminal title with a braille
-// spinner frame, and an idle one with U+2733.
+// Claude marks a working session by prefixing its terminal title with a spinner
+// frame, and an idle one with U+2733. Versions through 2.1.227 used braille;
+// 2.1.228+ use the four rotating half-circle glyphs U+25D0-U+25D3.
 const SPINNER_MIN = 0x2800, SPINNER_MAX = 0x28FF;
+const HALF_CIRCLE_MIN = 0x25D0, HALF_CIRCLE_MAX = 0x25D3;
 const IDLE_MARK = '\u2733'; // ✳
 
 /** What an OSC 0 title says about the session: 'busy', 'idle', or nothing. */
@@ -318,7 +320,8 @@ function parseTitleState(title) {
   const first = String(title || '').charAt(0);
   if (!first) return null;
   const code = first.charCodeAt(0);
-  if (code >= SPINNER_MIN && code <= SPINNER_MAX) return 'busy';
+  if ((code >= SPINNER_MIN && code <= SPINNER_MAX) ||
+      (code >= HALF_CIRCLE_MIN && code <= HALF_CIRCLE_MAX)) return 'busy';
   if (first === IDLE_MARK) return 'idle';
   return null;
 }
