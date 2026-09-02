@@ -75,6 +75,7 @@ const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 const { isSensitivePath, isAllowedMemoryPath: _isAllowedMemoryPath } = require('./ipc-path-validator');
 const { normalizePtySize } = require('./pty-size');
+const { createComposerState, noteUserInput } = require('./composer-state');
 
 
 // --- Auto-updater (only in packaged builds) ---
@@ -2010,6 +2011,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     // sessions, and a reattached session is still inside the same sandbox.
     sandbox: !!sessionOptions?.sandbox,
     mcpServer, _openedAt: Date.now(),
+    // see docs/automation.md — the trigger watcher's politeness guard
+    composerState: createComposerState(),
   };
   activeSessions.set(sessionId, session);
 
@@ -2150,6 +2153,7 @@ if (TRACE) {
 ipcMain.on('terminal-input', (_event, sessionId, data) => {
   const session = activeSessions.get(sessionId);
   if (session && !session.exited) {
+    if (session.composerState) noteUserInput(session.composerState, data, Date.now());
     session.pty.write(data);
   }
 });
@@ -2449,6 +2453,12 @@ if (!gotSingleInstanceLock) {
         isSessionBusy(sessionId) {
           const session = activeSessions.get(sessionId);
           return session ? !!session._cliBusy : false;
+        },
+        getComposerState(sessionId) {
+          const session = activeSessions.get(sessionId);
+          if (!session || session.exited || !session.composerState) return null;
+          const { pending, lastInputAt } = session.composerState;
+          return { pending, lastInputAt };
         },
       });
     } catch (err) {
