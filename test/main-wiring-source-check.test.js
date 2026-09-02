@@ -42,9 +42,13 @@ function argsOf(anchor, callee) {
 
 test('main-wiring source check: terminal-input is registered and calls handleTerminalInput', () => {
   const args = argsOf("ipcMain.on('terminal-input'", 'ipcMain.on');
+  // The whole argument list, not just the callee: `handleTerminalInput(...)`
+  // with a swapped or hard-coded `now` disables half the politeness guard
+  // while still matching a bare name check.
   assert.match(
-    args, /\bhandleTerminalInput\s*\(/,
-    'the terminal-input handler body must call handleTerminalInput',
+    args,
+    /\bhandleTerminalInput\s*\(\s*activeSessions\s*,\s*sessionId\s*,\s*data\s*,\s*Date\.now\(\)\s*\)/,
+    'terminal-input must call handleTerminalInput(activeSessions, sessionId, data, Date.now())',
   );
   assert.match(
     mainSrc, /require\('\.\/terminal-input'\)/,
