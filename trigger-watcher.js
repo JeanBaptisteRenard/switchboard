@@ -625,16 +625,29 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
       const result = await waitForIdle(sessionId, ctx, resolvedTimeoutMs);
       waited_ms    = result.waited_ms;
 
+      // Nothing is written yet — see .ai/contexts/trigger-watcher.md.
       // W5: session exited during wait
       if (result.sessionExited) {
         ctx.log.warn('[trigger-watcher] Session exited during wait:', sessionId);
-        await writeResult({ ok: false, error: 'session exited during wait', sessionId, waited_ms });
+        await writeResult({
+          ok: false,
+          submitted: SUBMITTED_NO,
+          error: 'session exited during wait',
+          reason: 'the session exited while waiting for it to go idle; nothing was written',
+          sessionId, waited_ms,
+        });
         return;
       }
 
       if (result.timedOut) {
-        ctx.log.warn('[trigger-watcher] Idle timeout for session:', sessionId);
-        await writeResult({ ok: false, error: 'timeout waiting for idle', sessionId, waited_ms });
+        ctx.log.warn('[trigger-watcher] Idle timeout for session, nothing sent:', sessionId);
+        await writeResult({
+          ok: false,
+          submitted: SUBMITTED_NO,
+          error: ERROR_NOT_SENT,
+          reason: 'timeout waiting for idle; nothing was written',
+          sessionId, waited_ms,
+        });
         return;
       }
     }
@@ -722,15 +735,30 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     const result = await waitForIdle(sessionId, ctx, remainingMs);
     totalWaitedMs += result.waited_ms;
 
+    // Nothing is written before step 0 — see .ai/contexts/trigger-watcher.md.
     if (result.sessionExited) {
       ctx.log.warn('[trigger-watcher] Session exited during chain initial wait:', sessionId);
-      await writeResult({ ok: false, error: 'session exited during wait', partial: true, steps_completed: 0, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      await writeResult({
+        ok: false,
+        submitted: SUBMITTED_NO,
+        error: 'session exited during wait',
+        reason: 'the session exited while waiting for it to go idle; nothing was written',
+        partial: false, steps_completed: 0, sessionId, sent_at: step0SentAt, steps,
+        total_waited_ms: totalWaitedMs,
+      });
       return;
     }
 
     if (result.timedOut || Date.now() >= globalDeadline) {
-      ctx.log.warn('[trigger-watcher] Chain timeout during initial idle wait:', sessionId);
-      await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: 0, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      ctx.log.warn('[trigger-watcher] Idle timeout during chain initial wait, nothing sent:', sessionId);
+      await writeResult({
+        ok: false,
+        submitted: SUBMITTED_NO,
+        error: ERROR_NOT_SENT,
+        reason: 'timed out waiting for the session to go idle; nothing was written',
+        partial: false, steps_completed: 0, sessionId, sent_at: step0SentAt, steps,
+        total_waited_ms: totalWaitedMs,
+      });
       return;
     }
   }

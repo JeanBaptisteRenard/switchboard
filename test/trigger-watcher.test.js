@@ -306,7 +306,7 @@ test('wait:idle while busy → flips to idle after 150ms → write happens, wait
   }
 });
 
-test('wait:idle timeout: busy stays true → ok:false, error contains "timeout", no PTY write', async () => {
+test('wait:idle timeout: busy stays true → ok:false, error "not sent", no PTY write', async () => {
   const tmp = mkTmp();
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
@@ -329,7 +329,8 @@ test('wait:idle timeout: busy stays true → ok:false, error contains "timeout",
 
     const result = readResult(path.join(tmp, 'processed'), uuid);
     assert.equal(result.ok, false);
-    assert.match(result.error, /timeout/i);
+    assert.equal(result.error, 'not sent', 'nothing was written, so the guard is voided');
+    assert.match(result.reason, /timeout/i, 'the detail lives in reason, not in error');
 
     assert.deepEqual(ctx._written, [], 'no PTY write on idle timeout');
 
@@ -911,7 +912,8 @@ test('W6 timeout_ms absent: falls back to env-var; env-var absent → falls back
     const result = readResult(path.join(tmp, 'processed'), uuid);
     // Env-var timeout (300 ms) should have fired → ok:false
     assert.equal(result.ok, false);
-    assert.match(result.error, /timeout/i, 'should time out using env-var timeout');
+    assert.equal(result.error, 'not sent', 'the env-var timeout fired before any write');
+    assert.match(result.reason, /timeout/i, 'should time out using env-var timeout');
     assert.deepEqual(ctx._written, [], 'no PTY write on env-var timeout');
 
     watcher.close();
@@ -2153,6 +2155,139 @@ test('submitted: a validation refusal before any write carries submitted "no"', 
 
     watcher.close();
   } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// ── Renouncing: `not sent` promises the session was never touched ─────────────
+// conventions/session-trigger-transport.md, "Renouncing": `not sent` voids the
+// harness guard, `chain timeout` keeps blocking the next compaction. A path that
+// returns without writing a single byte must say `not sent`, and the detail
+// belongs in `reason` — `error` is compared by strict equality.
+
+test('renouncing: a chain waiting on an idle that never comes writes nothing and says "not sent"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-never-idle-' + Date.now();
+    // Busy from the first poll and never released: `wait:"idle"` is unsatisfiable.
+    const ctx     = makeChainCtx(SESSION_ID, { initiallyBusy: true, noAutoTurn: true });
+    watcher = start(ctx);
+
+    const uuid = 'chain-never-idle-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'idle',
+      chain: [{ command: '/compact' }, { command: 'resume and finish' }],
+      timeout_ms: 300,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 5000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, [], 'the initial idle wait must not write a single byte');
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'not sent',
+      'nothing left, so the guard must be voided — chain timeout would block forever');
+    assert.equal(result.submitted, 'no');
+    assert.equal(result.partial, false, 'nothing partial about a chain that never started');
+    assert.ok(result.reason, 'the detail belongs in reason, never in error');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('renouncing: a single command waiting on an idle that never comes says "not sent", detail in reason', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-cmd-never-idle-' + Date.now();
+    // A session stays busy for as long as a delegated agent runs, so this is the
+    // path that fires most often in service.
+    const ctx     = makeCtx(SESSION_ID, () => true);
+    watcher = start(ctx);
+
+    const uuid = 'cmd-never-idle-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      command:   '/compact',
+      wait:      'idle',
+      timeout_ms: 300,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 5000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, [], 'no PTY write when idle never comes');
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'not sent', 'error carries the reserved value alone');
+    assert.equal(result.submitted, 'no');
+    assert.match(result.reason, /idle/i, 'the detail moved to reason, and is still there');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('renouncing: a chain whose first step was written reports "chain timeout", never "not sent"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-stuck-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    let busy  = false;
+    ctx.isSessionBusy = (id) => (id === SESSION_ID ? busy : false);
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      // Step 0 submits and the turn starts — and never ends.
+      if (data === '\r') busy = true;
+    };
+    watcher = start(ctx);
+
+    const uuid = 'chain-stuck-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume and finish' }],
+      timeout_ms: 800,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, ['/compact', '\r'], 'step 0 reached the PTY');
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'chain timeout',
+      'not sent would lie here: step 0 was written, so the guard must keep blocking');
+    assert.equal(result.partial, true);
+
+  } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
