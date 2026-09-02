@@ -124,6 +124,7 @@ function readResult(processedDir, uuid) {
 
 test('happy path: trigger → pty.write called, result ok:true, trigger deleted', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -131,7 +132,7 @@ test('happy path: trigger → pty.write called, result ok:true, trigger deleted'
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-happy-' + Date.now();
     const ctx        = makeCtx(SESSION_ID);
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const uuid    = 'aaa-' + Date.now();
     const triggerPath = writeTrigger(tmp, uuid, {
@@ -157,8 +158,8 @@ test('happy path: trigger → pty.write called, result ok:true, trigger deleted'
     // Trigger file deleted
     assert.equal(fs.existsSync(triggerPath), false, 'trigger file should be deleted');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -167,13 +168,14 @@ test('happy path: trigger → pty.write called, result ok:true, trigger deleted'
 
 test('unknown sessionId: result ok:false with session not found, no PTY write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
 
     const { start } = require('../trigger-watcher');
     const ctx        = makeCtx('real-session');
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const uuid    = 'bbb-' + Date.now();
     const triggerPath = writeTrigger(tmp, uuid, {
@@ -191,8 +193,8 @@ test('unknown sessionId: result ok:false with session not found, no PTY write', 
     assert.deepEqual(ctx._written, [], 'no PTY write for unknown session');
     assert.equal(fs.existsSync(triggerPath), false, 'trigger file should be deleted');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -201,13 +203,14 @@ test('unknown sessionId: result ok:false with session not found, no PTY write', 
 
 test('malformed JSON: result ok:false with error, trigger deleted, no PTY write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
 
     const { start } = require('../trigger-watcher');
     const ctx        = makeCtx('any-session');
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const uuid    = 'ccc-' + Date.now();
     const triggerPath = path.join(tmp, uuid + '.json');
@@ -223,8 +226,8 @@ test('malformed JSON: result ok:false with error, trigger deleted, no PTY write'
     assert.deepEqual(ctx._written, [], 'no PTY write for malformed JSON');
     assert.equal(fs.existsSync(triggerPath), false, 'trigger file should be deleted');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -233,6 +236,7 @@ test('malformed JSON: result ok:false with error, trigger deleted, no PTY write'
 
 test('missing required field (no command): result ok:false, no PTY write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -240,7 +244,7 @@ test('missing required field (no command): result ok:false, no PTY write', async
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-nocommand-' + Date.now();
     const ctx        = makeCtx(SESSION_ID);
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const uuid    = 'ddd-' + Date.now();
     const triggerPath = writeTrigger(tmp, uuid, { sessionId: SESSION_ID });
@@ -256,8 +260,8 @@ test('missing required field (no command): result ok:false, no PTY write', async
     assert.deepEqual(ctx._written, [], 'no PTY write when command missing');
     assert.equal(fs.existsSync(triggerPath), false, 'trigger file should be deleted');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -266,6 +270,7 @@ test('missing required field (no command): result ok:false, no PTY write', async
 
 test('wait:idle while busy → flips to idle after 150ms → write happens, waited_ms >= 150', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000'; // generous timeout
@@ -274,7 +279,7 @@ test('wait:idle while busy → flips to idle after 150ms → write happens, wait
     let busy = true;
     const SESSION_ID = 'sess-idle-' + Date.now();
     const ctx = makeCtx(SESSION_ID, () => busy);
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid    = 'eee-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -298,8 +303,8 @@ test('wait:idle while busy → flips to idle after 150ms → write happens, wait
     // busy is false by the time we submit → no rise → verify retries the Enter.
     assert.deepEqual(ctx._written, ['/compact', '\r', '\r'], 'PTY write should happen after idle (with verify-retry Enter)');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -308,6 +313,7 @@ test('wait:idle while busy → flips to idle after 150ms → write happens, wait
 
 test('wait:idle timeout: busy stays true → ok:false, error "not sent", no PTY write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200'; // short timeout for test
@@ -315,7 +321,7 @@ test('wait:idle timeout: busy stays true → ok:false, error "not sent", no PTY 
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-timeout-' + Date.now();
     const ctx = makeCtx(SESSION_ID, () => true); // always busy
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid    = 'fff-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -334,8 +340,8 @@ test('wait:idle timeout: busy stays true → ok:false, error "not sent", no PTY 
 
     assert.deepEqual(ctx._written, [], 'no PTY write on idle timeout');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -347,6 +353,7 @@ test('wait:idle timeout: busy stays true → ok:false, error "not sent", no PTY 
 // C1: size cap rejection
 test('C1 size cap: trigger > 64 KB rejected before read, result ok:false', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -354,7 +361,7 @@ test('C1 size cap: trigger > 64 KB rejected before read, result ok:false', async
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-c1-' + Date.now();
     const ctx        = makeCtx(SESSION_ID);
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const uuid    = 'c1-' + Date.now();
     const bigPath = path.join(tmp, uuid + '.json');
@@ -370,8 +377,8 @@ test('C1 size cap: trigger > 64 KB rejected before read, result ok:false', async
 
     assert.deepEqual(ctx._written, [], 'no PTY write for oversized trigger');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -381,6 +388,7 @@ test('C1 size cap: trigger > 64 KB rejected before read, result ok:false', async
 // C2: symlink rejection
 test('C2 symlink: symlinked trigger rejected, result ok:false', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -388,7 +396,7 @@ test('C2 symlink: symlinked trigger rejected, result ok:false', async () => {
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-c2-' + Date.now();
     const ctx        = makeCtx(SESSION_ID);
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const uuid      = 'c2-' + Date.now();
     const linkPath  = path.join(tmp, uuid + '.json');
@@ -404,8 +412,8 @@ test('C2 symlink: symlinked trigger rejected, result ok:false', async () => {
 
     assert.deepEqual(ctx._written, [], 'no PTY write for symlink trigger');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -417,13 +425,14 @@ test('C2 symlink: symlinked trigger rejected, result ok:false', async () => {
 // then we test the "retry-then-fail" path: both attempts get bad JSON → ok:false.
 test('W1 partial-write retry: truncated JSON on both attempts → ok:false after retry', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
 
     const { start } = require('../trigger-watcher');
     const ctx    = makeCtx('any-session');
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid      = 'w1-' + Date.now();
     const trigPath  = path.join(tmp, uuid + '.json');
@@ -438,8 +447,8 @@ test('W1 partial-write retry: truncated JSON on both attempts → ok:false after
     assert.equal(result.ok, false);
     assert.match(result.error, /invalid JSON/i);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -449,6 +458,7 @@ test('W1 partial-write retry: truncated JSON on both attempts → ok:false after
 // W2: command too long
 test('W2 command length cap: command > 4 KB rejected, result ok:false', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -456,7 +466,7 @@ test('W2 command length cap: command > 4 KB rejected, result ok:false', async ()
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-w2-' + Date.now();
     const ctx        = makeCtx(SESSION_ID);
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'w2-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -473,8 +483,8 @@ test('W2 command length cap: command > 4 KB rejected, result ok:false', async ()
 
     assert.deepEqual(ctx._written, [], 'no PTY write for too-long command');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -484,6 +494,7 @@ test('W2 command length cap: command > 4 KB rejected, result ok:false', async ()
 // W3: control chars in command
 test('W3 forbidden control chars: \\r in command rejected, result ok:false', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -491,7 +502,7 @@ test('W3 forbidden control chars: \\r in command rejected, result ok:false', asy
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-w3-' + Date.now();
     const ctx        = makeCtx(SESSION_ID);
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'w3-' + Date.now();
     // Write raw JSON with \r character in command
@@ -507,8 +518,8 @@ test('W3 forbidden control chars: \\r in command rejected, result ok:false', asy
 
     assert.deepEqual(ctx._written, [], 'no PTY write for command with control chars');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -518,6 +529,7 @@ test('W3 forbidden control chars: \\r in command rejected, result ok:false', asy
 // W4: concurrency cap — drop 12 triggers simultaneously, verify all 12 get processed
 test('W4 concurrency cap: 12 simultaneous triggers all get processed', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -525,7 +537,7 @@ test('W4 concurrency cap: 12 simultaneous triggers all get processed', async () 
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-w4-' + Date.now();
     const ctx        = makeCtx(SESSION_ID);
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const COUNT  = 12;
     const uuids  = Array.from({ length: COUNT }, (_, i) => `w4-${Date.now()}-${i}`);
@@ -551,8 +563,8 @@ test('W4 concurrency cap: 12 simultaneous triggers all get processed', async () 
     // per command when no busy-rise is observed.
     assert.equal(ctx._written.filter((w) => w !== '\r').length, COUNT, `expected ${COUNT} submitted commands`);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -562,6 +574,7 @@ test('W4 concurrency cap: 12 simultaneous triggers all get processed', async () 
 // W5: session exits during wait:idle
 test('W5 session exits during wait:idle → ok:false, error contains "session exited"', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
@@ -569,7 +582,7 @@ test('W5 session exits during wait:idle → ok:false, error contains "session ex
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-w5-' + Date.now();
     const ctx = makeCtx(SESSION_ID, () => true); // stays busy
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'w5-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -590,8 +603,8 @@ test('W5 session exits during wait:idle → ok:false, error contains "session ex
 
     assert.deepEqual(ctx._written, [], 'no PTY write when session exited during wait');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -601,6 +614,7 @@ test('W5 session exits during wait:idle → ok:false, error contains "session ex
 // W6 extra: PTY write throws — result ok:false with pty write failed
 test('PTY write throws: result ok:false with pty write failed error', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -608,7 +622,7 @@ test('PTY write throws: result ok:false with pty write failed error', async () =
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-ptythrow-' + Date.now();
     const ctx        = makeCtx(SESSION_ID, () => false, { ptyThrows: true });
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'ptythrow-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
@@ -620,8 +634,8 @@ test('PTY write throws: result ok:false with pty write failed error', async () =
     assert.equal(result.ok, false);
     assert.match(result.error, /pty write failed/i);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -631,6 +645,7 @@ test('PTY write throws: result ok:false with pty write failed error', async () =
 // W6 extra: inFlight dedup — same filename triggers twice, only processed once per dedup cycle
 test('inFlight dedup: same filename event fired twice → processed at most once concurrently', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -638,7 +653,7 @@ test('inFlight dedup: same filename event fired twice → processed at most once
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-dedup-' + Date.now();
     const ctx        = makeCtx(SESSION_ID);
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     // Write the trigger file once
     const uuid    = 'dedup-' + Date.now();
@@ -654,8 +669,8 @@ test('inFlight dedup: same filename event fired twice → processed at most once
     // Count command texts (w !== '\r'): submit-verify may add a retry '\r'.
     assert.equal(ctx._written.filter((w) => w !== '\r').length, 1, 'command submitted exactly once');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -665,6 +680,7 @@ test('inFlight dedup: same filename event fired twice → processed at most once
 // I4: NaN guard — invalid timeout env var falls back to default, does not poll forever
 test('I4 NaN timeout: invalid SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS uses default (no infinite loop)', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = 'not-a-number'; // I4: triggers NaN guard
@@ -673,7 +689,7 @@ test('I4 NaN timeout: invalid SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS uses default (
     const SESSION_ID = 'sess-i4-' + Date.now();
     // Always busy — with a valid timeout this resolves to timedOut; without NaN guard it never resolves
     const ctx = makeCtx(SESSION_ID, () => true);
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'i4-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -688,9 +704,9 @@ test('I4 NaN timeout: invalid SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS uses default (
     // the result file would never appear after 1 s; but with a normal default timeout
     // the poll eventually resolves (just slowly).  We only assert it doesn't throw.
     await new Promise(r => setTimeout(r, 200));
-    watcher.close();
     // No assertion on result needed — the goal is no crash / unhandled rejection.
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -704,6 +720,7 @@ test('I4 NaN timeout: invalid SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS uses default (
 // The per-trigger timeout should govern (not the env var), and injection succeeds.
 test('W6 timeout_ms: per-trigger timeout_ms honored, overrides env-var fallback', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     // env var set to 50 ms — without per-trigger override this would time out
@@ -713,7 +730,7 @@ test('W6 timeout_ms: per-trigger timeout_ms honored, overrides env-var fallback'
     let busy = true;
     const SESSION_ID = 'sess-tmout-override-' + Date.now();
     const ctx = makeCtx(SESSION_ID, () => busy);
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'tmout-override-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -735,8 +752,8 @@ test('W6 timeout_ms: per-trigger timeout_ms honored, overrides env-var fallback'
     // busy is false at submit time → no rise → verify retries the Enter once.
     assert.deepEqual(ctx._written, ['/compact', '\r', '\r'], 'PTY write should happen (with verify-retry Enter)');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -746,6 +763,7 @@ test('W6 timeout_ms: per-trigger timeout_ms honored, overrides env-var fallback'
 // W6-2: invalid timeout_ms — negative value
 test('W6 timeout_ms invalid: negative → ok:false, error "invalid timeout_ms", no PTY write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -753,7 +771,7 @@ test('W6 timeout_ms invalid: negative → ok:false, error "invalid timeout_ms", 
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-neg-tmout-' + Date.now();
     const ctx        = makeCtx(SESSION_ID);
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'neg-tmout-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -770,8 +788,8 @@ test('W6 timeout_ms invalid: negative → ok:false, error "invalid timeout_ms", 
     assert.match(result.error, /invalid timeout_ms/);
     assert.deepEqual(ctx._written, [], 'no PTY write for invalid timeout_ms');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -781,6 +799,7 @@ test('W6 timeout_ms invalid: negative → ok:false, error "invalid timeout_ms", 
 // W6-3: invalid timeout_ms — non-integer float
 test('W6 timeout_ms invalid: non-integer float (1.5) → ok:false, no PTY write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -788,7 +807,7 @@ test('W6 timeout_ms invalid: non-integer float (1.5) → ok:false, no PTY write'
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-float-tmout-' + Date.now();
     const ctx        = makeCtx(SESSION_ID);
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'float-tmout-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -805,8 +824,8 @@ test('W6 timeout_ms invalid: non-integer float (1.5) → ok:false, no PTY write'
     assert.match(result.error, /invalid timeout_ms/);
     assert.deepEqual(ctx._written, [], 'no PTY write for float timeout_ms');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -816,6 +835,7 @@ test('W6 timeout_ms invalid: non-integer float (1.5) → ok:false, no PTY write'
 // W6-4: invalid timeout_ms — exceeds cap (> 600 000)
 test('W6 timeout_ms invalid: value > 600000 → ok:false, no PTY write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -823,7 +843,7 @@ test('W6 timeout_ms invalid: value > 600000 → ok:false, no PTY write', async (
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-cap-tmout-' + Date.now();
     const ctx        = makeCtx(SESSION_ID);
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'cap-tmout-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -840,8 +860,8 @@ test('W6 timeout_ms invalid: value > 600000 → ok:false, no PTY write', async (
     assert.match(result.error, /invalid timeout_ms/);
     assert.deepEqual(ctx._written, [], 'no PTY write for over-cap timeout_ms');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -851,6 +871,7 @@ test('W6 timeout_ms invalid: value > 600000 → ok:false, no PTY write', async (
 // W6-5: invalid timeout_ms — string type (not a JSON number)
 test('W6 timeout_ms invalid: string type ("500") → ok:false, no PTY write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -858,7 +879,7 @@ test('W6 timeout_ms invalid: string type ("500") → ok:false, no PTY write', as
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-str-tmout-' + Date.now();
     const ctx        = makeCtx(SESSION_ID);
-    const watcher    = start(ctx);
+    watcher = start(ctx);
 
     // Write raw JSON so we control the type exactly (writeTrigger uses JSON.stringify
     // which would coerce, but here we need a JSON string value)
@@ -877,8 +898,8 @@ test('W6 timeout_ms invalid: string type ("500") → ok:false, no PTY write', as
     assert.match(result.error, /invalid timeout_ms/);
     assert.deepEqual(ctx._written, [], 'no PTY write for string timeout_ms');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -888,6 +909,7 @@ test('W6 timeout_ms invalid: string type ("500") → ok:false, no PTY write', as
 // W6-6: absent timeout_ms → falls back to env-var
 test('W6 timeout_ms absent: falls back to env-var; env-var absent → falls back to default (300 000 ms)', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '300'; // env var: 300 ms
@@ -896,7 +918,7 @@ test('W6 timeout_ms absent: falls back to env-var; env-var absent → falls back
     const SESSION_ID = 'sess-fallback-' + Date.now();
     // Always busy — with the env-var 300 ms timeout this should time out
     const ctx = makeCtx(SESSION_ID, () => true);
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'fallback-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -916,8 +938,8 @@ test('W6 timeout_ms absent: falls back to env-var; env-var absent → falls back
     assert.match(result.reason, /timeout/i, 'should time out using env-var timeout');
     assert.deepEqual(ctx._written, [], 'no PTY write on env-var timeout');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -929,6 +951,7 @@ test('W6 timeout_ms absent: falls back to env-var; env-var absent → falls back
 // W7-1: pty dead at lookup time → ok:false before any wait
 test('W7 dead on arrival: liveness false at lookup → ok:false, no wait, no write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR             = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS  = '5000';
@@ -936,7 +959,7 @@ test('W7 dead on arrival: liveness false at lookup → ok:false, no wait, no wri
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-dead-' + Date.now();
     const ctx = makeCtx(SESSION_ID, () => false, { alive: false });
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'dead-' + Date.now();
     const startedAt = Date.now();
@@ -952,8 +975,8 @@ test('W7 dead on arrival: liveness false at lookup → ok:false, no wait, no wri
     assert.deepEqual(ctx._written, [], 'no PTY write when child is dead');
     assert.ok(elapsed < 1500, `should fail fast, not wait idle timeout; got ${elapsed}ms`);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -963,6 +986,7 @@ test('W7 dead on arrival: liveness false at lookup → ok:false, no wait, no wri
 // W7-2: pty dies during idle wait → ok:false at the pre-write recheck
 test('W7 dies during wait: alive at lookup, dead before write → ok:false with waited_ms', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR             = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS  = '5000';
@@ -973,7 +997,7 @@ test('W7 dies during wait: alive at lookup, dead before write → ok:false with 
     const ctx = makeCtx(SESSION_ID, () => busy);
     setTimeout(() => { busy = false; ctx._killPty(); }, 300);
 
-    const watcher = start(ctx);
+    watcher = start(ctx);
     const uuid = 'dies-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', wait: 'idle' });
 
@@ -987,8 +1011,8 @@ test('W7 dies during wait: alive at lookup, dead before write → ok:false with 
       `waited_ms should reflect the wait that happened; got ${result.waited_ms}`);
     assert.deepEqual(ctx._written, [], 'no PTY write when child died during wait');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -998,6 +1022,7 @@ test('W7 dies during wait: alive at lookup, dead before write → ok:false with 
 // W7-3: default liveness helper sees the real test-process pid as alive → happy path unchanged
 test('W7 default helper: real-pid mock passes default signal-0 probe → happy path unchanged', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR             = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS  = '200';
@@ -1007,7 +1032,7 @@ test('W7 default helper: real-pid mock passes default signal-0 probe → happy p
     const ctx = makeCtx(SESSION_ID);
     delete ctx.isPtyAlive; // force the default signal-0 path
 
-    const watcher = start(ctx);
+    watcher = start(ctx);
     const uuid = 'default-alive-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/help', wait: 'idle' });
 
@@ -1019,8 +1044,8 @@ test('W7 default helper: real-pid mock passes default signal-0 probe → happy p
     // busy never rises → verify retries the Enter once.
     assert.deepEqual(ctx._written, ['/help', '\r', '\r']);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1086,6 +1111,7 @@ function makeChainCtx(sessionId, opts = {}) {
 // CHAIN-1: happy path — 3-step chain, all succeed, result shape correct
 test('chain happy path: 3-step chain → 3 PTY writes, result ok:true with steps array', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
@@ -1093,7 +1119,7 @@ test('chain happy path: 3-step chain → 3 PTY writes, result ok:true with steps
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-chain-happy-' + Date.now();
     const ctx = makeChainCtx(SESSION_ID);
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-happy-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -1129,8 +1155,8 @@ test('chain happy path: 3-step chain → 3 PTY writes, result ok:true with steps
     // All 3 writes happened in order
     assert.deepEqual(ctx._written, ['/compact', '\r', 'verify result file and commit', '\r', 'open the PR', '\r']);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1140,6 +1166,7 @@ test('chain happy path: 3-step chain → 3 PTY writes, result ok:true with steps
 // CHAIN-2: validation — command and chain both present → rejected before MAX_INFLIGHT
 test('chain+command mutually exclusive: both present → ok:false, error mentions mutually exclusive', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -1147,7 +1174,7 @@ test('chain+command mutually exclusive: both present → ok:false, error mention
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-chain-both-' + Date.now();
     const ctx = makeChainCtx(SESSION_ID);
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-both-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -1164,8 +1191,8 @@ test('chain+command mutually exclusive: both present → ok:false, error mention
     assert.match(result.error, /mutually exclusive/i);
     assert.deepEqual(ctx._written, [], 'no PTY write');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1175,6 +1202,7 @@ test('chain+command mutually exclusive: both present → ok:false, error mention
 // CHAIN-3: validation — chain is empty array → rejected
 test('chain validation: empty array → ok:false, error mentions chain', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -1182,7 +1210,7 @@ test('chain validation: empty array → ok:false, error mentions chain', async (
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-chain-empty-' + Date.now();
     const ctx = makeChainCtx(SESSION_ID);
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-empty-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, chain: [] });
@@ -1194,8 +1222,8 @@ test('chain validation: empty array → ok:false, error mentions chain', async (
     assert.equal(result.ok, false);
     assert.match(result.error, /chain/i);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1205,6 +1233,7 @@ test('chain validation: empty array → ok:false, error mentions chain', async (
 // CHAIN-4: validation — chain too long (> 20) → rejected
 test('chain validation: length > 20 → ok:false, error mentions chain', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -1212,7 +1241,7 @@ test('chain validation: length > 20 → ok:false, error mentions chain', async (
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-chain-long-' + Date.now();
     const ctx = makeChainCtx(SESSION_ID);
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-long-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -1227,8 +1256,8 @@ test('chain validation: length > 20 → ok:false, error mentions chain', async (
     assert.equal(result.ok, false);
     assert.match(result.error, /chain/i);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1238,6 +1267,7 @@ test('chain validation: length > 20 → ok:false, error mentions chain', async (
 // CHAIN-5: validation — step missing command → rejected
 test('chain validation: step without command string → ok:false', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -1245,7 +1275,7 @@ test('chain validation: step without command string → ok:false', async () => {
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-chain-badstep-' + Date.now();
     const ctx = makeChainCtx(SESSION_ID);
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-badstep-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -1261,8 +1291,8 @@ test('chain validation: step without command string → ok:false', async () => {
     assert.match(result.error, /step/i);
     assert.deepEqual(ctx._written, [], 'no PTY write for invalid chain step');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1272,6 +1302,7 @@ test('chain validation: step without command string → ok:false', async () => {
 // CHAIN-6: validation — step command too long → rejected
 test('chain validation: step command too long → ok:false, no PTY write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -1279,7 +1310,7 @@ test('chain validation: step command too long → ok:false, no PTY write', async
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-chain-longcmd-' + Date.now();
     const ctx = makeChainCtx(SESSION_ID);
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-longcmd-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -1295,8 +1326,8 @@ test('chain validation: step command too long → ok:false, no PTY write', async
     assert.match(result.error, /too long/i);
     assert.deepEqual(ctx._written, [], 'no PTY write for oversized step command');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1306,6 +1337,7 @@ test('chain validation: step command too long → ok:false, no PTY write', async
 // CHAIN-7: validation — step command with forbidden chars → rejected
 test('chain validation: step command with forbidden chars → ok:false, no PTY write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -1313,7 +1345,7 @@ test('chain validation: step command with forbidden chars → ok:false, no PTY w
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-chain-ctrlcmd-' + Date.now();
     const ctx = makeChainCtx(SESSION_ID);
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-ctrlcmd-' + Date.now();
     const payload = JSON.stringify({
@@ -1330,8 +1362,8 @@ test('chain validation: step command with forbidden chars → ok:false, no PTY w
     assert.match(result.error, /forbidden control/i);
     assert.deepEqual(ctx._written, [], 'no PTY write for chain step with control chars');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1345,6 +1377,7 @@ test('chain validation: step command with forbidden chars → ok:false, no PTY w
 // to ensure the poll catches busy=true and enters Phase 2 reliably.
 test('chain timeout mid-chain: global timeout fires → ok:false, partial:true, steps_completed=1', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
@@ -1371,7 +1404,7 @@ test('chain timeout mid-chain: global timeout fires → ok:false, partial:true, 
     };
     ctx.isSessionBusy = (id) => id === SESSION_ID ? busy : false;
 
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-timeout-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -1399,8 +1432,8 @@ test('chain timeout mid-chain: global timeout fires → ok:false, partial:true, 
     assert.equal(ctx._written[2], 'step-two', 'step 1 should be written (it was sent, just stuck)');
     assert.equal(ctx._written[3], '\r', 'step 1 Enter should be written');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1410,6 +1443,7 @@ test('chain timeout mid-chain: global timeout fires → ok:false, partial:true, 
 // CHAIN-9: session exits mid-chain → ok:false, partial:true, stops cleanly
 test('chain session exit mid-chain: session exits during step 1 turn wait → ok:false, partial:true', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
@@ -1436,7 +1470,7 @@ test('chain session exit mid-chain: session exits during step 1 turn wait → ok
     };
     ctx.isSessionBusy = (id) => id === SESSION_ID ? busy : false;
 
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-exit-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -1459,8 +1493,8 @@ test('chain session exit mid-chain: session exits during step 1 turn wait → ok
     assert.match(result.error, /session exited/i);
     assert.equal(typeof result.steps_completed, 'number');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1471,6 +1505,7 @@ test('chain session exit mid-chain: session exits during step 1 turn wait → ok
 // Uses a 3-step chain so step 1 (middle) has a between-step turn wait that can timeout.
 test('chain per-step timeout_ms: step with short per-step timeout fires before global', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
@@ -1497,7 +1532,7 @@ test('chain per-step timeout_ms: step with short per-step timeout fires before g
     };
     ctx.isSessionBusy = (id) => id === SESSION_ID ? busy : false;
 
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-steptmout-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -1520,8 +1555,8 @@ test('chain per-step timeout_ms: step with short per-step timeout fires before g
     assert.match(result.error, /timeout/i);
     assert.equal(result.steps_completed, 1);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1531,6 +1566,7 @@ test('chain per-step timeout_ms: step with short per-step timeout fires before g
 // CHAIN-11: invalid per-step timeout_ms → rejected before session lookup
 test('chain validation: invalid per-step timeout_ms → ok:false, no PTY write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
@@ -1538,7 +1574,7 @@ test('chain validation: invalid per-step timeout_ms → ok:false, no PTY write',
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-chain-badtmout-' + Date.now();
     const ctx = makeChainCtx(SESSION_ID);
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-badtmout-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -1557,8 +1593,8 @@ test('chain validation: invalid per-step timeout_ms → ok:false, no PTY write',
     assert.match(result.error, /step.*timeout_ms|invalid.*step/i);
     assert.deepEqual(ctx._written, [], 'no PTY write for invalid step timeout_ms');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1570,6 +1606,7 @@ test('chain validation: invalid per-step timeout_ms → ok:false, no PTY write',
 // declares the turn complete and proceeds. Step 2 (final) also goes through verify.
 test('chain instant-reply mid-chain: step 1 never sets busy → verify-retries then proceeds to step 2', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '10000';
@@ -1594,7 +1631,7 @@ test('chain instant-reply mid-chain: step 1 never sets busy → verify-retries t
     };
     ctx.isSessionBusy = (id) => id === SESSION_ID ? busy : false;
 
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-instant-' + Date.now();
     const startedAt = Date.now();
@@ -1629,8 +1666,8 @@ test('chain instant-reply mid-chain: step 1 never sets busy → verify-retries t
     assert.ok(elapsed >= 1500 && elapsed <= 3500,
       `total elapsed should reflect the verify+retry windows; got ${elapsed}ms`);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1643,6 +1680,7 @@ test('chain instant-reply mid-chain: step 1 never sets busy → verify-retries t
 // once. _written must carry the retry '\r' and result.submit_retries === 1.
 test('submit-verify single: busy never rises → retry Enter, submit_retries:1', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
@@ -1650,7 +1688,7 @@ test('submit-verify single: busy never rises → retry Enter, submit_retries:1',
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-verify-noRise-' + Date.now();
     const ctx = makeCtx(SESSION_ID, () => false); // busy never rises
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'verify-norise-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: 'resume the task' });
@@ -1665,8 +1703,8 @@ test('submit-verify single: busy never rises → retry Enter, submit_retries:1',
     assert.deepEqual(ctx._written, ['resume the task', '\r', '\r'],
       'should write text, Enter, then exactly one retry Enter');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1677,6 +1715,7 @@ test('submit-verify single: busy never rises → retry Enter, submit_retries:1',
 // result.submit_retries === 0 and only one Enter written.
 test('submit-verify single: busy rises fast → no retry, submit_retries:0', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
@@ -1692,7 +1731,7 @@ test('submit-verify single: busy rises fast → no retry, submit_retries:0', asy
       origWrite(data);
       if (data === '\r') busy = true; // turn starts immediately on submit
     };
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'verify-rise-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: 'do the thing' });
@@ -1705,8 +1744,8 @@ test('submit-verify single: busy rises fast → no retry, submit_retries:0', asy
     assert.equal(result.submit_retries, 0, 'no retry when busy rises promptly');
     assert.deepEqual(ctx._written, ['do the thing', '\r'], 'only one Enter, no retry');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1719,6 +1758,7 @@ test('submit-verify single: busy rises fast → no retry, submit_retries:0', asy
 // normally record submit_retries:0.
 test('submit-verify chain final step silent: retry traced on steps[last].submit_retries', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '10000';
@@ -1741,7 +1781,7 @@ test('submit-verify chain final step silent: retry traced on steps[last].submit_
     };
     ctx.isSessionBusy = (id) => id === SESSION_ID ? busy : false;
 
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'verify-finalsilent-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -1767,8 +1807,8 @@ test('submit-verify chain final step silent: retry traced on steps[last].submit_
       ['/compact', '\r', 'resume and finish', '\r', '\r'],
       'final step writes text, Enter, then the verify-retry Enter');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1780,6 +1820,7 @@ test('submit-verify chain final step silent: retry traced on steps[last].submit_
 // appears in _written.
 test('submit-verify chain happy: auto-turn rises every step → submit_retries:0 everywhere', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
@@ -1787,7 +1828,7 @@ test('submit-verify chain happy: auto-turn rises every step → submit_retries:0
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-verify-happy-' + Date.now();
     const ctx = makeChainCtx(SESSION_ID); // auto-turn: busy@50, idle@200 per '\r'
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'verify-happy-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -1814,8 +1855,8 @@ test('submit-verify chain happy: auto-turn rises every step → submit_retries:0
     assert.deepEqual(ctx._written,
       ['/compact', '\r', 'verify and commit', '\r', 'open the PR', '\r']);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1829,6 +1870,7 @@ test('submit-verify chain happy: auto-turn rises every step → submit_retries:0
 
 test('politeness: a non-empty composer blocks every write and renounces with "not sent"', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '300';
@@ -1837,7 +1879,7 @@ test('politeness: a non-empty composer blocks every write and renounces with "no
     const SESSION_ID = 'sess-polite-busy-' + Date.now();
     const ctx       = makeCtx(SESSION_ID);
     ctx._composer.pending = 5; // the user has a half-written sentence
-    const watcher   = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'polite-busy-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', timeout_ms: 300 });
@@ -1853,8 +1895,8 @@ test('politeness: a non-empty composer blocks every write and renounces with "no
     assert.equal(typeof result.reason, 'string');
     assert.ok(result.reason.length > 0, 'the detail belongs in reason, never in error');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1863,6 +1905,7 @@ test('politeness: a non-empty composer blocks every write and renounces with "no
 
 test('politeness: an empty and quiet composer lets the write through', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
@@ -1870,7 +1913,7 @@ test('politeness: an empty and quiet composer lets the write through', async () 
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-polite-free-' + Date.now();
     const ctx       = makeCtx(SESSION_ID);
-    const watcher   = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'polite-free-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
@@ -1883,8 +1926,8 @@ test('politeness: an empty and quiet composer lets the write through', async () 
     assert.equal(result.submitted, 'assumed', 'written, no failure seen, nothing observed after');
     assert.deepEqual(ctx._written, ['/compact', '\r', '\r']);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1893,6 +1936,7 @@ test('politeness: an empty and quiet composer lets the write through', async () 
 
 test('politeness: a composer that was typed into a moment ago is not free yet', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '300';
@@ -1905,7 +1949,7 @@ test('politeness: a composer that was typed into a moment ago is not free yet', 
     // looks exactly like this, and the box is still full.
     ctx._composer.pending     = 0;
     ctx._composer.lastInputAt = Date.now();
-    const watcher   = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'polite-fresh-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', timeout_ms: 300 });
@@ -1919,8 +1963,8 @@ test('politeness: a composer that was typed into a moment ago is not free yet', 
     assert.equal(result.submitted, 'no');
     assert.equal(result.error, 'not sent');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     delete process.env.SWITCHBOARD_TRIGGER_QUIET_MS;
@@ -1930,6 +1974,7 @@ test('politeness: a composer that was typed into a moment ago is not free yet', 
 
 test('politeness: a ctx with no getComposerState is treated as busy, not as free', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '300';
@@ -1938,7 +1983,7 @@ test('politeness: a ctx with no getComposerState is treated as busy, not as free
     const SESSION_ID = 'sess-polite-blind-' + Date.now();
     const ctx       = makeCtx(SESSION_ID);
     delete ctx.getComposerState; // a transport that cannot see the composer
-    const watcher   = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'polite-blind-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', timeout_ms: 300 });
@@ -1952,8 +1997,8 @@ test('politeness: a ctx with no getComposerState is treated as busy, not as free
     assert.equal(result.submitted, 'no');
     assert.equal(result.error, 'not sent');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1962,6 +2007,7 @@ test('politeness: a ctx with no getComposerState is treated as busy, not as free
 
 test('politeness: the bare recovery Enter is withheld when the user types during the verify window', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
@@ -1976,7 +2022,7 @@ test('politeness: the bare recovery Enter is withheld when the user types during
       // submit their unfinished sentence.
       if (ctx._written.length === 2) ctx._composer.pending = 4;
     };
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'polite-recovery-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
@@ -1988,8 +2034,8 @@ test('politeness: the bare recovery Enter is withheld when the user types during
     assert.deepEqual(ctx._written, ['/compact', '\r'], 'no third write: the recovery Enter is withheld');
     assert.equal(result.submitted, 'assumed');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -1998,6 +2044,7 @@ test('politeness: the bare recovery Enter is withheld when the user types during
 
 test('submitted: a busy rising edge after our write yields "confirmed"', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
@@ -2005,7 +2052,7 @@ test('submitted: a busy rising edge after our write yields "confirmed"', async (
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-submitted-confirmed-' + Date.now();
     const ctx       = makeChainCtx(SESSION_ID); // auto-turn: busy 50ms after '\r'
-    const watcher   = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'submitted-confirmed-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
@@ -2018,8 +2065,8 @@ test('submitted: a busy rising edge after our write yields "confirmed"', async (
     assert.equal(result.submitted, 'confirmed');
     assert.deepEqual(ctx._written, ['/compact', '\r'], 'a confirmed turn needs no recovery Enter');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -2028,6 +2075,7 @@ test('submitted: a busy rising edge after our write yields "confirmed"', async (
 
 test('submitted: a chain reports the weakest of its steps, and a blocked later step is "chain timeout"', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
@@ -2041,7 +2089,7 @@ test('submitted: a chain reports the weakest of its steps, and a blocked later s
       // Step 0 lands; the user then starts typing, so step 1 must never leave.
       if (ctx._written.length === 2) ctx._composer.pending = 7;
     };
-    const watcher = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'chain-polite-' + Date.now();
     writeTrigger(tmp, uuid, {
@@ -2061,8 +2109,8 @@ test('submitted: a chain reports the weakest of its steps, and a blocked later s
     assert.equal(result.error, 'chain timeout',
       'not sent would lie here: part of the chain was written');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -2071,6 +2119,7 @@ test('submitted: a chain reports the weakest of its steps, and a blocked later s
 
 test('wait: an unrecognised value is refused loudly, before any write', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
@@ -2078,7 +2127,7 @@ test('wait: an unrecognised value is refused loudly, before any write', async ()
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-wait-typo-' + Date.now();
     const ctx       = makeCtx(SESSION_ID);
-    const watcher   = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'wait-typo-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', wait: 'idel' });
@@ -2093,8 +2142,8 @@ test('wait: an unrecognised value is refused loudly, before any write', async ()
     assert.equal(result.error, 'not sent');
     assert.ok(result.reason.includes('idel'), 'the reason must name the value received');
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -2103,6 +2152,7 @@ test('wait: an unrecognised value is refused loudly, before any write', async ()
 
 test('wait: an absent field keeps the "none" default', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
@@ -2110,7 +2160,7 @@ test('wait: an absent field keeps the "none" default', async () => {
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-wait-absent-' + Date.now();
     const ctx       = makeCtx(SESSION_ID, () => true); // busy: 'idle' would stall
-    const watcher   = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'wait-absent-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
@@ -2123,8 +2173,8 @@ test('wait: an absent field keeps the "none" default', async () => {
     assert.equal(result.submitted, 'confirmed', 'the session was already busy when we polled');
     assert.deepEqual(ctx._written, ['/compact', '\r']);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
@@ -2133,6 +2183,7 @@ test('wait: an absent field keeps the "none" default', async () => {
 
 test('submitted: a validation refusal before any write carries submitted "no"', async () => {
   const tmp = mkTmp();
+  let watcher;
   try {
     process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
@@ -2140,7 +2191,7 @@ test('submitted: a validation refusal before any write carries submitted "no"', 
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-submitted-no-' + Date.now();
     const ctx       = makeCtx(SESSION_ID);
-    const watcher   = start(ctx);
+    watcher = start(ctx);
 
     const uuid = 'submitted-no-' + Date.now();
     writeTrigger(tmp, uuid, { sessionId: 'nobody-here', command: '/compact' });
@@ -2153,8 +2204,8 @@ test('submitted: a validation refusal before any write carries submitted "no"', 
     assert.equal(result.submitted, 'no');
     assert.deepEqual(ctx._written, []);
 
-    watcher.close();
   } finally {
+    if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
