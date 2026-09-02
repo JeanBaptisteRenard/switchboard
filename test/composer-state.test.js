@@ -76,6 +76,27 @@ const CASES = [
     ['\x1b[200', '~ab\rcd\x1b[201~'],
     5,
   ],
+  // A lone Escape is held in the partial buffer. The chunk that follows it may
+  // itself start with ESC — a bracketed paste does — and the two must not be
+  // eaten as one Alt+ESC, or the paste opener is missed and the CRs inside the
+  // paste clear the composer.
+  [
+    'an Escape followed by a paste does not swallow the paste opener',
+    ['\x1b', '\x1b[200~ab\r\ncd\x1b[201~'],
+    6,
+  ],
+  // Kitty Enter without a modifier is a submission, not a line break.
+  ['bare kitty Enter fills nothing',                   ['\x1b[13u'],               0],
+  // Editing keys the scalar counter could not model.
+  ['Ctrl+W erases the word it erases on screen',       ['hello world\x17\x17'],    0],
+  ['Ctrl+A then Ctrl+K empties the box',               ['hello\x01\x0b'],          0],
+  ['Ctrl+K only kills from the cursor on',             ['hello\x1b[D\x1b[D\x0b'],  3],
+  ['Alt+Backspace erases the word before the cursor',  ['hello\x1b\x7f'],          0],
+  ['Home then Delete twice empties the box',           ['ab\x1b[H\x1b[3~\x1b[3~'], 0],
+  ['End moves back to the tail',                       ['ab\x1b[H\x1b[Fc'],        3],
+  ['Ctrl+Left is a word motion, not a character one',  ['foo bar\x1b[1;5D\x17'],   3],
+  ['an astral character weighs one backspace',         ['😀\x7f'],       0],
+  ['an astral character weighs one code point',        ['a😀b'],         3],
 ];
 
 for (const [name, chunks, expected] of CASES) {
