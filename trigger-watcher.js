@@ -6,7 +6,8 @@
 // SWITCHBOARD_TRIGGERS_DIR/processed/<uuid>.result.json; the trigger file is
 // then deleted.
 //
-// Exports: start(ctx) where ctx = { getPtyForSession, isSessionBusy, log }
+// Exports: start(ctx) where ctx = { getPtyForSession, isSessionBusy,
+//                                   getComposerState, log }
 //
 // Security limits (defense-in-depth):
 //   - Max trigger file size: 64 KB (C1)
@@ -17,6 +18,7 @@
 //   - Per-trigger timeout_ms capped at 600 000 ms (W6)
 //   - Child-process liveness check before write (W7)
 //   - Max chain length: 20 steps (W8)
+//   - No write into a composer holding unsubmitted input (see docs/automation.md)
 //
 // Platform note: fs.watch is Linux-only reliable (I2). On macOS, inotify
 // events may be coalesced or delayed; not blocked but not tested.
@@ -58,6 +60,23 @@ const DEFAULT_SUBMIT_ENTER_DELAY_MS = 50; // ms
 // Control chars forbidden in command: CR, LF, NUL, ESC (W3)
 const FORBIDDEN_COMMAND_RE = /[\r\n\0\x1b]/;
 
+// Politeness guard — see docs/automation.md and .ai/contexts/trigger-watcher.md.
+const DEFAULT_QUIET_MS = 3000;
+
+const SUBMITTED_NO        = 'no';
+const SUBMITTED_ASSUMED   = 'assumed';
+const SUBMITTED_CONFIRMED = 'confirmed';
+const SUBMITTED_RANK      = { no: 0, assumed: 1, confirmed: 2 };
+
+const ERROR_NOT_SENT      = 'not sent';
+const ERROR_CHAIN_TIMEOUT = 'chain timeout';
+
+const ACCEPTED_WAITS = ['idle', 'none'];
+
+function weakestSubmitted(a, b) {
+  return SUBMITTED_RANK[a] <= SUBMITTED_RANK[b] ? a : b;
+}
+
 // W7 — child-process liveness check.
 // node-pty's ptyProcess.write() is silent on a dead child: the bytes land in
 // the kernel PTY buffer and are never consumed.  Without this check the watcher
@@ -87,6 +106,60 @@ async function submitToPty(ptyProcess, command) {
   const ms = Number.isFinite(envMs) && envMs >= 0 ? envMs : DEFAULT_SUBMIT_ENTER_DELAY_MS;
   await delay(ms);
   ptyProcess.write('\r');
+}
+
+function getQuietMs() {
+  const v = Number(process.env.SWITCHBOARD_TRIGGER_QUIET_MS);
+  return Number.isFinite(v) && v >= 0 ? v : DEFAULT_QUIET_MS;
+}
+
+function describeBusyComposer(state, quietMs, now) {
+  if (!state) {
+    return 'the composer of this session cannot be observed, and doubt resolves to busy';
+  }
+  if (state.pending > 0) {
+    return `${state.pending} byte(s) of input are sitting unsubmitted in the composer`;
+  }
+  return `the last keystroke landed ${now - (state.lastInputAt || 0)} ms ago, ` +
+    `inside the ${quietMs} ms quiet window`;
+}
+
+/**
+ * Poll until the target composer is free — empty AND quiet — bounded by the
+ * absolute `deadlineMs`.
+ *
+ * A ctx that cannot answer, or a session it does not know, is NOT free: an
+ * unobservable composer is treated exactly like a full one.
+ *
+ * Returns { free, waited_ms, reason }.
+ */
+function waitForComposerFree(sessionId, ctx, deadlineMs) {
+  return new Promise((resolve) => {
+    const start   = Date.now();
+    const quietMs = getQuietMs();
+    const limit   = (deadlineMs !== undefined) ? deadlineMs : Infinity;
+
+    function check() {
+      const now = Date.now();
+      const state = (typeof ctx.getComposerState === 'function')
+        ? ctx.getComposerState(sessionId)
+        : null;
+
+      if (state && state.pending === 0 && (now - (state.lastInputAt || 0)) >= quietMs) {
+        return resolve({ free: true, waited_ms: now - start, reason: null });
+      }
+      if (now >= limit) {
+        return resolve({
+          free: false,
+          waited_ms: now - start,
+          reason: describeBusyComposer(state, quietMs, now),
+        });
+      }
+      setTimeout(check, IDLE_POLL_INTERVAL).unref();
+    }
+
+    check();
+  });
 }
 
 // Window (ms) to wait for the busy rising edge when verifying a submission.
@@ -178,7 +251,22 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
     };
   }
 
-  // No rise within the window — retry the Enter ONCE (bare '\r', never the text).
+  // No rise within the window — retry the Enter ONCE (bare '\r', never the text),
+  // and only into a free composer. See docs/automation.md.
+  const recoveryDeadline = Math.min(effectiveDeadline, Date.now() + windowMs);
+  const polite = await waitForComposerFree(sessionId, ctx, recoveryDeadline);
+  if (!polite.free) {
+    return {
+      submit_retries: 0,
+      rose: false,
+      sessionExited: false,
+      timedOut: false,
+      recoverySkipped: true,
+      recoveryReason: polite.reason,
+      waited_ms: first.waited_ms + polite.waited_ms,
+    };
+  }
+
   try {
     ptyProcess.write('\r');
   } catch (err) {
@@ -327,6 +415,8 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
   // I1: atomic result write — write to .tmp then rename so pollers never
   // observe a partial JSON file.
   async function writeResult(result) {
+    // Every result carries `submitted`; an unstated one is the safe value.
+    if (result.submitted === undefined) result.submitted = SUBMITTED_NO;
     try {
       fs.writeFileSync(resultTmp, JSON.stringify(result) + '\n', 'utf8');
       fs.renameSync(resultTmp, resultPath);
@@ -398,6 +488,20 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
 
   if (typeof sessionId !== 'string' || !sessionId) {
     await writeResult({ ok: false, error: 'missing required field: sessionId', sessionId: sessionId || null });
+    return;
+  }
+
+  // An unknown `wait` is refused before anything is written: falling back to
+  // 'none' would submit immediately into a session that asked to be waited for.
+  if (trigger.wait !== undefined && !ACCEPTED_WAITS.includes(trigger.wait)) {
+    await writeResult({
+      ok:        false,
+      submitted: SUBMITTED_NO,
+      error:     ERROR_NOT_SENT,
+      reason:    `wait ${JSON.stringify(String(trigger.wait))} is not a value this ` +
+                 `transport knows: only "idle" and "none", and an absent field means "none"`,
+      sessionId,
+    });
     return;
   }
 
@@ -515,6 +619,8 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
   // ── 5. Single-command path ────────────────────────────────────────────────
   if (command !== undefined) {
     let waited_ms = 0;
+    const commandDeadline = Date.now() +
+      ((resolvedTimeoutMs !== undefined) ? resolvedTimeoutMs : getIdleTimeout());
     if (wait === 'idle') {
       const result = await waitForIdle(sessionId, ctx, resolvedTimeoutMs);
       waited_ms    = result.waited_ms;
@@ -543,14 +649,36 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
       return;
     }
 
+    // Politeness — never write over input the user typed and did not submit.
+    const polite = await waitForComposerFree(sessionId, ctx, commandDeadline);
+    waited_ms += polite.waited_ms;
+    if (!polite.free) {
+      ctx.log.warn('[trigger-watcher] Composer never free, nothing sent:', sessionId, polite.reason);
+      await writeResult({
+        ok:        false,
+        submitted: SUBMITTED_NO,
+        error:     ERROR_NOT_SENT,
+        reason:    polite.reason,
+        sessionId,
+        waited_ms,
+      });
+      return;
+    }
+
     // Write to PTY: text, then Enter as a discrete keypress (see submitToPty),
     // then verify the submission actually started a turn — retrying the Enter
     // once if the busy rising edge never arrives (the 2026-06-04 "text stuck in
     // composer, Enter absorbed" incident).
     let submitRetries = 0;
+    let rose = false;
+    let recoverySkipped = false;
+    let recoveryReason = null;
     try {
       const v = await submitWithVerify(ptyProcess, sessionId, command, ctx);
-      submitRetries = v.submit_retries;
+      submitRetries   = v.submit_retries;
+      rose            = v.rose;
+      recoverySkipped = !!v.recoverySkipped;
+      recoveryReason  = v.recoveryReason || null;
       if (v.writeError) throw v.writeError;
     } catch (err) {
       ctx.log.error('[trigger-watcher] PTY write failed:', err.message);
@@ -558,16 +686,21 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
       return;
     }
 
+    if (recoverySkipped) {
+      ctx.log.warn('[trigger-watcher] Recovery Enter withheld for ' + sessionId + ': ' + recoveryReason);
+    }
     ctx.log.info(`[trigger-watcher] Sent command to ${sessionId}: ${command}` +
       (submitRetries ? ` (submit retried ${submitRetries}x)` : ''));
 
     await writeResult({
       ok:             true,
+      submitted:      rose ? SUBMITTED_CONFIRMED : SUBMITTED_ASSUMED,
       sessionId,
       command,
       sent_at:        new Date().toISOString(),
       waited_ms,
       submit_retries: submitRetries,
+      ...(recoverySkipped ? { reason: recoveryReason } : {}),
     });
     return;
   }
@@ -580,6 +713,8 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
   const steps = [];
   let totalWaitedMs = 0;
   let step0SentAt = null;
+  // A chain reports the weakest thing any of its steps achieved.
+  let chainSubmitted = SUBMITTED_CONFIRMED;
 
   // Step 0: initial wait (respects `wait` field)
   if (wait === 'idle') {
@@ -606,7 +741,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     // Check deadline before each step
     if (Date.now() >= globalDeadline) {
       ctx.log.warn(`[trigger-watcher] Chain global timeout before step ${i}:`, sessionId);
-      await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      await writeResult({ ok: false, submitted: (i > 0) ? chainSubmitted : SUBMITTED_NO, error: (i > 0) ? ERROR_CHAIN_TIMEOUT : ERROR_NOT_SENT, partial: i > 0, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
       return;
     }
 
@@ -614,7 +749,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     const entry = ctx.getPtyForSession(sessionId);
     if (!entry) {
       ctx.log.warn(`[trigger-watcher] Session exited before chain step ${i}:`, sessionId);
-      await writeResult({ ok: false, error: 'session exited during wait', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      await writeResult({ ok: false, submitted: (i > 0) ? chainSubmitted : SUBMITTED_NO, error: 'session exited during wait', partial: i > 0, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
       return;
     }
 
@@ -625,7 +760,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     // `entry.ptyProcess.write()` below is bounded by the try/catch on write.
     if (!isPtyAlive(entry.ptyProcess)) {
       ctx.log.warn(`[trigger-watcher] Target process not running at chain step ${i}:`, sessionId);
-      await writeResult({ ok: false, error: 'target process not running', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      await writeResult({ ok: false, submitted: (i > 0) ? chainSubmitted : SUBMITTED_NO, error: 'target process not running', partial: i > 0, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
       return;
     }
 
@@ -643,6 +778,22 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
       stepTimeoutMs = globalDeadline - Date.now();
     }
     const stepDeadline = Date.now() + stepTimeoutMs;
+
+    // Politeness — never write over input the user typed and did not submit.
+    const polite = await waitForComposerFree(sessionId, ctx, stepDeadline);
+    totalWaitedMs += polite.waited_ms;
+    if (!polite.free) {
+      ctx.log.warn(`[trigger-watcher] Composer never free at chain step ${i}:`, sessionId, polite.reason);
+      await writeResult({
+        ok: false,
+        submitted: weakestSubmitted(chainSubmitted, SUBMITTED_NO),
+        error: (i === 0) ? ERROR_NOT_SENT : ERROR_CHAIN_TIMEOUT,
+        reason: polite.reason,
+        partial: i > 0, steps_completed: i, sessionId, sent_at: step0SentAt, steps,
+        total_waited_ms: totalWaitedMs,
+      });
+      return;
+    }
 
     // Submit the step and verify the turn actually started (busy rising edge).
     // The verify poll IS this step's Phase 1 (busy-rise) — for non-final steps
@@ -667,7 +818,15 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     submitRetries = verify.submit_retries;
     stepWaitedMs += verify.waited_ms;
     totalWaitedMs += verify.waited_ms;
+    chainSubmitted = weakestSubmitted(
+      chainSubmitted,
+      verify.rose ? SUBMITTED_CONFIRMED : SUBMITTED_ASSUMED,
+    );
 
+    if (verify.recoverySkipped) {
+      ctx.log.warn(`[trigger-watcher] Recovery Enter withheld at chain step ${i} for ` +
+        `${sessionId}: ${verify.recoveryReason}`);
+    }
     ctx.log.info(`[trigger-watcher] Chain step ${i} sent to ${sessionId}: ${step.command}` +
       (submitRetries ? ` (submit retried ${submitRetries}x)` : ''));
 
@@ -675,13 +834,13 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     if (verify.sessionExited) {
       ctx.log.warn(`[trigger-watcher] Session exited during chain step ${i} submit verify:`, sessionId);
       steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
-      await writeResult({ ok: false, error: 'session exited during wait', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      await writeResult({ ok: false, submitted: chainSubmitted, error: 'session exited during wait', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
       return;
     }
     if (verify.timedOut) {
       ctx.log.warn(`[trigger-watcher] Chain timeout during step ${i} submit verify:`, sessionId);
       steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
-      await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+      await writeResult({ ok: false, submitted: chainSubmitted, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
       return;
     }
 
@@ -699,14 +858,14 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
       if (result.sessionExited) {
         ctx.log.warn(`[trigger-watcher] Session exited during chain step ${i} turn wait:`, sessionId);
         steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
-        await writeResult({ ok: false, error: 'session exited during wait', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+        await writeResult({ ok: false, submitted: chainSubmitted, error: 'session exited during wait', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
         return;
       }
 
       if (result.timedOut) {
         ctx.log.warn(`[trigger-watcher] Chain timeout at step ${i}:`, sessionId);
         steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
-        await writeResult({ ok: false, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
+        await writeResult({ ok: false, submitted: chainSubmitted, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
         return;
       }
     }
@@ -716,6 +875,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
 
   await writeResult({
     ok:               true,
+    submitted:        chainSubmitted,
     sessionId,
     sent_at:          step0SentAt,
     steps,
@@ -729,6 +889,8 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
  * @param {object} ctx
  * @param {function} ctx.getPtyForSession  (sessionId: string) => { ptyProcess } | null
  * @param {function} ctx.isSessionBusy     (sessionId: string) => boolean
+ * @param {function} [ctx.getComposerState] (sessionId) => { pending, lastInputAt } | null;
+ *                                          absent or null means busy, never free
  * @param {function} [ctx.isPtyAlive]      (ptyProcess) => boolean (default: signal 0 probe)
  * @param {object}   ctx.log               electron-log compatible logger
  * @returns {{ close(): void }}

@@ -51,6 +51,8 @@ const silentLog = {
  */
 function makeCtx(sessionId, isBusyFn = () => false, opts = {}) {
   const written = [];
+  // Politeness guard: an empty, quiet composer unless a test says otherwise.
+  const composer = { pending: 0, lastInputAt: 0 };
   const ptyProcess = {
     // pid points at the running node test process so the default liveness check
     // (signal-0 probe) sees a real, alive pid in existing tests.
@@ -76,8 +78,14 @@ function makeCtx(sessionId, isBusyFn = () => false, opts = {}) {
       return id === sessionId ? isBusyFn() : false;
     },
     isPtyAlive() { return alive; },
+    getComposerState(id) {
+      return id === sessionId
+        ? { pending: composer.pending, lastInputAt: composer.lastInputAt }
+        : null;
+    },
     _written: written,
     _ptyProcess: ptyProcess,
+    _composer: composer,
     _removeSession() { sessionPresent = false; },
     _killPty() { alive = false; },
   };
@@ -1030,6 +1038,8 @@ function makeChainCtx(sessionId, opts = {}) {
   const written = [];
   let busy = opts.initiallyBusy || false;
   let sessionPresent = true;
+  // Politeness guard: an empty, quiet composer unless a test says otherwise.
+  const composer = { pending: 0, lastInputAt: 0 };
 
   const ptyProcess = {
     pid: process.pid,
@@ -1057,8 +1067,14 @@ function makeChainCtx(sessionId, opts = {}) {
       return id === sessionId ? busy : false;
     },
     isPtyAlive() { return alive; },
+    getComposerState(id) {
+      return id === sessionId
+        ? { pending: composer.pending, lastInputAt: composer.lastInputAt }
+        : null;
+    },
     _written: written,
     _ptyProcess: ptyProcess,
+    _composer: composer,
     _removeSession() { sessionPresent = false; },
     _setBusy(v) { busy = v; },
     _killPty() { alive = false; },
@@ -1582,7 +1598,7 @@ test('chain instant-reply mid-chain: step 1 never sets busy → verify-retries t
     const startedAt = Date.now();
     writeTrigger(tmp, uuid, {
       sessionId: SESSION_ID,
-      wait: 'no-idle',
+      wait: 'none',
       chain: [
         { command: '/first' },
         { command: '/second' },  // step 1 never sets busy
@@ -1795,6 +1811,345 @@ test('submit-verify chain happy: auto-turn rises every step → submit_retries:0
     // No retry '\r' anywhere — exactly one Enter per command.
     assert.deepEqual(ctx._written,
       ['/compact', '\r', 'verify and commit', '\r', 'open the PR', '\r']);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// ── Politeness guard (composer state) ────────────────────────────────────────
+//
+// A transport must not write into a target that has input typed and not
+// submitted; doubt resolves to busy. See docs/automation.md.
+
+test('politeness: a non-empty composer blocks every write and renounces with "not sent"', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '300';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-polite-busy-' + Date.now();
+    const ctx       = makeCtx(SESSION_ID);
+    ctx._composer.pending = 5; // the user has a half-written sentence
+    const watcher   = start(ctx);
+
+    const uuid = 'polite-busy-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', timeout_ms: 300 });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 5000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, [], 'nothing at all may reach the PTY');
+    assert.equal(result.ok, false);
+    assert.equal(result.submitted, 'no');
+    assert.equal(result.error, 'not sent', 'error is compared by strict equality');
+    assert.equal(typeof result.reason, 'string');
+    assert.ok(result.reason.length > 0, 'the detail belongs in reason, never in error');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('politeness: an empty and quiet composer lets the write through', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-polite-free-' + Date.now();
+    const ctx       = makeCtx(SESSION_ID);
+    const watcher   = start(ctx);
+
+    const uuid = 'polite-free-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 5000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submitted, 'assumed', 'written, no failure seen, nothing observed after');
+    assert.deepEqual(ctx._written, ['/compact', '\r', '\r']);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('politeness: a composer that was typed into a moment ago is not free yet', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '300';
+    process.env.SWITCHBOARD_TRIGGER_QUIET_MS        = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-polite-fresh-' + Date.now();
+    const ctx       = makeCtx(SESSION_ID);
+    // Counter back at zero — an Enter that validated a slash-command completion
+    // looks exactly like this, and the box is still full.
+    ctx._composer.pending     = 0;
+    ctx._composer.lastInputAt = Date.now();
+    const watcher   = start(ctx);
+
+    const uuid = 'polite-fresh-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', timeout_ms: 300 });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 5000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, [], 'the freshness window must hold the write back');
+    assert.equal(result.ok, false);
+    assert.equal(result.submitted, 'no');
+    assert.equal(result.error, 'not sent');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    delete process.env.SWITCHBOARD_TRIGGER_QUIET_MS;
+    cleanup(tmp);
+  }
+});
+
+test('politeness: a ctx with no getComposerState is treated as busy, not as free', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '300';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-polite-blind-' + Date.now();
+    const ctx       = makeCtx(SESSION_ID);
+    delete ctx.getComposerState; // a transport that cannot see the composer
+    const watcher   = start(ctx);
+
+    const uuid = 'polite-blind-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', timeout_ms: 300 });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 5000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, [], 'blind must mean deferred, never "send anyway"');
+    assert.equal(result.ok, false);
+    assert.equal(result.submitted, 'no');
+    assert.equal(result.error, 'not sent');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('politeness: the bare recovery Enter is withheld when the user types during the verify window', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-polite-recovery-' + Date.now();
+    const ctx       = makeCtx(SESSION_ID); // busy never rises → recovery Enter path
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      // The user starts typing right after our Enter: the recovery '\r' would
+      // submit their unfinished sentence.
+      if (ctx._written.length === 2) ctx._composer.pending = 4;
+    };
+    const watcher = start(ctx);
+
+    const uuid = 'polite-recovery-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, ['/compact', '\r'], 'no third write: the recovery Enter is withheld');
+    assert.equal(result.submitted, 'assumed');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('submitted: a busy rising edge after our write yields "confirmed"', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-submitted-confirmed-' + Date.now();
+    const ctx       = makeChainCtx(SESSION_ID); // auto-turn: busy 50ms after '\r'
+    const watcher   = start(ctx);
+
+    const uuid = 'submitted-confirmed-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submitted, 'confirmed');
+    assert.deepEqual(ctx._written, ['/compact', '\r'], 'a confirmed turn needs no recovery Enter');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('submitted: a chain reports the weakest of its steps, and a blocked later step is "chain timeout"', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-polite-' + Date.now();
+    const ctx       = makeChainCtx(SESSION_ID);
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      // Step 0 lands; the user then starts typing, so step 1 must never leave.
+      if (ctx._written.length === 2) ctx._composer.pending = 7;
+    };
+    const watcher = start(ctx);
+
+    const uuid = 'chain-polite-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume and finish' }],
+      timeout_ms: 1500,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 8000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, ['/compact', '\r'], 'step 1 must not reach the PTY');
+    assert.equal(result.ok, false);
+    assert.equal(result.submitted, 'no', 'the weakest step governs the chain');
+    assert.equal(result.error, 'chain timeout',
+      'not sent would lie here: part of the chain was written');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('wait: an unrecognised value is refused loudly, before any write', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-wait-typo-' + Date.now();
+    const ctx       = makeCtx(SESSION_ID);
+    const watcher   = start(ctx);
+
+    const uuid = 'wait-typo-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', wait: 'idel' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 5000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, [], 'a typo must never fall back to sending immediately');
+    assert.equal(result.ok, false);
+    assert.equal(result.submitted, 'no');
+    assert.equal(result.error, 'not sent');
+    assert.ok(result.reason.includes('idel'), 'the reason must name the value received');
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('wait: an absent field keeps the "none" default', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-wait-absent-' + Date.now();
+    const ctx       = makeCtx(SESSION_ID, () => true); // busy: 'idle' would stall
+    const watcher   = start(ctx);
+
+    const uuid = 'wait-absent-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 5000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submitted, 'confirmed', 'the session was already busy when we polled');
+    assert.deepEqual(ctx._written, ['/compact', '\r']);
+
+    watcher.close();
+  } finally {
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('submitted: a validation refusal before any write carries submitted "no"', async () => {
+  const tmp = mkTmp();
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-submitted-no-' + Date.now();
+    const ctx       = makeCtx(SESSION_ID);
+    const watcher   = start(ctx);
+
+    const uuid = 'submitted-no-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: 'nobody-here', command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 5000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.equal(result.submitted, 'no');
+    assert.deepEqual(ctx._written, []);
 
     watcher.close();
   } finally {
