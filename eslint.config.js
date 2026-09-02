@@ -352,6 +352,8 @@ module.exports = [
       'schedule-ipc.js',
       'schedule-runner.js',
       'shell-profiles.js',
+      'terminal-input.js',
+      'trigger-context.js',
       'workers/**/*.js',
     ],
     languageOptions: {
