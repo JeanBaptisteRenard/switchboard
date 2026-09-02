@@ -118,6 +118,15 @@ completion empties the counter while the box stays full.
   is still full. Only the quiet window covers that.
 - A composer filled by the CLI itself — a prompt, a queued message, a resumed
   draft — was never typed and is not counted.
+- **Modified Up arrows are not counted, and on Claude Code v2.1.258 that is
+  correct — as a dated measurement, not a guarantee.** Measured on an isolated
+  PTY with a screen dump: plain `ESC [ A` and `ESC O A` do recall history (the
+  screen shows `─── History 2/2 ───` and the previous command lands back in the
+  box), which is why the counter adds one for them. `ESC [ 1;2 A` (Shift+Up),
+  `ESC [ 1;3 A` (Alt+Up) and `ESC [ 1;5 A` (Ctrl+Up) leave the box empty, so not
+  counting them is not an undercount on this version. A CLI release that gave
+  those chords a meaning would reopen an undercount — and undercounting is the
+  dangerous direction: it reads a full composer as free.
 - A triggers directory whose path contains an 8.3 short name (`JEAN-B~1`) kills
   the process outright: `fs.watch`/libuv asserts. Use the long path.
 

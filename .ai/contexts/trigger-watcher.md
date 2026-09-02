@@ -7,7 +7,9 @@
 | File | LOC | Role |
 |---|---|---|
 | `trigger-watcher.js` | ~800 | The entire module: directory setup, `fs.watch` listener, idle-wait logic, single + chained trigger processing, submit-with-verify busy-rise/fall polling, input validation, PTY write, result file. |
-| `main.js` (wiring) | 15 | `require('./trigger-watcher').start(ctx)` in the `app.whenReady` block, right after `startScheduler`. |
+| `trigger-context.js` | ~35 | `createTriggerContext({ activeSessions, log })` — builds the whole `ctx` object out of `main.js`'s session map. |
+| `terminal-input.js` | ~20 | `handleTerminalInput(activeSessions, sessionId, data, now)` — the body of the `terminal-input` IPC handler; feeds `session.composerState`. |
+| `main.js` (wiring) | 3 | `require('./trigger-watcher').start(createTriggerContext({ activeSessions, log }))` in the `app.whenReady` block, right after `startScheduler`, plus the one-line `terminal-input` registration. |
 
 ## Public surface
 
@@ -16,20 +18,25 @@
 Starts the watcher.  Call once at app boot.
 
 ```js
-require('./trigger-watcher').start({
+// main.js
+require('./trigger-watcher').start(createTriggerContext({ activeSessions, log }));
+
+// trigger-context.js builds the ctx:
+{
   log,                          // electron-log compatible
   getPtyForSession(sessionId),  // → { ptyProcess } | null
   isSessionBusy(sessionId),     // → boolean
   getComposerState(sessionId),  // → { pending, lastInputAt } | null
-});
+  isPtyAlive(ptyProcess),       // optional; only present when supplied
+}
 ```
 
 `getPtyForSession` returns `null` when the session is unknown or has already exited.
 `isSessionBusy` reads `session._cliBusy` — the same flag that tracks OSC 0 title-change spinner chars.
 `getComposerState` reads `session.composerState`, the running count of bytes the
 user typed and has not submitted (`composer-state.js`, fed from
-`ipcMain.on('terminal-input')`).  It returns `null` for an unknown or exited
-session, and **a `null` — or an absent `getComposerState` — means busy, never
+`terminal-input.js`, called from `ipcMain.on('terminal-input')`).  It returns
+`null` for an unknown or exited session, and **a `null` — or an absent `getComposerState` — means busy, never
 free**.
 
 ## The submission contract
@@ -57,6 +64,15 @@ session slept nine hours with an inert `/compact` sitting in its composer.
 **How the counter is built, and where it is blind.** See the "Politeness" section
 of `docs/automation.md` — the blind spots are listed there and are part of the
 contract, not an implementation detail.
+
+One of them is worth repeating here because it is a **dated measurement, not a
+property**: on Claude Code v2.1.258, measured on an isolated PTY with a screen
+dump, plain `ESC [ A` and `ESC O A` recall history and fill the composer (the
+screen shows `─── History 2/2 ───`), so the counter adds one for them; `ESC [
+1;2 A` (Shift+Up), `ESC [ 1;3 A` (Alt+Up) and `ESC [ 1;5 A` (Ctrl+Up) leave the
+box empty, so ignoring them is not an undercount *on that version*. A CLI
+release giving those chords a meaning would reopen an undercount — the dangerous
+direction, since it reads a full composer as free.
 
 **`submitted`.** Every result carries it, compared by strict equality:
 `confirmed` (a busy rising edge was observed after our write), `assumed`
@@ -152,7 +168,7 @@ Trigger file is **deleted** after processing (success or failure).
 
 ## Change-also checklist
 
-- If you rename `_cliBusy` on `session` in `main.js`, update `isSessionBusy` in the `start(ctx)` wiring block.
-- If you rename `session.composerState` or stop feeding it from `ipcMain.on('terminal-input')`, `getComposerState` returns `null` and **every trigger renounces with `not sent`** — the safe direction, but the channel goes silent.  Tests for the counter live in `test/composer-state.test.js`.
-- If you rename `activeSessions` or change the structure (`session.pty` → `session.ptyProcess`), update both `getPtyForSession` and `isSessionBusy` in the wiring block.
+- If you rename `_cliBusy` on `session` in `main.js`, update `isSessionBusy` in `trigger-context.js`.
+- If you rename `session.composerState` or stop feeding it from `terminal-input.js`, `getComposerState` returns `null` and **every trigger renounces with `not sent`** — the safe direction, but the channel goes silent.  Tests for the counter live in `test/composer-state.test.js`; the handler and the ctx are exercised in `test/terminal-input-handler.test.js` and `test/trigger-context.test.js`, and `test/main-wiring-source-check.test.js` reads `main.js` as text to check the remaining glue is still written down (source only — it proves nothing at runtime).
+- If you rename `activeSessions` or change the structure (`session.pty` → `session.ptyProcess`), update `getPtyForSession` and `isSessionBusy` in `trigger-context.js`, and `handleTerminalInput` in `terminal-input.js`.
 - Tests live in `test/trigger-watcher.test.js`.  They use `SWITCHBOARD_TRIGGERS_DIR` env override — do not hardcode paths there.
