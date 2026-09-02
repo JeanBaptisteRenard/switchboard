@@ -237,31 +237,45 @@ const migrations = [
   // still hits the fileMtime fast path and is left untouched).
   (db) => {
     try {
+      // Both tag orders the CLI writes: <command-name> first, and
+      // <command-message> first (/auto-compact, /pre-compact).
       const bad = db.prepare(`SELECT sessionId, folder FROM session_cache
-         WHERE summary LIKE '<command-name>%' OR summary LIKE '<local-command-stdout>%'`
+         WHERE summary LIKE '<command-name>%' OR summary LIKE '<command-message>%'
+            OR summary LIKE '<local-command-stdout>%'`
       ).all();
       if (bad.length === 0) return;
       const delRow = db.prepare('DELETE FROM session_cache WHERE sessionId = ?');
       const delFolderMeta = db.prepare('DELETE FROM cache_meta WHERE folder = ?');
-      for (const { sessionId, folder } of bad) {
-        delRow.run(sessionId);
-        if (folder) delFolderMeta.run(folder);
-      }
-      // Search entries live in tables created further down this file, so they
-      // may not exist yet on a DB this migration is the first to touch —
-      // prepared separately so a missing table throws here instead of skipping
-      // the purge above. External-content FTS5 ordering: fts delete first (it
-      // reads search_content), then content, then the map.
-      try {
-        const delFts = db.prepare("DELETE FROM search_fts WHERE rowid IN (SELECT rowid FROM search_map WHERE type = 'session' AND id = ?)");
-        const delContent = db.prepare("DELETE FROM search_content WHERE rowid IN (SELECT rowid FROM search_map WHERE type = 'session' AND id = ?)");
-        const delMap = db.prepare("DELETE FROM search_map WHERE type = 'session' AND id = ?");
-        for (const { sessionId } of bad) {
-          delFts.run(sessionId);
-          delContent.run(sessionId);
-          delMap.run(sessionId);
+      // One transaction: a purge interrupted halfway cannot be resumed, because
+      // the next launch is already at db_version 9 and the SELECT above no
+      // longer matches the rows it dropped — whatever it left behind in the
+      // search tables would stay orphaned forever.
+      db.transaction(() => {
+        for (const { sessionId, folder } of bad) {
+          delRow.run(sessionId);
+          if (folder) delFolderMeta.run(folder);
         }
-      } catch {}
+        // Search entries and per-session metrics live in tables created further
+        // down this file, so they may not exist yet on a DB this migration is
+        // the first to touch — prepared separately so a missing table throws
+        // here instead of skipping the purge above. Metrics must go the same way
+        // deleteCachedSession drops them: a phantom's file is never re-read, so
+        // its rows would keep inflating the daily counts and totals for good.
+        // External-content FTS5 ordering: fts delete first (it reads
+        // search_content), then content, then the map.
+        try {
+          const delMetrics = db.prepare('DELETE FROM session_metrics WHERE sessionId = ?');
+          const delFts = db.prepare("DELETE FROM search_fts WHERE rowid IN (SELECT rowid FROM search_map WHERE type = 'session' AND id = ?)");
+          const delContent = db.prepare("DELETE FROM search_content WHERE rowid IN (SELECT rowid FROM search_map WHERE type = 'session' AND id = ?)");
+          const delMap = db.prepare("DELETE FROM search_map WHERE type = 'session' AND id = ?");
+          for (const { sessionId } of bad) {
+            delMetrics.run(sessionId);
+            delFts.run(sessionId);
+            delContent.run(sessionId);
+            delMap.run(sessionId);
+          }
+        } catch {}
+      })();
     } catch {}
   },
 ];
