@@ -68,7 +68,7 @@ test('fresh empty database does NOT get the completeness marker', () => {
     assert.equal(state.marker, null,
       'an empty cache means no scan ever completed -- the marker must be earned by the first successful scan, ' +
       'otherwise an interrupted first scan would be blessed as complete on relaunch');
-    assert.equal(state.version, '8');
+    assert.equal(state.version, '9');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -100,7 +100,7 @@ test('pre-marker install (populated cache, db_version 7) gets the marker backfil
     assert.equal(state.marker, 'true',
       'a populated pre-marker cache can only come from a completed batch-write scan -- ' +
       'migration v8 must bless it or every existing install would re-run the full cold-start scan');
-    assert.equal(state.version, '8');
+    assert.equal(state.version, '9');
     assert.equal(state.cacheCount, 1, 'the existing cache rows are preserved, not rescanned');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -110,7 +110,7 @@ test('pre-marker install (populated cache, db_version 7) gets the marker backfil
 test('the backfill runs once: a partial cache after an interrupted post-marker scan is NOT re-blessed on relaunch', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-marker-partial-'));
   try {
-    // First load: fresh DB, migrations run to completion (db_version 8), no
+    // First load: fresh DB, migrations run to completion (db_version 9), no
     // marker (empty cache). Now simulate an interrupted first scan: some rows
     // land in session_cache, the marker is never written.
     const init = loadDbModule(dir);
@@ -122,7 +122,8 @@ test('the backfill runs once: a partial cache after an interrupted post-marker s
     `, dir);
     assert.equal(seed.status, 0, seed.stderr);
 
-    // Relaunch: db_version is already 8, so migration v8 must not run again.
+    // Relaunch: db_version is already 9, so no migration runs again -- the v8
+    // marker backfill included.
     // If it did, the partial cache would be blessed as complete and the next
     // get-projects would take the warm branch straight into the synchronous
     // reconcile sweep -- the freeze the marker exists to prevent.

@@ -109,6 +109,41 @@ function extractDailyMetrics(lines, fallbackDate) {
   return Array.from(map.values());
 }
 
+// --- First-prompt selection ---
+// Some records typed `user` carry no prompt: `!`-prefixed shell input, the
+// caveat Claude Code wraps local-command output in, that output itself, and
+// bare slash-command invocations. /clear and /model open a BRAND NEW transcript
+// whose only records are that bookkeeping, so treating one as the session
+// summary both mistitles every session started by /clear and lists
+// content-free transcripts as phantom sidebar entries.
+// Anchored: a bookkeeping record IS one of these envelopes, it does not merely
+// mention one. A prompt quoting <local-command-stdout> (pasting a transcript
+// excerpt) is a real turn, and skipping it can leave a whole session unindexed.
+const LOCAL_COMMAND_RE = /^\s*<(bash-input|bash-stdout|local-command-caveat|local-command-stdout)>/;
+// The CLI emits both tag orders — <command-name> first, and <command-message>
+// first (/auto-compact, /pre-compact) — so a command record is recognised by
+// the presence of <command-name> alongside one of its siblings, not by position.
+const COMMAND_NAME_RE = /<command-name>([^<]*)<\/command-name>/;
+const COMMAND_SIBLING_RE = /<command-(message|args)>/;
+const COMMAND_ARGS_RE = /<command-args>([^<]*)<\/command-args>/;
+
+/** Classify a user message's text as a summary candidate:
+ *    'prompt'  — a real user turn, used as-is.
+ *    'command' — a slash-command invocation, usable only as a fallback.
+ *    'skip'    — local-command bookkeeping, never a summary.
+ */
+function classifyUserText(text) {
+  if (!text || LOCAL_COMMAND_RE.test(text)) return { kind: 'skip', text: '' };
+  const cmd = text.match(COMMAND_NAME_RE);
+  if (cmd && COMMAND_SIBLING_RE.test(text)) {
+    const name = cmd[1].trim();
+    const args = (text.match(COMMAND_ARGS_RE)?.[1] || '').trim();
+    return { kind: 'command', text: (args ? name + ' ' + args : name).slice(0, 120) };
+  }
+  const taskMatch = text.match(/<scheduled-task\s+name="([^"]+)"/);
+  return { kind: 'prompt', text: taskMatch ? 'Scheduled: ' + taskMatch[1] : text.slice(0, 120) };
+}
+
 /** Parse a single .jsonl file into a session object (or null if invalid).
  *  opts.parentSessionId — if set, treat as a subagent transcript and stamp the
  *  parent reference into the returned row.
@@ -121,6 +156,9 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
     const content = fs.readFileSync(filePath, 'utf8');
     const lines = content.split('\n').filter(Boolean);
     let summary = '';
+    // Fallback title for a session whose only user turn is a slash command.
+    let commandSummary = '';
+    let assistantSeen = false;
     let messageCount = 0;
     let textContent = '';
     let slug = null;
@@ -158,22 +196,26 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
           (entry.type === 'message' && (entry.role === 'user' || entry.role === 'assistant'))) {
         messageCount++;
       }
+      if (entry.type === 'assistant' || (entry.type === 'message' && entry.role === 'assistant')) {
+        assistantSeen = true;
+      }
       const msg = entry.message;
       const text = typeof msg === 'string' ? msg :
         (typeof msg?.content === 'string' ? msg.content :
         (msg?.content?.[0]?.text || ''));
       if (!summary && (entry.type === 'user' || (entry.type === 'message' && entry.role === 'user'))) {
-        // Skip local command messages (! prefix) — use the next real user message
-        if (text && !/<bash-input>|<bash-stdout>|<local-command-caveat>/.test(text)) {
-          // Use scheduled task name if present
-          const taskMatch = text.match(/<scheduled-task\s+name="([^"]+)"/);
-          summary = taskMatch ? 'Scheduled: ' + taskMatch[1] : text.slice(0, 120);
-        }
+        const cand = classifyUserText(text);
+        if (cand.kind === 'prompt') summary = cand.text;
+        else if (cand.kind === 'command' && !commandSummary) commandSummary = cand.text;
       }
       if (text && textContent.length < 8000) {
         textContent += text.slice(0, 500) + '\n';
       }
     }
+    // A slash command stands in as the title only when the session went on to
+    // do something. Bookkeeping-only transcripts (a bare /clear) have nothing
+    // to show and must not be indexed at all.
+    if (!summary && assistantSeen) summary = commandSummary;
     if (!summary || messageCount < 1) return null;
 
     const fallbackDate = stat.mtime.toISOString().slice(0, 10);
@@ -312,6 +354,8 @@ function readSessionDisplayHeader(filePath, opts = {}) {
     if (n < stat.size) lines.pop();
 
     let summary = '';
+    let commandSummary = '';
+    let assistantSeen = false;
     let slug = null, customTitle = null, aiTitle = null, agentId = null;
     let sidechainSeen = false;
     let lineCount = 0;
@@ -323,6 +367,9 @@ function readSessionDisplayHeader(filePath, opts = {}) {
       if (entry.slug && !slug) slug = entry.slug;
       if (entry.agentId && !agentId) agentId = entry.agentId;
       if (entry.isSidechain) sidechainSeen = true;
+      if (entry.type === 'assistant' || (entry.type === 'message' && entry.role === 'assistant')) {
+        assistantSeen = true;
+      }
       if (entry.type === 'custom-title' && entry.customTitle && !customTitle) customTitle = entry.customTitle;
       if (entry.type === 'ai-title' && entry.aiTitle && !aiTitle) aiTitle = entry.aiTitle;
       const msg = entry.message;
@@ -330,13 +377,13 @@ function readSessionDisplayHeader(filePath, opts = {}) {
         (typeof msg?.content === 'string' ? msg.content :
         (msg?.content?.[0]?.text || ''));
       if (!summary && (entry.type === 'user' || (entry.type === 'message' && entry.role === 'user'))) {
-        if (txt && !/<bash-input>|<bash-stdout>|<local-command-caveat>/.test(txt)) {
-          const taskMatch = txt.match(/<scheduled-task\s+name="([^"]+)"/);
-          summary = taskMatch ? 'Scheduled: ' + taskMatch[1] : txt.slice(0, 120);
-        }
+        const cand = classifyUserText(txt);
+        if (cand.kind === 'prompt') summary = cand.text;
+        else if (cand.kind === 'command' && !commandSummary) commandSummary = cand.text;
       }
     }
 
+    if (!summary && assistantSeen) summary = commandSummary;
     if (!summary) return null;
 
     if (isSubagent) {
@@ -371,4 +418,4 @@ function readSessionDisplayHeader(filePath, opts = {}) {
   }
 }
 
-module.exports = { readSessionFile, readSessionDisplayHeader, subagentSessionId, resolveJsonlPath, readSubagentMeta, enumerateSessionFiles, extractDailyMetrics, isToolResultOnly };
+module.exports = { readSessionFile, readSessionDisplayHeader, classifyUserText, subagentSessionId, resolveJsonlPath, readSubagentMeta, enumerateSessionFiles, extractDailyMetrics, isToolResultOnly };
