@@ -75,6 +75,9 @@ const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 const { isSensitivePath, isAllowedMemoryPath: _isAllowedMemoryPath } = require('./ipc-path-validator');
 const { normalizePtySize } = require('./pty-size');
+const { createComposerState } = require('./composer-state');
+const { handleTerminalInput } = require('./terminal-input');
+const { createTriggerContext } = require('./trigger-context');
 
 
 // --- Auto-updater (only in packaged builds) ---
@@ -2010,6 +2013,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     // sessions, and a reattached session is still inside the same sandbox.
     sandbox: !!sessionOptions?.sandbox,
     mcpServer, _openedAt: Date.now(),
+    // see docs/automation.md — the trigger watcher's politeness guard
+    composerState: createComposerState(),
   };
   activeSessions.set(sessionId, session);
 
@@ -2148,10 +2153,7 @@ if (TRACE) {
 
 // --- IPC: terminal-input (fire-and-forget) ---
 ipcMain.on('terminal-input', (_event, sessionId, data) => {
-  const session = activeSessions.get(sessionId);
-  if (session && !session.exited) {
-    session.pty.write(data);
-  }
+  handleTerminalInput(activeSessions, sessionId, data, Date.now());
 });
 
 // --- IPC: terminal-resize (fire-and-forget) ---
@@ -2439,18 +2441,7 @@ if (!gotSingleInstanceLock) {
     // I3: wrapped in try/catch so a boot failure here doesn't abort
     // app.whenReady (auto-updater, etc. would otherwise be silently lost).
     try {
-      require('./trigger-watcher').start({
-        log,
-        getPtyForSession(sessionId) {
-          const session = activeSessions.get(sessionId);
-          if (!session || session.exited) return null;
-          return { ptyProcess: session.pty };
-        },
-        isSessionBusy(sessionId) {
-          const session = activeSessions.get(sessionId);
-          return session ? !!session._cliBusy : false;
-        },
-      });
+      require('./trigger-watcher').start(createTriggerContext({ activeSessions, log }));
     } catch (err) {
       log.error('[trigger-watcher] Failed to start trigger watcher:', err.message);
     }
