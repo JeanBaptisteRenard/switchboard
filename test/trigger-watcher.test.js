@@ -1972,6 +1972,132 @@ test('politeness: a composer that was typed into a moment ago is not free yet', 
   }
 });
 
+// A launcher that exports a variable without a value hands the process an
+// empty string. Number('') is 0 and finite, so a naive parse accepts it and
+// collapses the quiet window to nothing — half the guard gone, silently.
+test('politeness: SWITCHBOARD_TRIGGER_QUIET_MS="" falls back to the default window', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '300';
+    process.env.SWITCHBOARD_TRIGGER_QUIET_MS        = '';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-polite-emptyenv-' + Date.now();
+    const ctx       = makeCtx(SESSION_ID);
+    ctx._composer.pending     = 0;
+    ctx._composer.lastInputAt = Date.now();
+    watcher = start(ctx);
+
+    const uuid = 'polite-emptyenv-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', timeout_ms: 300 });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 5000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, [],
+      'an empty override must not be read as a zero-length quiet window');
+    assert.equal(result.ok, false);
+    assert.equal(result.submitted, 'no');
+    assert.equal(result.error, 'not sent');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    delete process.env.SWITCHBOARD_TRIGGER_QUIET_MS;
+    cleanup(tmp);
+  }
+});
+
+// W7 — the liveness probe has to sit after the politeness wait, not before it:
+// that wait runs to the trigger deadline, so a probe taken before it says
+// nothing about the process at the moment of the write.
+test('W7: a PTY that dies during the politeness wait is not written to', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  let flip;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-polite-dies-' + Date.now();
+    const ctx       = makeCtx(SESSION_ID);
+    // Alive and busy at the moment the trigger lands: the pre-flight probe
+    // passes and the politeness wait begins.
+    ctx._composer.pending     = 5;
+    ctx._composer.lastInputAt = 0;
+    watcher = start(ctx);
+
+    // The user submits, then the CLI exits — while we are still waiting.
+    flip = setTimeout(() => { ctx._composer.pending = 0; ctx._killPty(); }, 250);
+
+    const uuid = 'polite-dies-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', timeout_ms: 4000 });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 8000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, [], 'not one byte may reach a dead PTY');
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'target process not running');
+
+  } finally {
+    if (flip) clearTimeout(flip);
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('W7: a chain step whose PTY dies during the politeness wait writes nothing', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  let flip;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-dies-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    ctx._composer.pending     = 5;
+    ctx._composer.lastInputAt = 0;
+    watcher = start(ctx);
+
+    flip = setTimeout(() => { ctx._composer.pending = 0; ctx._killPty(); }, 250);
+
+    const uuid = 'chain-dies-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      chain: [{ command: '/compact' }, { command: 'resume and finish' }],
+      timeout_ms: 4000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 8000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, [], 'not one byte may reach a dead PTY');
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'target process not running');
+    assert.equal(result.submitted, 'no');
+    assert.equal(result.partial, false);
+
+  } finally {
+    if (flip) clearTimeout(flip);
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
 test('politeness: a ctx with no getComposerState is treated as busy, not as free', async () => {
   const tmp = mkTmp();
   let watcher;

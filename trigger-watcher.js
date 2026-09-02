@@ -102,15 +102,23 @@ function delay(ms) {
 // keypress rather than a trailing newline. See DEFAULT_SUBMIT_ENTER_DELAY_MS.
 async function submitToPty(ptyProcess, command) {
   ptyProcess.write(command);
-  const envMs = Number(process.env.SWITCHBOARD_SUBMIT_ENTER_DELAY_MS);
-  const ms = Number.isFinite(envMs) && envMs >= 0 ? envMs : DEFAULT_SUBMIT_ENTER_DELAY_MS;
-  await delay(ms);
+  const envMs = envNumber('SWITCHBOARD_SUBMIT_ENTER_DELAY_MS');
+  await delay(envMs !== undefined ? envMs : DEFAULT_SUBMIT_ENTER_DELAY_MS);
   ptyProcess.write('\r');
 }
 
+// A variable set to the empty string is a launcher artefact, not a value:
+// Number('') is 0, which would silently drop the window to nothing.
+function envNumber(name) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const v = Number(raw);
+  return Number.isFinite(v) && v >= 0 ? v : undefined;
+}
+
 function getQuietMs() {
-  const v = Number(process.env.SWITCHBOARD_TRIGGER_QUIET_MS);
-  return Number.isFinite(v) && v >= 0 ? v : DEFAULT_QUIET_MS;
+  const v = envNumber('SWITCHBOARD_TRIGGER_QUIET_MS');
+  return v !== undefined ? v : DEFAULT_QUIET_MS;
 }
 
 function describeBusyComposer(state, quietMs, now) {
@@ -165,8 +173,8 @@ function waitForComposerFree(sessionId, ctx, deadlineMs) {
 // Window (ms) to wait for the busy rising edge when verifying a submission.
 // Defaults to BUSY_RISE_TIMEOUT_MS; override via SWITCHBOARD_SUBMIT_VERIFY_MS.
 function getSubmitVerifyMs() {
-  const v = Number(process.env.SWITCHBOARD_SUBMIT_VERIFY_MS);
-  return Number.isFinite(v) && v >= 0 ? v : BUSY_RISE_TIMEOUT_MS;
+  const v = envNumber('SWITCHBOARD_SUBMIT_VERIFY_MS');
+  return v !== undefined ? v : BUSY_RISE_TIMEOUT_MS;
 }
 
 /**
@@ -652,16 +660,6 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
       }
     }
 
-    // W7 — re-check liveness right before writing.  The idle wait can be up to
-    // 10 min (MAX_TRIGGER_TIMEOUT); the child may have exited during that
-    // window while busy-was-true never flipped.  Without this re-check we'd
-    // write into a dead PTY and claim ok:true.
-    if (!isPtyAlive(ptyProcess)) {
-      ctx.log.warn('[trigger-watcher] Target process exited during wait:', sessionId);
-      await writeResult({ ok: false, error: 'target process not running', sessionId, waited_ms });
-      return;
-    }
-
     // Politeness — never write over input the user typed and did not submit.
     const polite = await waitForComposerFree(sessionId, ctx, commandDeadline);
     waited_ms += polite.waited_ms;
@@ -675,6 +673,17 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
         sessionId,
         waited_ms,
       });
+      return;
+    }
+
+    // W7 — re-check liveness right before writing.  The idle wait can be up to
+    // 10 min (MAX_TRIGGER_TIMEOUT) and the politeness wait runs to the same
+    // deadline; the child may have exited during either while busy-was-true
+    // never flipped.  This probe belongs AFTER both waits: run before them it
+    // proves nothing about the moment of the write.
+    if (!isPtyAlive(ptyProcess)) {
+      ctx.log.warn('[trigger-watcher] Target process exited during wait:', sessionId);
+      await writeResult({ ok: false, error: 'target process not running', sessionId, waited_ms });
       return;
     }
 
@@ -781,17 +790,6 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
       return;
     }
 
-    // W7 — liveness check before each step's write.  The previous step's turn
-    // wait may have spanned several minutes; the child could have exited while
-    // main.js still has a stale activeSessions entry.  See also the
-    // liveness→write TOCTOU window: an exit between this probe and
-    // `entry.ptyProcess.write()` below is bounded by the try/catch on write.
-    if (!isPtyAlive(entry.ptyProcess)) {
-      ctx.log.warn(`[trigger-watcher] Target process not running at chain step ${i}:`, sessionId);
-      await writeResult({ ok: false, submitted: (i > 0) ? chainSubmitted : SUBMITTED_NO, error: 'target process not running', partial: i > 0, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
-      return;
-    }
-
     // Inject the step command
     const stepSentAt = new Date().toISOString();
     if (i === 0) step0SentAt = stepSentAt;
@@ -820,6 +818,18 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
         partial: i > 0, steps_completed: i, sessionId, sent_at: step0SentAt, steps,
         total_waited_ms: totalWaitedMs,
       });
+      return;
+    }
+
+    // W7 — liveness check before each step's write.  The previous step's turn
+    // wait may have spanned several minutes and the politeness wait runs to
+    // this step's deadline; the child could have exited during either while
+    // main.js still has a stale activeSessions entry.  The probe belongs after
+    // both waits.  The remaining liveness→write TOCTOU window is bounded by
+    // the try/catch on write.
+    if (!isPtyAlive(entry.ptyProcess)) {
+      ctx.log.warn(`[trigger-watcher] Target process not running at chain step ${i}:`, sessionId);
+      await writeResult({ ok: false, submitted: (i > 0) ? chainSubmitted : SUBMITTED_NO, error: 'target process not running', partial: i > 0, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
       return;
     }
 
