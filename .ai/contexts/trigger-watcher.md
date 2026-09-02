@@ -33,7 +33,7 @@ require('./trigger-watcher').start(createTriggerContext({ activeSessions, log })
 
 `getPtyForSession` returns `null` when the session is unknown or has already exited.
 `isSessionBusy` reads `session._cliBusy` — the same flag that tracks OSC 0 title-change spinner chars.
-`getComposerState` reads `session.composerState`, the running count of bytes the
+`getComposerState` reads `session.composerState`, the running model of what the
 user typed and has not submitted (`composer-state.js`, fed from
 `terminal-input.js`, called from `ipcMain.on('terminal-input')`).  It returns
 `null` for an unknown or exited session, and **a `null` — or an absent `getComposerState` — means busy, never
@@ -61,18 +61,37 @@ submits at all — the CLI only submits `/compact` through the completion menu,
 which opens only when the `/` is the first character of an empty box.  A VPS
 session slept nine hours with an inert `/compact` sitting in its composer.
 
-**How the counter is built, and where it is blind.** See the "Politeness" section
-of `docs/automation.md` — the blind spots are listed there and are part of the
-contract, not an implementation detail.
+**Politeness bounds the wait, and `wait:"none"` is not exempt.** The composer
+wait runs to the trigger's deadline — `timeout_ms`, or the idle default, 300 000
+ms — and holds one of the `MAX_INFLIGHT` (8) slots for its whole duration. So
+`wait:"none"` no longer means "write now": on a non-empty composer it blocks
+like any other, and a few such triggers stall the queue. `timeout_ms` is the
+only lever.
+
+**Liveness is probed after the waits, never before them.** `isPtyAlive` runs
+once as a pre-flight, then again *after* `waitForComposerFree` on the
+single-`command` path and on every chain step. A probe taken before a wait that
+can last minutes proves nothing about the process at the moment of the write.
+The residual probe→write window is bounded by the try/catch on the write.
+
+**How the model is built, and where it is blind.** `composer-state.js` keeps a
+copy of the composer's text and a cursor into it, and applies the editing keys
+it recognises (backspace, Delete, Ctrl+W, Ctrl+K, Alt+Backspace, Ctrl+A/Ctrl+E,
+Home/End, arrows). `pending` is that text's length in code points. A scalar
+counter could not model those keys — the number of characters a Ctrl+W removes
+is unknowable without the text — and left `pending` positive for good after any
+of them, which mutes every later trigger for that session. See the "Politeness"
+section of `docs/automation.md` for the full table and the blind spots; they are
+part of the contract, not an implementation detail.
 
 One of them is worth repeating here because it is a **dated measurement, not a
 property**: on Claude Code v2.1.258, measured on an isolated PTY with a screen
 dump, plain `ESC [ A` and `ESC O A` recall history and fill the composer (the
-screen shows `─── History 2/2 ───`), so the counter adds one for them; `ESC [
-1;2 A` (Shift+Up), `ESC [ 1;3 A` (Alt+Up) and `ESC [ 1;5 A` (Ctrl+Up) leave the
-box empty, so ignoring them is not an undercount *on that version*. A CLI
-release giving those chords a meaning would reopen an undercount — the dangerous
-direction, since it reads a full composer as free.
+screen shows `─── History 2/2 ───`), so the model inserts one placeholder for
+them; `ESC [ 1;2 A` (Shift+Up), `ESC [ 1;3 A` (Alt+Up) and `ESC [ 1;5 A`
+(Ctrl+Up) leave the box empty, so ignoring them is not an undercount *on that
+version*. A CLI release giving those chords a meaning would reopen an
+undercount — the dangerous direction, since it reads a full composer as free.
 
 **`submitted`.** Every result carries it, compared by strict equality:
 `confirmed` (a busy rising edge was observed after our write), `assumed`
@@ -169,6 +188,6 @@ Trigger file is **deleted** after processing (success or failure).
 ## Change-also checklist
 
 - If you rename `_cliBusy` on `session` in `main.js`, update `isSessionBusy` in `trigger-context.js`.
-- If you rename `session.composerState` or stop feeding it from `terminal-input.js`, `getComposerState` returns `null` and **every trigger renounces with `not sent`** — the safe direction, but the channel goes silent.  Tests for the counter live in `test/composer-state.test.js`; the handler and the ctx are exercised in `test/terminal-input-handler.test.js` and `test/trigger-context.test.js`, and `test/main-wiring-source-check.test.js` reads `main.js` as text to check the remaining glue is still written down (source only — it proves nothing at runtime).
+- If you rename `session.composerState` or stop feeding it from `terminal-input.js`, `getComposerState` returns `null` and **every trigger renounces with `not sent`** — the safe direction, but the channel goes silent.  Tests for the model live in `test/composer-state.test.js`; the handler and the ctx are exercised in `test/terminal-input-handler.test.js` and `test/trigger-context.test.js`, and `test/main-wiring-source-check.test.js` reads `main.js` as text to check the remaining glue is still written down (source only — it proves nothing at runtime).
 - If you rename `activeSessions` or change the structure (`session.pty` → `session.ptyProcess`), update `getPtyForSession` and `isSessionBusy` in `trigger-context.js`, and `handleTerminalInput` in `terminal-input.js`.
 - Tests live in `test/trigger-watcher.test.js`.  They use `SWITCHBOARD_TRIGGERS_DIR` env override — do not hardcode paths there.

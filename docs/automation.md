@@ -54,8 +54,8 @@ The trigger watcher lets any external script type into an open session's termina
 
 - `sessionId` — the target session (must be open in Switchboard).
 - `command` — written to the PTY, followed by a discrete Enter keypress.
-- `wait` — `"none"` (default) sends immediately; `"idle"` waits until the session stops being busy before sending. Use `"idle"` for anything that must not interrupt a mid-response stream.
-- `timeout_ms` — optional cap on the idle wait (≤ 600 000 ms; default 300 000).
+- `wait` — `"none"` (default) does not wait for the session to stop being busy; `"idle"` does. Neither sends into a composer with unsubmitted input: see "Politeness" — `"none"` can still wait, up to `timeout_ms`. Use `"idle"` for anything that must not interrupt a mid-response stream.
+- `timeout_ms` — optional cap on the waiting, idle **and politeness** (≤ 600 000 ms; default 300 000). See "Politeness" below: with `wait: "none"` this is the only bound on how long a trigger sits waiting for a free composer.
 
 Environment overrides: `SWITCHBOARD_TRIGGERS_DIR` (watched directory), `SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS` (default idle wait), `SWITCHBOARD_TRIGGER_QUIET_MS` (the politeness quiet window, default 3000 ms).
 
@@ -91,30 +91,58 @@ completion menu, which opens only when the `/` is the first character of an
 empty box. A session once slept nine hours with an inert `/compact` sitting in
 its composer. Politeness is the condition under which the channel works.
 
-**How Switchboard knows.** It counts the bytes. Every keystroke the renderer
-sends reaches the main process through one IPC channel, and `composer-state.js`
-folds each chunk into a running count of unsubmitted input: printable bytes and
-pasted bytes add, backspace subtracts, Enter / Ctrl+U / Ctrl+C reset to zero,
-cursor motion and other escape sequences change nothing. A bracketed paste
-(`ESC [ 200 ~` … `ESC [ 201 ~`) counts every byte it contains and its embedded
-carriage returns do **not** reset the count. An escape sequence cut across two
-IPC chunks is buffered and re-joined, so half a sequence is never counted as
-text. A sequence that cannot be parsed at all counts as input: **doubt resolves
-to busy**, always.
+**How Switchboard knows.** It models the box. Every keystroke the renderer sends
+reaches the main process through one IPC channel, and `composer-state.js` keeps
+a running copy of the text it believes is sitting there, plus a cursor into it.
+`pending` is that text's length in **code points**, so an emoji weighs one and
+one backspace removes it.
 
-The composer is called free only when the count is zero **and** nothing has been
-typed for `SWITCHBOARD_TRIGGER_QUIET_MS` (default 3000). The freshness window
-covers the one case the count cannot: an Enter that validates a slash-command
-completion empties the counter while the box stays full.
+A counter could only add and subtract; a model can be edited. What is applied:
+
+| Input | Effect on the model |
+|---|---|
+| printable bytes, pasted bytes, `ESC [ 200 ~` … `ESC [ 201 ~` content | inserted at the cursor — a paste's embedded carriage returns are text, and do **not** clear the box |
+| Enter, newline, Ctrl+U, Ctrl+C | clears |
+| Backspace / DEL, `ESC [ 3 ~` (Delete) | removes one code point behind / ahead of the cursor |
+| Ctrl+W, Alt+Backspace | removes the word before the cursor |
+| Ctrl+K | removes from the cursor to the end |
+| Left / Right (`ESC [ C`, `ESC O C`, …), Ctrl+A, Ctrl+E, Home, End | move the cursor; a modified Left/Right moves by a word |
+| bare Up (`ESC [ A`, `ESC O A`), Ctrl+V, an unparseable escape | insert one opaque placeholder — the content is unknown, so it counts as one |
+| kitty Enter **with** a modifier (`ESC [ 13;2 u`, `ESC [ 13;5 u`) | inserts a line break |
+| kitty Enter **without** one (`ESC [ 13 u`), modified Up, OSC, other escapes | nothing |
+
+An escape sequence cut across two IPC chunks is buffered and re-joined, so half
+a sequence is never counted as text — including a lone `ESC` that turns out to
+be the first byte of the next chunk's bracketed paste. A sequence that cannot be
+parsed at all counts as input: **doubt resolves to busy**, always.
+
+The composer is called free only when `pending` is zero **and** nothing has
+arrived on that channel for `SWITCHBOARD_TRIGGER_QUIET_MS` (default 3000). The
+freshness window covers the one case the model cannot: an Enter that validates a
+slash-command completion empties the box while the CLI refills it.
 
 **Where this is blind — stated, not papered over:**
 
 - Only bytes coming from the renderer are seen. Input reaching the PTY by any
-  other route is invisible to the counter.
+  other route is invisible to the model.
+- The model is a **line editor's** model, not the CLI's. It knows nothing of
+  wrapping, of multi-line navigation, or of any binding Claude Code adds beyond
+  the table above; an unmodelled editing key leaves the text longer than the box
+  really is. That over-count is the safe direction — the trigger renounces —
+  but it stays until the next Enter, Ctrl+U or Ctrl+C, and until then every
+  trigger for that session renounces.
+- Ctrl+U is treated as clearing the whole box, which is right when the cursor is
+  at the end. Used mid-line it would be an under-count if the CLI binds it to
+  "kill to start of line" — unmeasured.
+- Any non-empty chunk on the channel restarts the quiet clock, whether or not it
+  changes the text. A TUI that has enabled mouse reporting (`CSI ?1003h`) sends
+  a report per mouse move, so moving the pointer over the terminal delays a
+  trigger — bounded by the quiet window, so at most ~3 s each time, never a
+  refusal on its own.
 - Escape does **not** clear the composer on Claude Code v2.1.258 (measured), so
   treating it as neutral is correct *today*. A CLI change would turn it into a
   false "free".
-- An Enter that validates a completion menu zeroes the counter although the box
+- An Enter that validates a completion menu empties the model although the box
   is still full. Only the quiet window covers that.
 - A composer filled by the CLI itself — a prompt, a queued message, a resumed
   draft — was never typed and is not counted.
@@ -122,7 +150,7 @@ completion empties the counter while the box stays full.
   correct — as a dated measurement, not a guarantee.** Measured on an isolated
   PTY with a screen dump: plain `ESC [ A` and `ESC O A` do recall history (the
   screen shows `─── History 2/2 ───` and the previous command lands back in the
-  box), which is why the counter adds one for them. `ESC [ 1;2 A` (Shift+Up),
+  box), which is why the model inserts one placeholder for them. `ESC [ 1;2 A` (Shift+Up),
   `ESC [ 1;3 A` (Alt+Up) and `ESC [ 1;5 A` (Ctrl+Up) leave the box empty, so not
   counting them is not an undercount on this version. A CLI release that gave
   those chords a meaning would reopen an undercount — and undercounting is the
@@ -134,6 +162,13 @@ The guard applies to every write, including the bare recovery Enter the watcher
 sends when it saw no turn start — on a half-typed sentence that Enter would
 submit the sentence. When politeness never allows a write, the result is
 `{ "ok": false, "submitted": "no", "error": "not sent", "reason": "…" }`.
+
+**What this costs `wait: "none"`.** It no longer means "write now": against a
+non-empty composer it waits, and the only bound is `timeout_ms` — 300 000 ms by
+default. For all of that time the trigger holds one of the 8 concurrent slots
+(`MAX_INFLIGHT`), so a handful of triggers aimed at sessions whose users walked
+away mid-sentence can stall the queue for every other session. Set a short
+`timeout_ms` on triggers that would rather renounce than wait.
 
 ### Reading a result
 
