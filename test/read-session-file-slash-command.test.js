@@ -173,3 +173,93 @@ test('a scheduled-task prompt still wins over a leading slash command', () => {
     cleanup(tmp);
   }
 });
+
+// The CLI writes the two envelope tags in either order. /auto-compact and
+// /pre-compact put <command-message> first; requiring <command-name> to open
+// the record let the raw XML back in as the summary, which cleanDisplayName
+// then truncated to "/pre-compact pre-compact </comm".
+test('a command record whose <command-message> comes first is still a command', () => {
+  const tmp = mkTmp();
+  try {
+    const filePath = write(tmp, 'message-first', [
+      {
+        type: 'user',
+        timestamp: '2026-08-26T07:44:02.578Z',
+        message: {
+          role: 'user',
+          content: '<command-message>auto-compact</command-message>\n<command-name>/auto-compact</command-name>',
+        },
+      },
+      { type: 'assistant', timestamp: '2026-08-26T07:44:03.000Z', message: { role: 'assistant', content: 'compacting' } },
+    ]);
+
+    const row = readSessionFile(filePath, 'folder-x', '/some/project');
+    assert.equal(row.summary, '/auto-compact');
+    assert.equal(readSessionDisplayHeader(filePath).summary, '/auto-compact');
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('a message-first command record carries its args into the title', () => {
+  const tmp = mkTmp();
+  try {
+    const filePath = write(tmp, 'message-first-args', [
+      {
+        type: 'user',
+        timestamp: '2026-08-26T07:44:02.578Z',
+        message: {
+          role: 'user',
+          content: '<command-message>pre-compact</command-message>\n<command-name>/pre-compact</command-name>\n<command-args>manual</command-args>',
+        },
+      },
+      { type: 'assistant', timestamp: '2026-08-26T07:44:03.000Z', message: { role: 'assistant', content: 'noted' } },
+    ]);
+
+    assert.equal(readSessionFile(filePath, 'folder-x', '/some/project').summary, '/pre-compact manual');
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test('a message-first command record alone is bookkeeping, not a session', () => {
+  const tmp = mkTmp();
+  try {
+    const filePath = write(tmp, 'message-first-only', [
+      {
+        type: 'user',
+        timestamp: '2026-08-26T07:44:02.578Z',
+        message: {
+          role: 'user',
+          content: '<command-message>auto-compact</command-message>\n<command-name>/auto-compact</command-name>',
+        },
+      },
+    ]);
+    assert.equal(readSessionFile(filePath, 'folder-x', '/some/project'), null);
+    assert.equal(readSessionDisplayHeader(filePath), null);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+// The bookkeeping test is anchored: a record IS an envelope, it does not merely
+// mention one. Matching anywhere in the text made a prompt quoting a transcript
+// excerpt disappear -- with no other user turn, the whole session went unindexed
+// (absent from the sidebar and from search).
+test('a prompt quoting local-command output is a real prompt', () => {
+  const tmp = mkTmp();
+  try {
+    const quoted = 'why is <local-command-stdout>Set model to Sonnet 5</local-command-stdout> skipped here?';
+    const filePath = write(tmp, 'quoting-prompt', [
+      { type: 'user', timestamp: '2026-08-26T07:45:00.000Z', message: { role: 'user', content: quoted } },
+      { type: 'assistant', timestamp: '2026-08-26T07:45:01.000Z', message: { role: 'assistant', content: 'because…' } },
+    ]);
+
+    const row = readSessionFile(filePath, 'folder-x', '/some/project');
+    assert.notEqual(row, null, 'a session whose only prompt quotes an envelope must still be indexed');
+    assert.equal(row.summary, quoted);
+    assert.equal(readSessionDisplayHeader(filePath).summary, quoted);
+  } finally {
+    cleanup(tmp);
+  }
+});

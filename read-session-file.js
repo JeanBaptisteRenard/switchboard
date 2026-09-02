@@ -116,8 +116,15 @@ function extractDailyMetrics(lines, fallbackDate) {
 // whose only records are that bookkeeping, so treating one as the session
 // summary both mistitles every session started by /clear and lists
 // content-free transcripts as phantom sidebar entries.
-const LOCAL_COMMAND_RE = /<bash-input>|<bash-stdout>|<local-command-caveat>|<local-command-stdout>/;
-const SLASH_COMMAND_RE = /^\s*<command-name>([^<]*)<\/command-name>/;
+// Anchored: a bookkeeping record IS one of these envelopes, it does not merely
+// mention one. A prompt quoting <local-command-stdout> (pasting a transcript
+// excerpt) is a real turn, and skipping it can leave a whole session unindexed.
+const LOCAL_COMMAND_RE = /^\s*<(bash-input|bash-stdout|local-command-caveat|local-command-stdout)>/;
+// The CLI emits both tag orders — <command-name> first, and <command-message>
+// first (/auto-compact, /pre-compact) — so a command record is recognised by
+// the presence of <command-name> alongside one of its siblings, not by position.
+const COMMAND_NAME_RE = /<command-name>([^<]*)<\/command-name>/;
+const COMMAND_SIBLING_RE = /<command-(message|args)>/;
 const COMMAND_ARGS_RE = /<command-args>([^<]*)<\/command-args>/;
 
 /** Classify a user message's text as a summary candidate:
@@ -127,8 +134,8 @@ const COMMAND_ARGS_RE = /<command-args>([^<]*)<\/command-args>/;
  */
 function classifyUserText(text) {
   if (!text || LOCAL_COMMAND_RE.test(text)) return { kind: 'skip', text: '' };
-  const cmd = text.match(SLASH_COMMAND_RE);
-  if (cmd) {
+  const cmd = text.match(COMMAND_NAME_RE);
+  if (cmd && COMMAND_SIBLING_RE.test(text)) {
     const name = cmd[1].trim();
     const args = (text.match(COMMAND_ARGS_RE)?.[1] || '').trim();
     return { kind: 'command', text: (args ? name + ' ' + args : name).slice(0, 120) };
