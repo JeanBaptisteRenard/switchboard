@@ -122,7 +122,8 @@ test('the backfill runs once: a partial cache after an interrupted post-marker s
     `, dir);
     assert.equal(seed.status, 0, seed.stderr);
 
-    // Relaunch: db_version is already 9, so migration v8 must not run again.
+    // Relaunch: db_version is already 9, so no migration runs again -- the v8
+    // marker backfill included.
     // If it did, the partial cache would be blessed as complete and the next
     // get-projects would take the warm branch straight into the synchronous
     // reconcile sweep -- the freeze the marker exists to prevent.
