@@ -147,7 +147,8 @@ test('a half-typed sentence refuses the trigger, and a submitted one lets it thr
     );
 
     // 2. The user hits Enter; once the quiet window has run out, the trigger passes.
-    handleTerminalInput(sessions, SESSION_ID, '\r', Date.now());
+    const enterAt = Date.now();
+    handleTerminalInput(sessions, SESSION_ID, '\r', enterAt);
     assert.equal(session.composerState.pending, 0);
     const afterSubmit = pty.written.length;
 
@@ -164,7 +165,10 @@ test('a half-typed sentence refuses the trigger, and a submitted one lets it thr
       pty.written.slice(afterSubmit, afterSubmit + 2), ['/wrap-up', '\r'],
       'the command and its discrete Enter reach the pty',
     );
-    assert.ok(passed.waited_ms >= 200, 'it waited out the quiet window rather than writing at once');
+    assert.ok(
+      Date.parse(passed.sent_at) - enterAt >= 200,
+      'the write landed no sooner than the quiet window after the last keystroke',
+    );
   } finally {
     watcher.close();
     if (previousDir === undefined) delete process.env.SWITCHBOARD_TRIGGERS_DIR;
