@@ -67,9 +67,33 @@ what it saw.
 
 **`not sent` vs `chain timeout`.** `error` is compared by strict equality, so the
 detail goes in `reason` and never into `error` — `not sent: input pending` is not
-`not sent`.  `not sent` promises the session was never touched: a chain whose
-step 0 landed and whose step 1 was held back by politeness reports
-`chain timeout`, never `not sent`.
+`not sent`.  `reason` is the only field that carries detail; nothing downstream
+may parse `error` for a substring.
+
+| `error` | Promise to the reader | Consequence in the harness |
+|---|---|---|
+| `not sent` | not one byte was written into the target | the pending guard is **voided**; the emitter retries from scratch |
+| `chain timeout` | at least one step was written, the effect was not observed | the guard **keeps blocking** the next compaction |
+| free text (`session not found`, `pty write failed: …`, validation refusals) | no reserved meaning | read `submitted` |
+
+The invariant, in one line: **no result says `not sent` if a byte reached the
+target, and no result says `chain timeout` if none did.**  Concretely, the four
+paths that return without touching the PTY all renounce: `submitted: "no"`, the
+detail in `reason`, and — on the chain path, which is the only one that carries
+the field — `partial: false`.
+
+- `wait:"idle"` expiring on a `command`, and on a `chain`'s initial wait
+  (`error: "not sent"`).  This is the path that fires most often: a session
+  reports itself busy for as long as a delegated agent runs, so `idle` is
+  regularly unsatisfiable; the old `chain timeout` there froze compaction on a
+  payload that never left.
+- the session exiting during either of those waits (`error` stays the free-text
+  `session exited during wait`, since the reserved values do not cover it).
+
+Symmetrically, a chain that wrote step 0 and then stalled — on a turn that never
+ends, or on a later step held back by politeness — reports `chain timeout` with
+`partial: true`, never `not sent`.  Both directions are covered by the
+`renouncing:` tests in `test/trigger-watcher.test.js`.
 
 **An unknown `wait` is refused, loudly.** Only `idle` and `none` are accepted.
 An **absent** field still defaults to `none` (existing triggers rely on it), but
@@ -104,8 +128,8 @@ Fields:
 Result written to `SWITCHBOARD_TRIGGERS_DIR/processed/<uuid>.result.json`:
 
 ```json
-{ "ok": true,  "sessionId": "...", "command": "...", "sent_at": "...", "waited_ms": 320 }
-{ "ok": false, "error": "<reason>", "sessionId": "..." }
+{ "ok": true,  "submitted": "confirmed", "sessionId": "...", "command": "...", "sent_at": "...", "waited_ms": 320 }
+{ "ok": false, "submitted": "no", "error": "not sent", "reason": "timeout waiting for idle; nothing was written", "sessionId": "..." }
 ```
 
 Trigger file is **deleted** after processing (success or failure).

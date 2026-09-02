@@ -148,13 +148,28 @@ A `chain` reports the **weakest** value any of its steps reached
 (`no` < `assumed` < `confirmed`).
 
 **`error` is compared by strict equality too**, so explanations go in `reason`
-and never into `error`: `not sent: input pending` is not `not sent`. Two of the
-reserved values are easy to confuse and mean opposite things:
+and never into `error`: `not sent: input pending` is not `not sent`. `reason`
+carries the detail alone, and carries it for every failure — a reader that wants
+to know *why* reads `reason`, never a substring of `error`.
 
-- **`not sent`** — nothing ever reached the session. Nothing to assume about;
-  the emitter can retry from scratch.
-- **`chain timeout`** — something was written and the expected effect was not
-  observed. A chain whose first step landed and whose second was held back by
-  politeness reports this, never `not sent`.
+| `error` | What it promises the reader | What the emitter does with it |
+|---|---|---|
+| `not sent` | **not one byte reached the session.** No idle ever came, politeness never allowed a write, or the trigger was refused before any write | nothing to assume about: the harness **voids** the pending guard, and the next turn forces again on its own |
+| `chain timeout` | at least one step **was written**, and the expected effect was not observed before the deadline | the effect is only assumed, so the harness **keeps blocking** the next compaction |
+| anything else | free text: `session not found`, `pty write failed: …`, a validation refusal | read `submitted` to know whether anything landed |
+
+The two reserved values are easy to confuse and mean opposite things, so:
+
+- A chain whose first step landed and whose second was held back by politeness
+  reports `chain timeout`, never `not sent`.
+- A `wait: "idle"` that expires without the session ever going idle reports
+  `not sent` with `reason: "timeout waiting for idle; nothing was written"`,
+  and `partial: false` — never `chain timeout`. This is the commonest failure
+  in service: a session reports itself busy for as long as any delegated agent
+  runs, so `idle` is regularly unsatisfiable, and answering `chain timeout`
+  there would block every later compaction over a payload that never left.
+- The same holds when the session exits during that initial wait: the `error`
+  stays the free-text `session exited during wait`, but `submitted` is `no`,
+  `partial` is `false`, and `reason` says nothing was written.
 
 The primary use case is context-management harnesses — e.g. an agent hook that detects a full context window and injects `/compact` into its own session. Write the trigger file atomically (write to a temp name, then rename) so the watcher never reads a half-written file.
