@@ -56,6 +56,38 @@ test('main-wiring source check: terminal-input is registered and calls handleTer
   );
 });
 
+test('main-wiring source check: terminal-input carries the pty.input probe, under the TRACE guard', () => {
+  const args = argsOf("ipcMain.on('terminal-input'", 'ipcMain.on');
+  assert.match(
+    args,
+    /if\s*\(TRACE\)\s*\{/,
+    'the pty.input probe must sit behind `if (TRACE)` — no cost when the trace is off',
+  );
+  assert.match(
+    args,
+    /trace\(\s*'pty\.input'\s*,\s*sessionId\s*,/,
+    "terminal-input must trace('pty.input', sessionId, ...)",
+  );
+  assert.match(
+    args, /\bcontrolOffset\(\s*chunk\s*\)/,
+    'the probe must locate the first control character before deciding what to record',
+  );
+  // The whole point of the offset: `codePoints(chunk, …)` would transcribe a
+  // typed chunk, hex-encoded and reversible. Only the slice may be rendered.
+  assert.match(
+    args, /\bcodePoints\(\s*chunk\.slice\(\s*at\s*\)\s*,\s*10\s*\)/,
+    'cp must be taken from chunk.slice(at), never from the whole chunk',
+  );
+  assert.doesNotMatch(
+    args, /\bcodePoints\(\s*chunk\s*[,)]/,
+    'cp must never be rendered from the whole chunk',
+  );
+  assert.match(
+    args, /at\s*===\s*-1\s*\?\s*\{\s*len:\s*chunk\.length\s*\}/,
+    'an all-printable chunk must contribute its length and nothing else',
+  );
+});
+
 test('main-wiring source check: trigger-watcher.start is handed createTriggerContext(...)', () => {
   const args = argsOf(
     "require('./trigger-watcher').start", "require('./trigger-watcher').start",

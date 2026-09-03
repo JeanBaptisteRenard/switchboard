@@ -98,6 +98,7 @@ no `sent`.
 | `subagent.rehabilitated` | An assumed-finished entry grew inside its recheck window: the withheld spawn is released | `agentId`, `withheldForMs`, `subagentType`, `sent` |
 | `subagent.completed` | `subagent-completed` is sent | `agentId`, `stableForMs`, `reason`, `sent` |
 | `session.forked` | A fork re-keys a live session | `newId`, `wasBusy`, `sent` |
+| `pty.input` | Every `terminal-input` IPC chunk, before the composer model sees it | `len` always; `at` and `cp` only when the chunk holds a control character |
 | `pty.exit` | The PTY exits | `exitCode`, `alsoUnder`, `wasBusy` |
 | `poll.snapshot` | `get-active-sessions` answers | `count`, `entries` |
 | `app.quit` | Last line of a clean shutdown | — |
@@ -231,8 +232,33 @@ This matters because of
 [ADR 0002](decisions/0002-discrete-steps-sidebar-animations.md) — the
 indicators were rebuilt to stop burning CPU at idle, and a diagnostic that
 allocated on every render would undo that. Even when the trace is **on**, no
-probe sits on the terminal render path: the busiest is `osc.title`, which fires
-only for chunks containing an OSC introducer.
+probe sits on the terminal render path: `osc.title` fires only for chunks
+carrying an OSC introducer, and `pty.input` only for chunks the renderer sends
+*to* the PTY — a channel a person can only drive at typing speed, and whose
+unexplained traffic is the thing that probe exists to expose.
+
+`pty.input` always records the chunk's length, and records code points **only
+from the chunk's first control character** (C0 or DEL) onwards, with `at` saying
+where that was. A chunk of printable text has no control character, so it
+contributes a length and nothing else — no `cp` field at all.
+
+That rule is what stops the probe from being a keylogger. xterm sends roughly
+one chunk per keystroke, and the leading code points of a typed chunk *are* the
+text, hex-encoded and trivially reversible; a trace left on for an evening would
+otherwise hold everything typed into every session, on disk, for anything that
+reads the file afterwards. Nothing is lost for the question being asked: the
+chunks under suspicion push the composer's quiet clock while leaving `pending`
+at 0, which makes them escape sequences and control characters by construction —
+exactly what is kept — and a typed chunk announces itself through `pending > 0`,
+where its length is all the trace needs to add.
+
+Ten code points is more than `osc.title`'s three because the question here is
+which escape sequence arrived, and a CPR reply (`ESC [ 24 ; 80 R`) is eight.
+Those ten start at the control character, so a chunk whose sequence is followed
+by text — a bracketed paste, `ESC [ 200 ~` then the pasted content — can still
+carry a few characters of it. That is the bound of the guarantee: no chunk of
+plain text is ever rendered, and no rendering ever starts before a control
+character.
 
 ## Disk use
 

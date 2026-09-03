@@ -143,6 +143,47 @@ them; `ESC [ 1;2 A` (Shift+Up), `ESC [ 1;3 A` (Alt+Up) and `ESC [ 1;5 A`
 version*. A CLI release giving those chords a meaning would reopen an
 undercount — the dangerous direction, since it reads a full composer as free.
 
+**Measuring what actually writes to the input channel.** On JB's machine the
+guard still refuses triggers on a composer the user can see is empty, with
+`lastInputAt` pushed every ~50–200 ms. A code investigation ruled out every
+periodic producer (no `setInterval` in the repo, none in xterm.js, no ConPTY
+poll beyond the ~80 ms startup handshake) and the mouse (Claude Code never sends
+`ESC [ ?1002h` / `ESC [ ?1003h`, and xterm.js de-duplicates identical motions, so
+a resting pointer emits nothing). What remains, unproven, is xterm.js *answering*
+queries the CLI emits while redrawing — CPR, DA, DECRQM, OSC replies — or a
+sequence whose final byte `applyCsi` does not handle. The activity trace's
+`pty.input` probe (`main.js`, in `ipcMain.on('terminal-input')`) settles it by
+recording every chunk the renderer sends to the PTY — its length always, its
+code points only from the first control character onwards, so a typed chunk
+leaves a length and nothing readable:
+
+```bash
+SWITCHBOARD_ACTIVITY_TRACE=1 task dev
+TRACE=~/.switchboard-dev/activity-trace-*.jsonl
+
+# What arrives, in order. A line with no `cp` was a chunk of printable text —
+# the probe records its length only, never its content (docs/activity-trace.md).
+jq -r 'select(.cat=="pty.input") | "\(.wall)\t\(.len)\t\(.at // "-")\t\(.cp // "-")"' $TRACE
+
+# Which control sequences dominate — the suspects are all in here
+jq -r 'select(.cat=="pty.input" and .cp) | .cp' $TRACE | sort | uniq -c | sort -rn
+```
+
+**Take four control shots, not two.** The two measurements taken so far were
+n=1 per condition and varied the pointer while the CLI's own activity varied
+with it, so they could not tell the two apart — and the fix they motivated
+addressed the wrong factor. Run the full grid: {CLI idle, CLI busy — a task
+spawning subagents} × {pointer resting over the terminal, pointer moved off the
+window}. In each cell: empty the composer with Ctrl+U, touch nothing, drop a
+trigger, and record both the result (`waited_ms`, refusal or not) and the
+`pty.input` lines in that window. The culprit is whichever factor moves the
+chunk rate, and the chunks to look for push the quiet clock while leaving
+`pending` at 0 — which excludes X10 and history recall by construction.
+
+The SGR-and-focus exemption above (PR #160) is correct and worth keeping, but it
+**cannot** be the cause of this symptom: exempting mouse reports cannot quiet a
+channel that carries none, since Claude Code never turns motion tracking on.
+
 **`submitted`.** Every result carries it, compared by strict equality:
 `confirmed` (a busy rising edge was observed after our write), `assumed`
 (written, no failure seen, nothing observed after), `no` (nothing written, or

@@ -40,6 +40,17 @@ function codePoints(str, count = 3) {
   return out.join(' ');
 }
 
+// Index of the first C0 control or DEL, or -1 when the string is all printable.
+// See docs/activity-trace.md — `pty.input` traces from here, never from 0.
+function controlOffset(str) {
+  if (typeof str !== 'string') return -1;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) return i;
+  }
+  return -1;
+}
+
 // Mirrors the OSC 0 branch in main.js — see .ai/contexts/ipc-bridge.md.
 function busyDecision(isBusy, isIdle, wasBusy) {
   if (isBusy && !wasBusy) return 'emit:busy';
@@ -219,6 +230,7 @@ module.exports = {
   createActivityTrace,
   formatEntry,
   codePoints,
+  controlOffset,
   busyDecision,
   progressDecision,
   envEnabled,
