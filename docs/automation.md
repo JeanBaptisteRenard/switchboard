@@ -212,21 +212,44 @@ trigger file. The directory therefore holds exactly the triggers still waiting
 to be processed:
 
 ```json
-{ "ok": true,  "submitted": "confirmed", "sessionId": "...", "command": "...", "sent_at": "...", "waited_ms": 320 }
+{ "ok": true,  "submitted": "activity", "sessionId": "...", "command": "...", "sent_at": "...", "waited_ms": 320 }
 { "ok": false, "submitted": "no", "error": "not sent", "reason": "4 byte(s) of input are sitting unsubmitted in the composer" }
 ```
 
 **`submitted` is the field to read, not `ok`.** A payload written into a
-composer is not a message received. Three values, compared by strict equality:
+composer is not a message received. Four values, compared by strict equality:
 
 | Value | Meaning |
 |---|---|
-| `confirmed` | the session went busy after our write — the submission was observed |
+| `confirmed` | the effect you asked for was read back. **Reserved — no transport in this repository emits it today** |
+| `activity` | the session was seen busy after our write. A turn was observed, and nothing beyond that |
 | `assumed` | written, no failure seen, nothing observed afterwards |
 | `no` | nothing was written, or it was written and not submitted |
 
 A `chain` reports the **weakest** value any of its steps reached
-(`no` < `assumed` < `confirmed`).
+(`no` < `assumed` < `activity` < `confirmed`).
+
+**What `activity` refuses to claim.** Busy is sampled, not compared against a
+baseline taken before the write, and nothing ties it to that write: a session
+already mid-turn when the trigger fires reads busy on the very first sample. And
+even when our write did cause the turn, a turn starting says nothing about *what*
+the CLI made of the text — a slash command that misses the CLI's completion menu
+is submitted as an ordinary message whose text merely starts with `/`, and that
+message produces a turn too. Only reading back the effect you asked for
+distinguishes those.
+
+So a caller that must not act twice on the same intent has to check the effect
+itself — a smaller context window, a new transcript, a file on disk — and treat
+`activity` as "something happened, unattributed".
+
+> **Changed — read this if you parse `submitted`.**
+> `confirmed` used to be emitted whenever the session was seen busy after a
+> write. It asserted more than the transport could know, so that case now reports
+> `activity`, and `confirmed` is reserved for a transport that reads the effect
+> back. A reader testing `submitted === 'confirmed'` stops matching and falls
+> through to its retry or escalation path: more cautious, which is the point,
+> since what it was trusting was never a guarantee. A reader testing
+> `submitted === 'no'` or `submitted !== 'no'` is unaffected.
 
 **`error` is compared by strict equality too**, so explanations go in `reason`
 and never into `error`: `not sent: input pending` is not `not sent`. `reason`

@@ -44,10 +44,10 @@ const MAX_TRIGGER_SIZE  = 64 * 1024;  // 64 KB  (C1)
 const MAX_COMMAND_LEN   = 4 * 1024;   // 4 KB   (W2)
 const MAX_INFLIGHT      = 8;          // concurrency cap (W4)
 const MAX_CHAIN_LENGTH  = 20;         // max steps per chain (W8)
-// Max time to wait for busy=true after injecting a command.
-// Claude may answer so fast that we never observe the rising edge;
-// after BUSY_RISE_TIMEOUT_MS we assume the turn completed instantly and move on.
-const BUSY_RISE_TIMEOUT_MS   = 2000; // ms
+// Max time to spend looking for busy=true after injecting a command.
+// see .ai/contexts/trigger-watcher.md ("submitted") for what this does and does
+// not prove.
+const BUSY_OBSERVE_TIMEOUT_MS = 2000; // ms
 // Delay (ms) between writing a command's text and the Enter keypress that
 // submits it. The Enter MUST arrive as a discrete PTY read — concatenated onto
 // the text in a single write, Claude Code (kitty keyboard protocol) absorbs it
@@ -63,10 +63,18 @@ const FORBIDDEN_COMMAND_RE = /[\r\n\0\x1b]/;
 // Politeness guard — see docs/automation.md and .ai/contexts/trigger-watcher.md.
 const DEFAULT_QUIET_MS = 3000;
 
+// see .ai/contexts/trigger-watcher.md ("submitted") — `confirmed` is reserved
+// for an effect readback and is never emitted by this transport.
 const SUBMITTED_NO        = 'no';
 const SUBMITTED_ASSUMED   = 'assumed';
+const SUBMITTED_ACTIVITY  = 'activity';
 const SUBMITTED_CONFIRMED = 'confirmed';
-const SUBMITTED_RANK      = { no: 0, assumed: 1, confirmed: 2 };
+const SUBMITTED_RANK      = {
+  [SUBMITTED_NO]:        0,
+  [SUBMITTED_ASSUMED]:   1,
+  [SUBMITTED_ACTIVITY]:  2,
+  [SUBMITTED_CONFIRMED]: 3,
+};
 
 const ERROR_NOT_SENT      = 'not sent';
 const ERROR_CHAIN_TIMEOUT = 'chain timeout';
@@ -186,24 +194,27 @@ function waitForComposerFree(sessionId, ctx, deadlineMs) {
   });
 }
 
-// Window (ms) to wait for the busy rising edge when verifying a submission.
-// Defaults to BUSY_RISE_TIMEOUT_MS; override via SWITCHBOARD_SUBMIT_VERIFY_MS.
+// Window (ms) to look for busy=true when verifying a submission.
+// Defaults to BUSY_OBSERVE_TIMEOUT_MS; override via SWITCHBOARD_SUBMIT_VERIFY_MS.
 function getSubmitVerifyMs() {
   const v = envNumber('SWITCHBOARD_SUBMIT_VERIFY_MS');
-  return v !== undefined ? v : BUSY_RISE_TIMEOUT_MS;
+  return v !== undefined ? v : BUSY_OBSERVE_TIMEOUT_MS;
 }
 
 /**
- * Poll ctx.isSessionBusy(sessionId) for a rising edge (busy=true) up to
- * `windowMs`, bounded by the absolute `deadlineMs`. Stops early if the PTY
- * disappears.
+ * Poll ctx.isSessionBusy(sessionId) for busy=true up to `windowMs`, bounded
+ * by the absolute `deadlineMs`. Stops early if the PTY disappears.
  *
- * Returns { rose, timedOut, sessionExited, waited_ms }.
- *   - rose:         busy=true was observed
- *   - timedOut:     global deadline fired before any rise
+ * This is a LEVEL probe, not an edge detector: a session already busy on
+ * entry answers on the first tick, and nothing here ties the busy state to
+ * our own write. See .ai/contexts/trigger-watcher.md ("submitted").
+ *
+ * Returns { sawBusy, timedOut, sessionExited, waited_ms }.
+ *   - sawBusy:       busy=true was observed at some point in the window
+ *   - timedOut:      global deadline fired before any observation
  *   - sessionExited: PTY vanished during the poll
  */
-function pollForBusyRise(sessionId, ctx, windowMs, deadlineMs) {
+function pollForBusyObserved(sessionId, ctx, windowMs, deadlineMs) {
   const start = Date.now();
   const windowEnd = start + windowMs;
 
@@ -211,41 +222,41 @@ function pollForBusyRise(sessionId, ctx, windowMs, deadlineMs) {
     const now = Date.now();
 
     if (now >= deadlineMs) {
-      return resolve({ rose: false, timedOut: true, sessionExited: false, waited_ms: now - start });
+      return resolve({ sawBusy: false, timedOut: true, sessionExited: false, waited_ms: now - start });
     }
     if (!ctx.getPtyForSession(sessionId)) {
-      return resolve({ rose: false, timedOut: false, sessionExited: true, waited_ms: now - start });
+      return resolve({ sawBusy: false, timedOut: false, sessionExited: true, waited_ms: now - start });
     }
     if (ctx.isSessionBusy(sessionId)) {
-      return resolve({ rose: true, timedOut: false, sessionExited: false, waited_ms: now - start });
+      return resolve({ sawBusy: true, timedOut: false, sessionExited: false, waited_ms: now - start });
     }
     if (now >= windowEnd) {
-      // Verify window elapsed without a rise — caller decides what to do.
-      return resolve({ rose: false, timedOut: false, sessionExited: false, waited_ms: now - start });
+      // Verify window elapsed without seeing busy — caller decides.
+      return resolve({ sawBusy: false, timedOut: false, sessionExited: false, waited_ms: now - start });
     }
     scheduleNext();
   });
 }
 
 /**
- * Submit a command and verify it actually started a turn.
+ * Submit a command, then look for activity on the session.
  *
  * 1. submitToPty(text + discrete Enter)
- * 2. Poll for busy-rise within SWITCHBOARD_SUBMIT_VERIFY_MS.
- * 3. Rise observed → done (submit_retries: 0).
- * 4. No rise → write a SINGLE bare '\r' (a no-op on an empty composer, so it is
+ * 2. Poll for busy=true within SWITCHBOARD_SUBMIT_VERIFY_MS.
+ * 3. Busy observed → done (submit_retries: 0).
+ * 4. Nothing observed → write a SINGLE bare '\r' (a no-op on an empty composer, so it is
  *    harmless if the first submit actually worked; if the text is still sitting
  *    in the composer because the first Enter was absorbed, this submits it) and
  *    poll the same window again (submit_retries: 1).
  *
- * The observed rise IS the equivalent of waitForTurnComplete's Phase 1; callers
- * MUST NOT then wait for the rise again — they proceed straight to busy-fall.
+ * The observation IS the equivalent of waitForTurnComplete's Phase 1; callers
+ * MUST NOT then wait for busy again — they proceed straight to busy-fall.
  *
- * Returns { submit_retries, rose, sessionExited, timedOut, waited_ms }.
+ * Returns { submit_retries, sawBusy, sessionExited, timedOut, waited_ms }.
  *   - waited_ms is the total time spent polling (both windows + retry).
  *
  * If sessionExited/timedOut fire, the caller short-circuits with the usual
- * error result. If neither rise nor retry produces a rise (and no deadline),
+ * error result. If neither poll observes busy (and no deadline),
  * the caller keeps the legacy instant-reply semantics — submit_retries traces
  * that the verification could not confirm a turn started.
  */
@@ -257,25 +268,25 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
   // must fire on window expiry, so the deadline must NOT coincide with it.
   const effectiveDeadline = (deadlineMs !== undefined) ? deadlineMs : Infinity;
 
-  const first = await pollForBusyRise(sessionId, ctx, windowMs, effectiveDeadline);
-  if (first.rose || first.sessionExited || first.timedOut) {
+  const first = await pollForBusyObserved(sessionId, ctx, windowMs, effectiveDeadline);
+  if (first.sawBusy || first.sessionExited || first.timedOut) {
     return {
       submit_retries: 0,
-      rose: first.rose,
+      sawBusy: first.sawBusy,
       sessionExited: first.sessionExited,
       timedOut: first.timedOut,
       waited_ms: first.waited_ms,
     };
   }
 
-  // No rise within the window — retry the Enter ONCE (bare '\r', never the text),
+  // Nothing observed in the window — retry the Enter ONCE (bare '\r', never the text),
   // and only into a free composer. See docs/automation.md.
   const recoveryDeadline = Math.min(effectiveDeadline, Date.now() + windowMs);
   const polite = await waitForComposerFree(sessionId, ctx, recoveryDeadline);
   if (!polite.free) {
     return {
       submit_retries: 0,
-      rose: false,
+      sawBusy: false,
       sessionExited: false,
       timedOut: false,
       recoverySkipped: true,
@@ -290,7 +301,7 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
     // Surface as a sessionExited-like failure; caller maps to an error result.
     return {
       submit_retries: 1,
-      rose: false,
+      sawBusy: false,
       sessionExited: false,
       timedOut: false,
       writeError: err,
@@ -298,10 +309,10 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
     };
   }
 
-  const second = await pollForBusyRise(sessionId, ctx, windowMs, effectiveDeadline);
+  const second = await pollForBusyObserved(sessionId, ctx, windowMs, effectiveDeadline);
   return {
     submit_retries: 1,
-    rose: second.rose,
+    sawBusy: second.sawBusy,
     sessionExited: second.sessionExited,
     timedOut: second.timedOut,
     waited_ms: first.waited_ms + second.waited_ms,
@@ -310,7 +321,7 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
 
 /**
  * Wait only for the busy FALLING edge (busy → false), i.e. the turn finishing.
- * Used after submitWithVerify has already confirmed (or assumed) the rise.
+ * Used after submitWithVerify has already observed (or assumed) the turn.
  *
  * Returns { timedOut, sessionExited, waited_ms }.
  */
@@ -701,16 +712,16 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
 
     // Write to PTY: text, then Enter as a discrete keypress (see submitToPty),
     // then verify the submission actually started a turn — retrying the Enter
-    // once if the busy rising edge never arrives (the 2026-06-04 "text stuck in
+    // once if busy is never observed (the 2026-06-04 "text stuck in
     // composer, Enter absorbed" incident).
     let submitRetries = 0;
-    let rose = false;
+    let sawBusy = false;
     let recoverySkipped = false;
     let recoveryReason = null;
     try {
       const v = await submitWithVerify(ptyProcess, sessionId, command, ctx);
       submitRetries   = v.submit_retries;
-      rose            = v.rose;
+      sawBusy         = v.sawBusy;
       recoverySkipped = !!v.recoverySkipped;
       recoveryReason  = v.recoveryReason || null;
       if (v.writeError) throw v.writeError;
@@ -728,7 +739,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
 
     await writeResult({
       ok:             true,
-      submitted:      rose ? SUBMITTED_CONFIRMED : SUBMITTED_ASSUMED,
+      submitted:      sawBusy ? SUBMITTED_ACTIVITY : SUBMITTED_ASSUMED,
       sessionId,
       command,
       sent_at:        new Date().toISOString(),
@@ -748,7 +759,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
   let totalWaitedMs = 0;
   let step0SentAt = null;
   // A chain reports the weakest thing any of its steps achieved.
-  let chainSubmitted = SUBMITTED_CONFIRMED;
+  let chainSubmitted = SUBMITTED_ACTIVITY;
 
   // Step 0: initial wait (respects `wait` field)
   if (wait === 'idle') {
@@ -845,10 +856,10 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
       return;
     }
 
-    // Submit the step and verify the turn actually started (busy rising edge).
-    // The verify poll IS this step's Phase 1 (busy-rise) — for non-final steps
-    // we proceed straight to the busy-FALL wait, never re-observing the rise.
-    // The verify window is bounded by this step's deadline; if no rise arrives
+    // Submit the step, then look for activity on the session.
+    // The verify poll IS this step's Phase 1 — for non-final steps we proceed
+    // straight to the busy-FALL wait, never re-observing busy.
+    // The verify window is bounded by this step's deadline; if nothing arrives
     // we retry the bare Enter once (harmless no-op if already submitted).
     let submitRetries = 0;
     let stepWaitedMs = 0;
@@ -870,7 +881,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     totalWaitedMs += verify.waited_ms;
     chainSubmitted = weakestSubmitted(
       chainSubmitted,
-      verify.rose ? SUBMITTED_CONFIRMED : SUBMITTED_ASSUMED,
+      verify.sawBusy ? SUBMITTED_ACTIVITY : SUBMITTED_ASSUMED,
     );
 
     if (verify.recoverySkipped) {
@@ -895,7 +906,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     }
 
     // For non-final steps, wait for the turn to FINISH (busy falling edge).
-    // submitWithVerify already consumed the rising edge. If the rise was never
+    // submitWithVerify already consumed the observation. If busy was never
     // observed (instant-reply / unconfirmed submit), busy is already false and
     // this returns immediately — preserving the legacy instant-reply behaviour
     // while submit_retries records that verification could not confirm a turn.
@@ -1041,4 +1052,4 @@ function start(ctx) {
   };
 }
 
-module.exports = { start };
+module.exports = { start, weakestSubmitted, SUBMITTED_RANK };

@@ -2168,7 +2168,7 @@ test('politeness: the bare recovery Enter is withheld when the user types during
   }
 });
 
-test('submitted: a busy rising edge after our write yields "confirmed"', async () => {
+test('submitted: activity seen after our write yields "activity", never "confirmed"', async () => {
   const tmp = mkTmp();
   let watcher;
   try {
@@ -2188,8 +2188,10 @@ test('submitted: a busy rising edge after our write yields "confirmed"', async (
 
     const result = readResult(path.join(tmp, 'processed'), uuid);
     assert.equal(result.ok, true);
-    assert.equal(result.submitted, 'confirmed');
-    assert.deepEqual(ctx._written, ['/compact', '\r'], 'a confirmed turn needs no recovery Enter');
+    assert.equal(result.submitted, 'activity');
+    assert.notEqual(result.submitted, 'confirmed',
+      'seeing the session go busy does not prove the CLI ran what we wrote');
+    assert.deepEqual(ctx._written, ['/compact', '\r'], 'an observed turn needs no recovery Enter');
 
   } finally {
     if (watcher) watcher.close();
@@ -2296,7 +2298,7 @@ test('wait: an absent field keeps the "none" default', async () => {
 
     const result = readResult(path.join(tmp, 'processed'), uuid);
     assert.equal(result.ok, true);
-    assert.equal(result.submitted, 'confirmed', 'the session was already busy when we polled');
+    assert.equal(result.submitted, 'activity', 'the session was already busy when we polled');
     assert.deepEqual(ctx._written, ['/compact', '\r']);
 
   } finally {
@@ -3237,5 +3239,70 @@ test('dispatch() backstop log call cannot escape even when ctx.log.error throws 
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
     cleanup(tmp);
+  }
+});
+
+// ── submitted: the strength order and what "activity" refuses to claim ────────
+// see .ai/contexts/trigger-watcher.md ("submitted")
+
+test('submitted: a session already busy before our write never reports "confirmed"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-preexisting-busy-' + Date.now();
+    // Busy from the start and never idle: every busy reading the watcher takes
+    // predates its own write, so no observation of ours caused it.
+    const ctx = makeCtx(SESSION_ID, () => true);
+    watcher = start(ctx);
+
+    const uuid = 'preexisting-busy-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, wait: 'none', command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 5000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.deepEqual(ctx._written, ['/compact', '\r']);
+    assert.notEqual(result.submitted, 'confirmed',
+      'busy that predates the write must never be reported as a confirmation');
+    assert.equal(result.submitted, 'activity');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('submitted: the strength order is total, and "confirmed" sits strictly above "activity"', () => {
+  const { weakestSubmitted, SUBMITTED_RANK } = require('../trigger-watcher');
+
+  const ORDER = ['no', 'assumed', 'activity', 'confirmed'];
+
+  assert.deepEqual(Object.keys(SUBMITTED_RANK).sort(), [...ORDER].sort(),
+    'every value carries a rank, and no rank exists without a value');
+
+  const ranks = ORDER.map((v) => SUBMITTED_RANK[v]);
+  assert.equal(new Set(ranks).size, ORDER.length, 'no two values share a rank');
+  for (let i = 1; i < ranks.length; i++) {
+    assert.ok(ranks[i - 1] < ranks[i],
+      `${ORDER[i - 1]} must rank strictly below ${ORDER[i]}`);
+  }
+  assert.ok(SUBMITTED_RANK.confirmed > SUBMITTED_RANK.activity,
+    'an effect readback must outrank a bare activity observation');
+
+  for (const a of ORDER) {
+    for (const b of ORDER) {
+      const expected = SUBMITTED_RANK[a] <= SUBMITTED_RANK[b] ? a : b;
+      assert.equal(weakestSubmitted(a, b), expected, `weakest(${a}, ${b})`);
+      assert.equal(SUBMITTED_RANK[weakestSubmitted(a, b)],
+        Math.min(SUBMITTED_RANK[a], SUBMITTED_RANK[b]), `min rank of (${a}, ${b})`);
+    }
   }
 });

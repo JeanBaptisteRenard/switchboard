@@ -298,11 +298,80 @@ discarding a whole DCS sequence), not a `reportLength` addition — a
 different, larger piece of work than this PR's scope.
 
 **`submitted`.** Every result carries it, compared by strict equality:
-`confirmed` (a busy rising edge was observed after our write), `assumed`
+`confirmed` (the effect asked for was read back — **reserved, never emitted
+here**), `activity` (the session was seen busy after our write), `assumed`
 (written, no failure seen, nothing observed after), `no` (nothing written, or
 written and not submitted).  A chain reports the **weakest** of its steps
 (`weakestSubmitted`), because the field exists to stop a transport overstating
 what it saw.
+
+### Why the top value is `activity`, not `confirmed`
+
+Until this change the busy observation was emitted as `confirmed`, and the field
+overstated exactly what it existed to prevent.  Three separate gaps sit between
+"we saw busy" and "the command ran":
+
+1. **The observation is a level, not an edge.**  `pollForBusyObserved` samples
+   `ctx.isSessionBusy` and answers on the first tick that reads true.  A session
+   already mid-turn when the trigger fires satisfies it in milliseconds, with a
+   turn the write did not cause.  `test/trigger-watcher.test.js` has carried a
+   case of this shape since the verify path landed — a `wait:"none"` trigger into
+   a permanently busy session — and it used to assert `confirmed`.
+2. **Sampling a baseline first would not close it.**  The window between reading
+   the state and the keystroke stays open, and that window is where the race
+   lives.  A pre-write busy check buys a narrower race, not a guarantee, so this
+   module does not pretend to one.
+3. **A turn is not an interpretation.**  The CLI submits a slash command *as a
+   command* only through its completion menu.  Text written straight into an
+   empty composer with an Enter `DEFAULT_SUBMIT_ENTER_DELAY_MS` behind it can
+   land before that menu opens, in which case Enter submits an ordinary message
+   whose text merely begins with `/`.  The CLI answers it, the session goes
+   busy, and the observation is indistinguishable from a real command.
+
+   Waiting for that menu to actually open, instead of the blind
+   `DEFAULT_SUBMIT_ENTER_DELAY_MS`, would mean reading the rendered screen — which
+   lives in the renderer's xterm buffer, not in this main-process module.  Not
+   attempted here.
+
+An honest transport therefore cannot claim submission from activity alone, and a
+caller that debounces on `confirmed` is blinded by it: it believes it acted, and
+does not retry.
+
+### Why no discriminator was wired in
+
+We looked for a signal separating "the CLI ran a slash command" from "the CLI
+answered a message starting with `/`", observable **when the result is written**.
+There is none, measured on 13 real `/compact` occurrences across four session
+transcripts:
+
+- At Enter + a few seconds both cases write the *same* line —
+  `{"type":"user","message":{"content":"/compact"}}`, no `<command-name>`, no
+  `isMeta`, nothing structural to separate them.
+- The signal that never lied on that sample is the `system` /
+  `subtype:"compact_boundary"` record with its `compactMetadata`, plus the
+  `isCompactSummary` user record and the `<command-name>`/`<local-command-stdout>`
+  replay carrying the *same* `promptId` as the injected text.  It is flushed only
+  once the compaction has finished: **96 s to 271 s** on that sample, with no
+  intermediate write to watch.  A compaction stays in the same `.jsonl`; no new
+  transcript opens.
+- `~/.claude/sessions/<pid>.json` (see cli-session-state.md) reads `busy`
+  throughout a compaction exactly as through any other turn.
+
+So the effect *is* readable, minutes later, by a reader that keeps the injected
+`promptId` and watches the session file.  That is a caller's job, not the
+watcher's: the watcher returns in seconds by construction.  `confirmed` is kept
+in `SUBMITTED_RANK`, strictly above `activity`, so that a transport which does
+read an effect back has a value to report — and so that the order stays total.
+
+### Compatibility
+
+`confirmed` disappears from emitted results.  A reader testing
+`submitted === 'confirmed'` stops matching and falls through to its retry or
+escalation path, which is the safe direction: the value it trusted was never a
+guarantee.  Readers testing `submitted === 'no'` or `submitted !== 'no'` are
+unaffected.  The wire format is shared with other implementations of this
+contract, so the same reasoning applies to any transport that writes a
+`result.json` with this field.
 
 **`not sent` vs `chain timeout`.** `error` is compared by strict equality, so the
 detail goes in `reason` and never into `error` — `not sent: input pending` is not
@@ -367,7 +436,7 @@ Fields:
 Result written to `SWITCHBOARD_TRIGGERS_DIR/processed/<uuid>.result.json`:
 
 ```json
-{ "ok": true,  "submitted": "confirmed", "sessionId": "...", "command": "...", "sent_at": "...", "waited_ms": 320 }
+{ "ok": true,  "submitted": "activity", "sessionId": "...", "command": "...", "sent_at": "...", "waited_ms": 320 }
 { "ok": false, "submitted": "no", "error": "not sent", "reason": "timeout waiting for idle; nothing was written", "sessionId": "..." }
 ```
 
