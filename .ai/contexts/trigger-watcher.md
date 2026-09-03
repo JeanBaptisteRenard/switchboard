@@ -49,9 +49,12 @@ submitted.  `waitForComposerFree(sessionId, ctx, deadlineMs)` polls every
 `IDLE_POLL_INTERVAL` and calls the composer free only when `pending === 0` **and**
 `now - lastInputAt >= quietMs` (`SWITCHBOARD_TRIGGER_QUIET_MS`, default 3000 ms).
 It gates every PTY write: the single-`command` path, every `chain` step, and the
-bare recovery `` inside `submitWithVerify` — that last one is the sharp edge,
-since a lone `` on somebody's half-typed sentence submits the sentence.  Every
-wait is bounded by the deadline already in force; the recovery `` is bounded by
+bare recovery `
+` inside `submitWithVerify` — that last one is the sharp edge,
+since a lone `
+` on somebody's half-typed sentence submits the sentence.  Every
+wait is bounded by the deadline already in force; the recovery `
+` is bounded by
 the shorter of that deadline and one verify window.
 
 Two consequences beyond hygiene, both measured on Claude Code v2.1.258: a
@@ -107,6 +110,19 @@ the catastrophic direction. And the renderer independently drops `ESC [ I` /
 `ESC [ O` before the IPC send (`public/terminal-manager.js`, in `onData`), so
 the focus branch is defence in depth rather than the live path — do not delete
 either half on the grounds that the other exists.
+
+**X10 mouse reports were tried here and removed — do not add them back without
+first wiring `terminal.onBinary`.** xterm.js sends the DEFAULT (X10) encoding
+through `triggerBinaryEvent`, and nothing in this repo subscribes to that
+channel, so `ESC [ M` + 3 payload bytes can never arrive on the input path. The
+only producer of `ESC [ M` on `onData` is therefore a person: Escape emits
+`ESC` alone, then `[`, then `M`. Exempting it meant that typing Escape, `[M`
+and up to three more characters left `pending` at 0 on a composer holding real
+text — a false "free", the one the guard exists to prevent — and that half an
+X10 report held in `state.partial` swallowed the next SGR report and inserted
+its remainder as text, freezing the composer until an Enter. Both paths were
+safe before the exemption was added. The branch protected an unreachable case
+at the cost of a reachable regression.
 
 **Two blind spots the exemption does not close**, both written up in the
 "Politeness" section of `docs/automation.md`. xterm.js puts more than reports on
