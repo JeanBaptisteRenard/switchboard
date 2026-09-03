@@ -14,7 +14,7 @@ const { spawnSync } = require('node:child_process');
 
 const {
   createActivityTrace, formatEntry, codePoints, controlOffset, busyDecision, progressDecision,
-  envEnabled,
+  envEnabled, envState, initialEnabled,
 } = require('../activity-trace');
 
 function capture(options = {}) {
@@ -358,5 +358,141 @@ test('the trace file is timestamped so a new run never overwrites the last', asy
   const written = fs.readFileSync(file, 'utf8').trim().split('\n');
   assert.equal(written.length, 1);
   assert.equal(JSON.parse(written[0]).cp, 'U+25D0');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// --- runtime toggling: arming the trace without losing the state under study --
+
+function tmpTraceDir(tag) {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'sb-trace-' + tag + '-'));
+}
+
+function jsonlIn(dir) {
+  return fs.readdirSync(dir).filter(f => f.endsWith('.jsonl')).sort();
+}
+
+test('envState separates an unset variable from an explicit off', () => {
+  assert.equal(envState({}), null);
+  assert.equal(envState({ SWITCHBOARD_ACTIVITY_TRACE: '' }), null);
+  assert.equal(envState({ SWITCHBOARD_ACTIVITY_TRACE: '   ' }), null);
+  assert.equal(envState({ SWITCHBOARD_ACTIVITY_TRACE: '0' }), false);
+  assert.equal(envState({ SWITCHBOARD_ACTIVITY_TRACE: 'no' }), false);
+  assert.equal(envState({ SWITCHBOARD_ACTIVITY_TRACE: '1' }), true);
+  assert.equal(envState({ SWITCHBOARD_ACTIVITY_TRACE: ' ON ' }), true);
+});
+
+test('the environment decides the startup state, the preference decides when it is unset', () => {
+  // Unset: the stored preference is the whole answer.
+  assert.equal(initialEnabled({}, true), true);
+  assert.equal(initialEnabled({}, false), false);
+  assert.equal(initialEnabled({}, undefined), false);
+  // Set: it wins over the preference, in both directions.
+  assert.equal(initialEnabled({ SWITCHBOARD_ACTIVITY_TRACE: '1' }, false), true);
+  assert.equal(initialEnabled({ SWITCHBOARD_ACTIVITY_TRACE: '0' }, true), false);
+});
+
+test('a trace armed at runtime starts writing where it wrote nothing before', async () => {
+  const dir = tmpTraceDir('arm');
+  const t = createActivityTrace({ enabled: false });
+
+  assert.equal(t.init(dir), null, 'init on a disabled trace opens no file');
+  t.trace('osc.title', 's1', { busy: true });
+  assert.equal(t.sequence, 0, 'nothing was written while off');
+  assert.deepEqual(jsonlIn(dir), [], 'no segment on disk while off');
+
+  const file = t.setEnabled(true);
+  assert.ok(file, 'enabling opened a segment');
+  t.trace('osc.title', 's1', { busy: true });
+  assert.equal(t.sequence, 1);
+
+  await new Promise(r => t.close(r));
+  assert.deepEqual(readEntries([file]).map(e => e.cat), ['osc.title']);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('disabling flushes what was already written and then stops writing', async () => {
+  const dir = tmpTraceDir('flush');
+  const t = createActivityTrace({ enabled: true });
+  const file = t.init(dir);
+
+  // Well past the stream's 16 KB high-water mark, so a plain `stream = null`
+  // without an end() would strand the tail in the buffer.
+  for (let i = 0; i < 4000; i++) t.trace('fill', 's1', { i, pad: 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy' });
+  const written = t.sequence;
+  assert.equal(written, 4000);
+
+  await new Promise(r => t.setEnabled(false, r));
+  assert.equal(readEntries([file]).length, written, 'every line written before the toggle reached disk');
+
+  t.trace('osc.title', 's1', { busy: true });
+  assert.equal(t.sequence, written, 'the sequence did not advance after disabling');
+  assert.equal(readEntries([file]).length, written, 'nothing was appended after disabling');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('disabling never touches the payload of a later probe', () => {
+  const lines = [];
+  const t = createActivityTrace({ enabled: true, write: (l) => lines.push(l) });
+  t.setEnabled(false);
+  let touched = false;
+  t.trace('osc.title', 's1', { get busy() { touched = true; return true; } });
+  assert.equal(touched, false);
+  assert.equal(lines.length, 0);
+});
+
+test('re-enabling opens a fresh segment instead of appending to the closed one', async () => {
+  const dir = tmpTraceDir('resume');
+  let now = Date.parse('2026-08-22T09:15:00.000Z');
+  const t = createActivityTrace({ enabled: true, nowMs: () => now });
+
+  const first = t.init(dir);
+  t.trace('first.window', null, {});
+  await new Promise(r => t.setEnabled(false, r));
+
+  now += 65_000;
+  const second = t.setEnabled(true);
+  assert.notEqual(second, first, 'the second window has its own timestamped file');
+  t.trace('second.window', null, {});
+  await new Promise(r => t.setEnabled(false, r));
+
+  assert.deepEqual(readEntries([first]).map(e => e.cat), ['first.window']);
+  assert.deepEqual(readEntries([second]).map(e => e.cat), ['second.window']);
+  // The sequence is process-wide: it is what orders the two halves of a session.
+  assert.deepEqual(readEntries([first, second]).map(e => e.seq), [1, 2]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('rotation still bounds the disk when the trace was armed at runtime', async () => {
+  const dir = tmpTraceDir('armrot');
+  const t = createActivityTrace({ enabled: false, maxSegmentBytes: 200, maxSegments: 2 });
+  t.init(dir);
+  t.setEnabled(true);
+
+  for (let i = 0; i < 60; i++) t.trace('fill', 's1', { i, pad: 'xxxxxxxxxxxxxxxxxxxx' });
+  assert.ok(t.files.length > 2, 'the run produced more segments than it retains');
+  await new Promise(r => t.close(r));
+
+  let files = [];
+  await waitUntil(() => { files = jsonlIn(dir); return files.length <= 2; });
+  assert.equal(files.length, 2, 'older segments are unlinked, disk use stays bounded');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('the segment ceiling holds across repeated toggles, not just within one window', async () => {
+  const dir = tmpTraceDir('toggle-cap');
+  let now = Date.parse('2026-08-22T09:15:00.000Z');
+  const t = createActivityTrace({ enabled: false, maxSegments: 2, nowMs: () => now });
+  t.init(dir);
+
+  for (let i = 0; i < 4; i++) {
+    now += 60_000;
+    t.setEnabled(true);
+    t.trace('window', null, { i });
+    await new Promise(r => t.setEnabled(false, r));
+  }
+
+  let files = [];
+  await waitUntil(() => { files = jsonlIn(dir); return files.length <= 2; });
+  assert.equal(files.length, 2, 'four observation windows still leave only the retained segments');
   fs.rmSync(dir, { recursive: true, force: true });
 });

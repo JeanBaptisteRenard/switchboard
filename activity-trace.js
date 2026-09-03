@@ -1,6 +1,7 @@
 'use strict';
 
-// Opt-in activity trace, off unless SWITCHBOARD_ACTIVITY_TRACE is set.
+// Opt-in activity trace. The environment variable sets the state at startup;
+// it can be toggled at runtime afterwards.
 // See docs/activity-trace.md and .ai/contexts/ipc-bridge.md "Activity trace".
 
 const fs = require('fs');
@@ -20,6 +21,19 @@ function envEnabled(env) {
   if (typeof raw !== 'string') return false;
   const v = raw.trim().toLowerCase();
   return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+
+// true / false / null, where null means the variable was not set.
+function envState(env) {
+  const raw = env && env[ENV_VAR];
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  return envEnabled(env);
+}
+
+// see docs/activity-trace.md "Turning it on"
+function initialEnabled(env, stored) {
+  const fromEnv = envState(env);
+  return fromEnv === null ? stored === true : fromEnv;
 }
 
 function envMaxBytes(env) {
@@ -102,7 +116,7 @@ function timestampSlug(date) {
 }
 
 function createActivityTrace(options = {}) {
-  const enabled = !!options.enabled;
+  const state = { on: !!options.enabled };
   const maxSegmentBytes = options.maxSegmentBytes || envMaxBytes(process.env);
   const maxSegments = options.maxSegments || DEFAULT_SEGMENTS;
   const nowMs = options.nowMs || (() => Date.now());
@@ -171,21 +185,55 @@ function createActivityTrace(options = {}) {
     if (old) old.end(pruneSegments); else pruneSegments();
   }
 
-  function init(dataDir) {
-    if (!enabled || write || stream || !dataDir) return null;
-    dir = dataDir;
+  // see docs/activity-trace.md "Turning it off, and on again"
+  function startSegment() {
     baseName = 'activity-trace-' + timestampSlug(new Date(nowMs()));
+    segment = 0;
+    fs.mkdirSync(dir, { recursive: true });
+    openSegment();
+  }
+
+  function init(dataDir) {
+    if (write || !dataDir) return null;
+    dir = dataDir;
+    if (!state.on || stream) return null;
     try {
-      fs.mkdirSync(dir, { recursive: true });
-      openSegment();
+      startSegment();
     } catch {
       stream = null;
     }
     return stream ? segments[segments.length - 1] : null;
   }
 
+  function setEnabled(value, done) {
+    const next = !!value;
+    if (next === state.on) {
+      if (done) done();
+      return next && segments.length ? segments[segments.length - 1] : null;
+    }
+    if (next) {
+      state.on = true;
+      if (!write && !stream && dir) {
+        try {
+          startSegment();
+          pruneSegments();
+        } catch {
+          stream = null;
+        }
+      }
+      if (done) done();
+      return stream ? segments[segments.length - 1] : null;
+    }
+    state.on = false;
+    const old = stream;
+    stream = null;
+    if (old) old.end(done);
+    else if (done) done();
+    return null;
+  }
+
   function trace(cat, sid, fields, src) {
-    if (!enabled) return;
+    if (!state.on) return;
     if (!stream && !write) return;
     seq += 1;
     const line = formatEntry({
@@ -202,14 +250,17 @@ function createActivityTrace(options = {}) {
     if (bytes >= maxSegmentBytes) rotate();
   }
 
-  function close() {
+  function close(done) {
     const old = stream;
     stream = null;
-    if (old) old.end();
+    if (old) old.end(done);
+    else if (done) done();
   }
 
   return {
-    enabled,
+    state,
+    get enabled() { return state.on; },
+    setEnabled,
     init,
     trace,
     close,
@@ -222,11 +273,14 @@ function createActivityTrace(options = {}) {
 const singleton = createActivityTrace({ enabled: envEnabled(process.env) });
 
 module.exports = {
-  enabled: singleton.enabled,
+  state: singleton.state,
+  get enabled() { return singleton.enabled; },
+  setEnabled: singleton.setEnabled,
   init: singleton.init,
   trace: singleton.trace,
   close: singleton.close,
   currentFile: () => singleton.currentFile,
+  files: () => singleton.files,
   createActivityTrace,
   formatEntry,
   codePoints,
@@ -234,4 +288,6 @@ module.exports = {
   busyDecision,
   progressDecision,
   envEnabled,
+  envState,
+  initialEnabled,
 };

@@ -60,8 +60,8 @@ test('main-wiring source check: terminal-input carries the pty.input probe, unde
   const args = argsOf("ipcMain.on('terminal-input'", 'ipcMain.on');
   assert.match(
     args,
-    /if\s*\(TRACE\)\s*\{/,
-    'the pty.input probe must sit behind `if (TRACE)` — no cost when the trace is off',
+    /if\s*\(TRACE\.on\)\s*\{/,
+    'the pty.input probe must sit behind `if (TRACE.on)` — no cost when the trace is off',
   );
   assert.match(
     args,

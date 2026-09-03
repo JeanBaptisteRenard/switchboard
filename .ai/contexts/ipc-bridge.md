@@ -256,8 +256,9 @@ subagents are live, which asserts only that both things are true at once — see
 
 ### Activity trace: why the main process is the only writer
 
-`activity-trace.js` + `public/activity-trace.js`, off unless
-`SWITCHBOARD_ACTIVITY_TRACE` is set. User-facing docs:
+`activity-trace.js` + `public/activity-trace.js` + `public/activity-trace-panel.js`,
+off by default. `SWITCHBOARD_ACTIVITY_TRACE` sets the state at startup; Settings
+→ Diagnostics switches it at runtime and stores the choice. User-facing docs:
 [docs/activity-trace.md](../../docs/activity-trace.md).
 
 The indicators above are produced by two processes with two clocks, and the
@@ -278,23 +279,44 @@ from a packaged build, and it records the renderer half that `log` never saw.
 
 Two constraints shaped the API:
 
-- **The off path must allocate nothing.** `enabled` is resolved once at require
-  time and re-exported, so probes are `if (TRACE) trace(...)` /
-  `if (window.ATRACE) window.atrace(...)` — the payload literal is never
-  evaluated when the trace is off, and the IPC handler is not registered at
-  all. The renderer probes go through `window.*` rather than bare globals so
-  `session-activity.js` and `sidebar.js` stay loadable in the jsdom tests,
-  which evaluate them without the trace file. This is the same discipline as
+- **The off path must allocate nothing.** The module exports its state as an
+  object, `{ on }`, so probes are `if (TRACE.on) trace(...)` /
+  `if (window.ATRACE) window.atrace(...)` — one property load, and the payload
+  literal is never evaluated when the trace is off. An object rather than a
+  boolean because the state is now switchable at runtime: a destructured
+  `const { enabled: TRACE }` would freeze the flag at require time and pin
+  every probe to the launch environment. The renderer probes go through
+  `window.*` rather than bare globals so `session-activity.js` and
+  `sidebar.js` stay loadable in the jsdom tests, which evaluate them without
+  the trace file. This is the same discipline as
   [ADR 0002](../../docs/decisions/0002-discrete-steps-sidebar-animations.md):
   nothing that runs per render may do work.
+- **The switch must not need a restart.** Restarting to arm a diagnostic
+  destroys the state it was meant to observe, so `set-activity-trace-enabled`
+  flips the module state, opens or flushes-and-closes the file, persists the
+  choice into the `global` settings row, and pushes the new state to the
+  renderer on `activity-trace-state`. The `activity-trace` handler is
+  therefore registered unconditionally — a listener added on demand would not
+  exist in the window that was created while the trace was off — and `trace()`
+  drops the line itself while off.
 - **The flag is parsed once.** `activity-trace.js` resolves
   `SWITCHBOARD_ACTIVITY_TRACE`; the preload is sandboxed and cannot require it,
   so main passes `--switchboard-activity-trace` via `additionalArguments` and
-  the preload only checks `process.argv`. Re-parsing the env var in the preload
-  would let the two halves disagree silently — a trace file with no
-  `src:"renderer"` lines and no error. Likewise the output directory is
+  the preload only checks `process.argv` for the *startup* value. Re-parsing
+  the env var in the preload would let the two halves disagree silently — a
+  trace file with no `src:"renderer"` lines and no error. The env var stays the
+  startup path (it wins over the stored preference when set, in either
+  direction) and nothing else reads it. Likewise the output directory is
   `path.dirname(DB_PATH)`, never a second derivation of the env var (`db.js`
   documents that anti-pattern where it exports `DB_PATH`).
+- **The control channels are path-narrow.** `list-activity-trace-files`,
+  `read-activity-trace-file` and `delete-activity-trace-file` accept only paths
+  whose directory is the trace directory and whose basename matches the segment
+  name pattern — an allowlist of exactly one directory, tighter than
+  `isSensitivePath`, because the legitimate surface here is a single generated
+  file family. Deleting the segment currently being written is refused rather
+  than attempted. A read over 4 MB returns the tail and says so, so a 16 MB
+  segment does not go into an editor whole.
 - **The probes must stay one line each.** The interesting sites live in files
   that other branches touch (`session-transitions.js`, `public/sidebar.js`),
   so every probe is a single inserted statement and all the logic —
