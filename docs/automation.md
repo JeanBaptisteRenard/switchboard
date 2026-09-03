@@ -110,7 +110,7 @@ A counter could only add and subtract; a model can be edited. What is applied:
 | bare Up (`ESC [ A`, `ESC O A`), Ctrl+V, an unparseable escape | insert one opaque placeholder — the content is unknown, so it counts as one |
 | kitty Enter **with** a modifier (`ESC [ 13;2 u`, `ESC [ 13;5 u`) | inserts a line break |
 | kitty Enter **without** one (`ESC [ 13 u`), modified Up, OSC, other escapes | nothing |
-| mouse reports (`ESC [ < b ; x ; y M`/`m`, `ESC [ M` + 3 bytes), focus reports (`ESC [ I`, `ESC [ O`) | nothing — **and the quiet clock does not move**; these are the terminal talking, not the user |
+| SGR mouse reports (`ESC [ < b ; x ; y M`/`m`), focus reports (`ESC [ I`, `ESC [ O`) | nothing — **and the quiet clock does not move**; these two forms are the terminal talking, not the user |
 
 An escape sequence cut across two IPC chunks is buffered and re-joined, so half
 a sequence is never counted as text — including a lone `ESC` that turns out to
@@ -149,9 +149,9 @@ slash-command completion empties the box while the CLI refills it.
   was wrong: with the user simply present at the machine, triggers were
   unusable. Reports now count as neither text nor activity, so a chunk holding
   only reports changes nothing at all, clock included. The exemption is
-  deliberately narrow: SGR reports (`CSI < b ; x ; y M|m`), X10 reports (`CSI M`
-  plus exactly three payload bytes), and focus reports (`CSI I`, `CSI O`) with
-  no parameter. A near-miss — a parameter too few or too many, a non-numeric
+  deliberately narrow: SGR reports (`CSI < b ; x ; y M|m`) and focus reports
+  (`CSI I`, `CSI O`) with no parameter — those two forms and nothing else. A
+  near-miss — a parameter too few or too many, a non-numeric
   one, another final byte, a report cut short by the end of a chunk — is *not*
   recognised and still counts as input. Doubt resolves to busy here too: a wrong
   exemption would be a false "free", and a false "free" types over the user's

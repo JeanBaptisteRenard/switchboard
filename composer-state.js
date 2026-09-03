@@ -158,22 +158,15 @@ function matchEscape(buf, i) {
 
 const SGR_MOUSE_PARAMS_RE = /^<\d{1,10};\d{1,10};\d{1,10}$/;
 
-const REPORT_INCOMPLETE = -1;
-
 /**
- * How many bytes of terminal report start at `buf[i]`, `seq` having matched
- * there. 0 when the sequence is not a report. REPORT_INCOMPLETE when it opens
- * an X10 mouse report whose three payload bytes have not all arrived.
+ * How many bytes of terminal report start at the sequence `seq` just matched.
+ * 0 when the sequence is not a report.
  */
-function reportLength(buf, i, seq) {
+function reportLength(seq) {
   if (seq.kind !== 'csi') return 0;
   const { final, params } = seq;
   // SGR (CSI ?1006h): `CSI < b ; x ; y M` press, `… m` release.
   if ((final === 'M' || final === 'm') && SGR_MOUSE_PARAMS_RE.test(params)) return seq.len;
-  // X10 / normal tracking: `CSI M` then exactly three raw payload bytes.
-  if (final === 'M' && params === '') {
-    return i + seq.len + 3 <= buf.length ? seq.len + 3 : REPORT_INCOMPLETE;
-  }
   // Focus in / focus out (CSI ?1004h).
   if ((final === 'I' || final === 'O') && params === '') return seq.len;
   return 0;
@@ -325,13 +318,7 @@ function noteUserInput(state, data, now) {
         return finish();
       }
 
-      const report = reportLength(buf, i, seq);
-      if (report === REPORT_INCOMPLETE) {
-        // Half an X10 report: hold it, resolve towards busy for this chunk.
-        counted = true;
-        state.partial = buf.slice(i);
-        return finish();
-      }
+      const report = reportLength(seq);
       if (report > 0) {
         i += report;
         continue;

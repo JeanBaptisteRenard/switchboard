@@ -96,8 +96,8 @@ trigger needed `waited_ms: 15504` to find 3 s of silence. `docs/automation.md`
 had promised the opposite ("at most ~3 s each time, never a refusal on its
 own"), so the feature was in practice unusable whenever the user sat in front of
 the machine. The parser now has a third category — recognised, but touching
-neither the text nor the clock — for SGR mouse reports, X10 mouse reports and
-focus reports; `lastInputAt` is stamped after parsing, only if at least one
+neither the text nor the clock — holding exactly two forms: SGR mouse reports
+and focus reports. `lastInputAt` is stamped after parsing, only if at least one
 element of the chunk counted. Reports still reach the PTY untouched: the TUI
 needs them. Two things to keep in mind before widening this. The exemption is
 strict by design — a near-miss (wrong parameter count, non-numeric parameter,

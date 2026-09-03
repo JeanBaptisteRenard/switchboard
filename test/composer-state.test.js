@@ -135,7 +135,6 @@ test('composer-state: isComposerEmpty tracks the counter', () => {
 const SGR_PRESS   = '\x1b[<0;42;13M';
 const SGR_RELEASE = '\x1b[<0;42;13m';
 const SGR_MOVE    = '\x1b[<35;120;40M';
-const X10_REPORT  = '\x1b[M\x20\x2a\x2d';
 const FOCUS_IN    = '\x1b[I';
 const FOCUS_OUT   = '\x1b[O';
 
@@ -159,13 +158,6 @@ test('composer-state: an SGR mouse report is neither text nor activity', () => {
   assertInert([SGR_MOVE.repeat(12)]);
 });
 
-test('composer-state: an X10 mouse report is neither text nor activity', () => {
-  // The three payload bytes are printable: without the report rule they land in
-  // the composer as text.
-  assertInert([X10_REPORT]);
-  assertInert([X10_REPORT + X10_REPORT]);
-});
-
 test('composer-state: a focus report is neither text nor activity', () => {
   assertInert([FOCUS_IN]);
   assertInert([FOCUS_OUT]);
@@ -186,7 +178,7 @@ test('composer-state: a chunk mixing a report and a keystroke counts the keystro
 });
 
 test('composer-state: a report split across chunks is never counted as text', () => {
-  // SGR: the head is buffered, the tail completes it, and no byte reaches the box.
+  // The head is buffered, the tail completes it, and no byte reaches the box.
   const sgr = createComposerState();
   noteUserInput(sgr, '\x1b[<35;120', 1000);
   assert.equal(sgr.pending, 0, 'a half report is held back, not typed');
@@ -195,16 +187,6 @@ test('composer-state: a report split across chunks is never counted as text', ()
   assert.equal(sgr.pending, 0, 'the completed report adds nothing');
   assert.equal(sgr.partial, '');
   assert.equal(sgr.lastInputAt, 1000, 'the completing chunk is silence');
-
-  // X10: the payload bytes are printable, so a naive resume would type them.
-  const x10 = createComposerState();
-  noteUserInput(x10, '\x1b[M\x20', 1000);
-  assert.equal(x10.pending, 0);
-  assert.equal(x10.partial, '\x1b[M\x20');
-  noteUserInput(x10, '\x2a\x2d', 2000);
-  assert.equal(x10.pending, 0, 'the payload bytes are payload, not text');
-  assert.equal(x10.partial, '');
-  assert.equal(x10.lastInputAt, 1000);
 });
 
 test('composer-state: an unrecognised sequence still counts as input', () => {
@@ -231,9 +213,38 @@ test('composer-state: an unrecognised sequence still counts as input', () => {
 
 test('composer-state: a truncated report resolves towards busy for its own chunk', () => {
   const state = createComposerState();
-  noteUserInput(state, '\x1b[M\x20', 4000);
+  noteUserInput(state, '\x1b[<35;120', 4000);
   assert.equal(state.lastInputAt, 4000, 'half a report is not proof of silence');
   assert.equal(state.pending, 0, 'but it is not text either');
+});
+
+test('composer-state: a typed ESC [ M is input, not a mouse report', () => {
+  // Nothing in the repo subscribes to xterm's onBinary channel, so a
+  // DEFAULT-encoded mouse report never reaches this model: `ESC [ M` arriving
+  // on onData is a person pressing Escape, then [, then M.
+  const oneChunk = createComposerState();
+  noteUserInput(oneChunk, '\x1b[Mabc', 2000);
+  assert.equal(oneChunk.text, 'abc', 'the letters after it are typed text');
+  assert.equal(oneChunk.pending, 3);
+  assert.equal(oneChunk.lastInputAt, 2000, 'and the chunk pushes the quiet clock');
+
+  const keyByKey = createComposerState();
+  let now = 1000;
+  for (const key of ['\x1b', '[', 'M', 'i', 's', 'e']) noteUserInput(keyByKey, key, (now += 1000));
+  assert.equal(keyByKey.text, 'ise');
+  assert.equal(keyByKey.pending, 3);
+  assert.equal(keyByKey.lastInputAt, 7000);
+});
+
+test('composer-state: a bare CSI M never swallows the bytes that follow it', () => {
+  // Treating it as the head of a report misaligned the next chunk and left the
+  // composer frozen on a phantom count.
+  const state = createComposerState();
+  noteUserInput(state, '\x1b[M ', 1000);
+  assert.equal(state.partial, '', 'nothing is held back waiting for a payload');
+  noteUserInput(state, '\x1b[<0;1;1M', 2000);
+  assert.equal(state.text, ' ', 'the SGR report that follows stays inert');
+  assert.equal(state.pending, 1);
 });
 
 test('composer-state: lastInputAt advances on any chunk carrying real input', () => {
