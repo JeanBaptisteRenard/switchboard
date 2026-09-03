@@ -260,10 +260,45 @@ Result written to `SWITCHBOARD_TRIGGERS_DIR/processed/<uuid>.result.json`:
 
 Trigger file is **deleted** after processing (success or failure).
 
+### Removing the entry
+
+`writeResult()` is the single place a trigger's fate is decided: it writes the
+result atomically (`.tmp` + rename) and then unlinks the trigger. Every `return`
+in `processTriggerFile()` that produces a result goes through it, so there is no
+"processed but left behind" path — the trigger directory lists exactly what is
+still pending. Two consequences worth knowing:
+
+- **`ENOENT` on the unlink is not a failure.** Two `rename` events for the same
+  file can both reach processing; the loser finds the file already gone. That is
+  the intended end state, so it stays silent.
+- **Any other unlink error, and any non-`ENOENT` `lstat` error, marks the name
+  `retained`.** The entry could not be removed, so a later filesystem event on
+  that name would re-run a command that already ran. `retained` (a `Set` in
+  `start()`) makes the watcher ignore the name for the process's lifetime, and
+  the failure is logged at error level rather than swallowed. This trades
+  "processed at least once" for "never processed twice", which is the direction
+  the transport must fail in: the result file is already written, so nothing is
+  lost by refusing to look at the leftover again. The `Set` only ever holds
+  names whose removal failed, so it does not grow in normal operation.
+
+A rejected `processTriggerFile()` promise is caught in `dispatch()` and marks the
+name `retained` too: a throw leaves the entry in an unknown state — the command
+may or may not have reached the PTY — and replaying it is the one outcome that
+cannot be undone. No result file is written in that case; the error log is the
+only trace.
+
+**Known gap, deliberately not fixed**: if writing the result file fails, the
+trigger is deleted anyway. The two invariants ("always a result", "never twice")
+cannot both hold there, and "never twice" wins.
+
+`processed/` **has no retention policy** — result files accumulate without bound
+and nothing prunes them.
+
 ## Invariants
 
-- **Never throws out of the watcher callback** — every error path lands in the result file.
+- **Never throws out of the watcher callback** — every anticipated error path lands in the result file, and an unanticipated rejection is caught in `dispatch()` (logged, name retained, no result file).
 - **Deduplication via `inFlight` Set** — noisy `rename` events for the same file (common on Linux inotify) are coalesced; a file is processed at most once per appearance.
+- **A processed trigger never runs twice** — normally because it was deleted; when the deletion fails, because its name is in `retained`.
 - **`accessSync` guard** — the `rename` event fires both on file creation and deletion; the existence check prevents processing a deletion event.
 - **Directories ignored** — non-`*.json` filenames and any name containing `/` or `path.sep` are skipped.
 - **Invalid `timeout_ms` releases the semaphore** — validation happens before the session look-up and before acquiring an idle-wait slot; a bad value produces a result file and returns without counting against `MAX_INFLIGHT`.

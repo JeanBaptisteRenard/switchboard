@@ -2470,3 +2470,146 @@ test('renouncing: a chain whose first step was written reports "chain timeout", 
     cleanup(tmp);
   }
 });
+
+// ── Entry removal after processing ────────────────────────────────────────────
+// See .ai/contexts/trigger-watcher.md — a processed trigger must leave the
+// directory, and one that cannot be removed must never be run a second time.
+
+/** Logger that records what it was told, so failures can be asserted on. */
+function recordingLog() {
+  const errors = [];
+  return {
+    info:  () => {},
+    warn:  () => {},
+    debug: () => {},
+    error: (...args) => { errors.push(args.join(' ')); },
+    _errors: errors,
+  };
+}
+
+test('unremovable entry: failure is logged instead of swallowed', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-unremovable-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    ctx.log          = recordingLog();
+    watcher = start(ctx);
+
+    // A directory named <uuid>.json: lstat succeeds, isFile() is false, so the
+    // watcher writes a result — and unlink() on a directory always fails.
+    const uuid  = 'unremovable-' + Date.now();
+    const entry = path.join(tmp, uuid + '.json');
+    fs.mkdirSync(entry);
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /regular file/);
+    assert.equal(fs.existsSync(entry), true, 'precondition: the entry cannot be unlinked');
+
+    assert.ok(
+      ctx.log._errors.some(m => /survived processing/.test(m)),
+      'a removal failure must be logged, not swallowed by a bare catch; got: ' +
+        JSON.stringify(ctx.log._errors),
+    );
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('unremovable entry: a later event on the same name is never processed again', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-noreplay-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    ctx.log          = recordingLog();
+    watcher = start(ctx);
+
+    const uuid  = 'noreplay-' + Date.now();
+    const entry = path.join(tmp, uuid + '.json');
+    fs.mkdirSync(entry);
+
+    const processedDir = path.join(tmp, 'processed');
+    const resultPath   = path.join(processedDir, uuid + '.result.json');
+    await waitForFile(resultPath);
+    assert.equal(readResult(processedDir, uuid).ok, false, 'first pass rejected the entry');
+
+    // The entry survived processing. Make the same name appear again — a valid
+    // trigger this time. It must NOT be picked up: it was already processed.
+    fs.rmdirSync(entry);
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    await new Promise(r => setTimeout(r, 600));
+
+    assert.deepEqual(ctx._written, [],
+      'a name whose entry survived processing must never reach the PTY again');
+    assert.equal(readResult(processedDir, uuid).ok, false,
+      'the original result must not be overwritten by a second run');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('a throwing ctx does not leave an unhandled rejection, and the entry is not retried', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  const rejections = [];
+  const onRejection = (err) => rejections.push(err);
+  process.on('unhandledRejection', onRejection);
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-throwing-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    ctx.log          = recordingLog();
+    let calls = 0;
+    ctx.getComposerState = () => { calls++; throw new Error('composer state unavailable'); };
+    watcher = start(ctx);
+
+    const uuid = 'throwing-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    await new Promise(r => setTimeout(r, 600));
+    assert.ok(calls > 0, 'precondition: the throwing hook was reached');
+
+    assert.deepEqual(rejections, [], 'the watcher must not leave an unhandled rejection');
+    assert.ok(
+      ctx.log._errors.some(m => /processing threw/.test(m)),
+      'the failure must be logged; got: ' + JSON.stringify(ctx.log._errors),
+    );
+
+    // Same name reappearing must not be retried: it is in an unknown state.
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+    await new Promise(r => setTimeout(r, 400));
+    assert.deepEqual(ctx._written, [], 'an entry left in an unknown state is never replayed');
+
+  } finally {
+    process.removeListener('unhandledRejection', onRejection);
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});

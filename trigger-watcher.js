@@ -410,7 +410,7 @@ function validateTimeoutMs(value) {
  * Process a single trigger file (by basename, e.g. "abc-123.json").
  * Never throws — all errors land in the result file.
  */
-async function processTriggerFile(name, ctx, triggersDir, processedDir) {
+async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryRetained) {
   // Only handle *.json files, ignore the processed/ subdir itself and
   // any stray files.
   if (!name.endsWith('.json')) return;
@@ -433,9 +433,12 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
     }
     try {
       fs.unlinkSync(triggerPath);
-    } catch {
-      // Trigger may already be gone (race between two watcher events for the
-      // same file). Silently ignore.
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        ctx.log.error('[trigger-watcher] Trigger file survived processing, will not be run again:',
+          name, err.message);
+        if (onEntryRetained) onEntryRetained();
+      }
     }
   }
 
@@ -443,8 +446,12 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir) {
   let stat;
   try {
     stat = fs.lstatSync(triggerPath); // C2: lstat does NOT follow symlinks
-  } catch {
-    // File gone between access check and here — skip silently
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      ctx.log.error('[trigger-watcher] Trigger file could not be inspected, will not be run again:',
+        name, err.message);
+      if (onEntryRetained) onEntryRetained();
+    }
     return;
   }
 
@@ -953,22 +960,31 @@ function start(ctx) {
   const inFlight = new Set();
   // W4: queue of filenames awaiting an in-flight slot
   const waitQueue = [];
+  // Entries that were processed but stayed in the directory — see
+  // .ai/contexts/trigger-watcher.md.
+  const retained = new Set();
 
   function scheduleNext() {
     while (waitQueue.length > 0 && inFlight.size < MAX_INFLIGHT) {
       const filename = waitQueue.shift();
       // Dedup: may have been enqueued twice before a slot opened
-      if (inFlight.has(filename)) continue;
+      if (inFlight.has(filename) || retained.has(filename)) continue;
       dispatch(filename);
     }
   }
 
   function dispatch(filename) {
     inFlight.add(filename);
-    processTriggerFile(filename, ctx, triggersDir, processedDir).finally(() => {
-      inFlight.delete(filename);
-      scheduleNext();
-    });
+    processTriggerFile(filename, ctx, triggersDir, processedDir, () => retained.add(filename))
+      .catch((err) => {
+        retained.add(filename);
+        ctx.log.error('[trigger-watcher] Trigger processing threw, will not be run again:',
+          filename, err && err.message);
+      })
+      .finally(() => {
+        inFlight.delete(filename);
+        scheduleNext();
+      });
   }
 
   let watcher;
@@ -980,7 +996,7 @@ function start(ctx) {
       // Linux only reports the basename for non-recursive watches, but be
       // defensive: skip anything that looks like a path separator.
       if (filename.includes('/') || filename.includes(path.sep)) return;
-      if (inFlight.has(filename)) return;
+      if (inFlight.has(filename) || retained.has(filename)) return;
 
       // Confirm the file still exists (the rename event fires on delete too)
       const filePath = path.join(triggersDir, filename);

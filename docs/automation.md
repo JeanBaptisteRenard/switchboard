@@ -205,7 +205,11 @@ away mid-sentence can stall the queue for every other session. Set a short
 
 ### Reading a result
 
-The trigger file is deleted after processing, and a result file is written to `~/.switchboard/triggers/processed/<name>.result.json`:
+Every path that decides a trigger's fate — success, validation refusal, timeout,
+missing session, refused `wait` — writes the result to
+`~/.switchboard/triggers/processed/<name>.result.json` and then deletes the
+trigger file. The directory therefore holds exactly the triggers still waiting
+to be processed:
 
 ```json
 { "ok": true,  "submitted": "confirmed", "sessionId": "...", "command": "...", "sent_at": "...", "waited_ms": 320 }
@@ -248,5 +252,17 @@ The two reserved values are easy to confuse and mean opposite things, so:
 - The same holds when the session exits during that initial wait: the `error`
   stays the free-text `session exited during wait`, but `submitted` is `no`,
   `partial` is `false`, and `reason` says nothing was written.
+
+**When the deletion itself fails** (permissions, a locked file, an entry that is
+not a regular file), the trigger stays on disk. The result file is still
+written, the failure is logged at error level, and that name is remembered for
+the lifetime of the process so a later filesystem event on it can never run the
+command a second time — the leftover file is inert, not pending. A trigger whose
+name sits in `processed/` has been processed, whatever the trigger directory
+still shows.
+
+**`processed/` has no retention policy**: result files accumulate there for as
+long as the directory lives, and nothing in the app ever removes them. Callers
+that write many triggers should prune it themselves.
 
 The primary use case is context-management harnesses — e.g. an agent hook that detects a full context window and injects `/compact` into its own session. Write the trigger file atomically (write to a temp name, then rename) so the watcher never reads a half-written file.
