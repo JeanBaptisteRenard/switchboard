@@ -127,7 +127,116 @@ test('composer-state: isComposerEmpty tracks the counter', () => {
   assert.equal(isComposerEmpty(state), true);
 });
 
-test('composer-state: lastInputAt advances on any non-empty chunk', () => {
+// ── Terminal reports ─────────────────────────────────────────────────────────
+// Regression cover for the 2026-09-02 measurement: a resting pointer over a
+// mouse-tracking session pushed the quiet clock and got a trigger refused.
+// See docs/automation.md ("Politeness") for the numbers.
+
+const SGR_PRESS   = '\x1b[<0;42;13M';
+const SGR_RELEASE = '\x1b[<0;42;13m';
+const SGR_MOVE    = '\x1b[<35;120;40M';
+const X10_REPORT  = '\x1b[M\x20\x2a\x2d';
+const FOCUS_IN    = '\x1b[I';
+const FOCUS_OUT   = '\x1b[O';
+
+/** Feed `chunks` on top of a composer holding "hi", asserting nothing moved. */
+function assertInert(chunks) {
+  const state = createComposerState();
+  noteUserInput(state, 'hi', 1000);
+  assert.equal(state.pending, 2);
+  let t = 2000;
+  for (const chunk of chunks) noteUserInput(state, chunk, (t += 1000));
+  assert.equal(state.pending, 2, `${JSON.stringify(chunks)} must not touch the text`);
+  assert.equal(state.lastInputAt, 1000, `${JSON.stringify(chunks)} must not push the clock`);
+  assert.equal(state.partial, '', 'nothing should be left buffered');
+  return state;
+}
+
+test('composer-state: an SGR mouse report is neither text nor activity', () => {
+  assertInert([SGR_MOVE]);
+  assertInert([SGR_PRESS, SGR_RELEASE]);
+  // A whole flick of the wrist in one chunk is still silence.
+  assertInert([SGR_MOVE.repeat(12)]);
+});
+
+test('composer-state: an X10 mouse report is neither text nor activity', () => {
+  // The three payload bytes are printable: without the report rule they land in
+  // the composer as text.
+  assertInert([X10_REPORT]);
+  assertInert([X10_REPORT + X10_REPORT]);
+});
+
+test('composer-state: a focus report is neither text nor activity', () => {
+  assertInert([FOCUS_IN]);
+  assertInert([FOCUS_OUT]);
+  assertInert([FOCUS_OUT, FOCUS_IN]);
+});
+
+test('composer-state: a chunk mixing a report and a keystroke counts the keystroke', () => {
+  const state = createComposerState();
+  noteUserInput(state, 'hi', 1000);
+  noteUserInput(state, SGR_MOVE + 'x', 5000);
+  assert.equal(state.pending, 3, 'the keystroke lands in the composer');
+  assert.equal(state.lastInputAt, 5000, 'and pushes the quiet clock');
+
+  const trailing = createComposerState();
+  noteUserInput(trailing, 'a' + FOCUS_IN, 6000);
+  assert.equal(trailing.pending, 1);
+  assert.equal(trailing.lastInputAt, 6000);
+});
+
+test('composer-state: a report split across chunks is never counted as text', () => {
+  // SGR: the head is buffered, the tail completes it, and no byte reaches the box.
+  const sgr = createComposerState();
+  noteUserInput(sgr, '\x1b[<35;120', 1000);
+  assert.equal(sgr.pending, 0, 'a half report is held back, not typed');
+  assert.equal(sgr.partial, '\x1b[<35;120');
+  noteUserInput(sgr, ';40M', 2000);
+  assert.equal(sgr.pending, 0, 'the completed report adds nothing');
+  assert.equal(sgr.partial, '');
+  assert.equal(sgr.lastInputAt, 1000, 'the completing chunk is silence');
+
+  // X10: the payload bytes are printable, so a naive resume would type them.
+  const x10 = createComposerState();
+  noteUserInput(x10, '\x1b[M\x20', 1000);
+  assert.equal(x10.pending, 0);
+  assert.equal(x10.partial, '\x1b[M\x20');
+  noteUserInput(x10, '\x2a\x2d', 2000);
+  assert.equal(x10.pending, 0, 'the payload bytes are payload, not text');
+  assert.equal(x10.partial, '');
+  assert.equal(x10.lastInputAt, 1000);
+});
+
+test('composer-state: an unrecognised sequence still counts as input', () => {
+  // The safety principle: only sequences actually recognised as reports are
+  // exempt. A near-miss must resolve towards busy, never towards free — a false
+  // "idle" is what lets a trigger type over the user's sentence.
+  const cases = [
+    ['\x1b[<0;42M',     'an SGR report short of a parameter'],
+    ['\x1b[<0;42;13;9M', 'an SGR report with a parameter too many'],
+    ['\x1b[5M',          'CSI 5 M — delete lines, not a mouse report'],
+    ['\x1b[<a;b;cM',     'non-numeric SGR parameters'],
+    ['\x1b[2I',          'a parameterised CSI I'],
+    ['\x1b[1;2O',        'a modified CSI O'],
+    ['\x1bOM',           'SS3 M, not CSI M'],
+    ['\x1b[<0;42;13X',   'the right shape with the wrong final byte'],
+  ];
+  for (const [seq, why] of cases) {
+    const state = createComposerState();
+    noteUserInput(state, 'hi', 1000);
+    noteUserInput(state, seq, 9000);
+    assert.equal(state.lastInputAt, 9000, `${why} must push the quiet clock`);
+  }
+});
+
+test('composer-state: a truncated report resolves towards busy for its own chunk', () => {
+  const state = createComposerState();
+  noteUserInput(state, '\x1b[M\x20', 4000);
+  assert.equal(state.lastInputAt, 4000, 'half a report is not proof of silence');
+  assert.equal(state.pending, 0, 'but it is not text either');
+});
+
+test('composer-state: lastInputAt advances on any chunk carrying real input', () => {
   const state = createComposerState();
   noteUserInput(state, 'a', 5000);
   assert.equal(state.lastInputAt, 5000);

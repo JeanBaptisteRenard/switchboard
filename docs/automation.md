@@ -110,6 +110,7 @@ A counter could only add and subtract; a model can be edited. What is applied:
 | bare Up (`ESC [ A`, `ESC O A`), Ctrl+V, an unparseable escape | insert one opaque placeholder — the content is unknown, so it counts as one |
 | kitty Enter **with** a modifier (`ESC [ 13;2 u`, `ESC [ 13;5 u`) | inserts a line break |
 | kitty Enter **without** one (`ESC [ 13 u`), modified Up, OSC, other escapes | nothing |
+| mouse reports (`ESC [ < b ; x ; y M`/`m`, `ESC [ M` + 3 bytes), focus reports (`ESC [ I`, `ESC [ O`) | nothing — **and the quiet clock does not move**; these are the terminal talking, not the user |
 
 An escape sequence cut across two IPC chunks is buffered and re-joined, so half
 a sequence is never counted as text — including a lone `ESC` that turns out to
@@ -134,11 +135,27 @@ slash-command completion empties the box while the CLI refills it.
 - Ctrl+U is treated as clearing the whole box, which is right when the cursor is
   at the end. Used mid-line it would be an under-count if the CLI binds it to
   "kill to start of line" — unmeasured.
-- Any non-empty chunk on the channel restarts the quiet clock, whether or not it
-  changes the text. A TUI that has enabled mouse reporting (`CSI ?1003h`) sends
-  a report per mouse move, so moving the pointer over the terminal delays a
-  trigger — bounded by the quiet window, so at most ~3 s each time, never a
-  refusal on its own.
+- Any chunk carrying something other than a recognised terminal report restarts
+  the quiet clock, whether or not it changes the text. Mouse and focus reports
+  are the exception, and they had to be: a TUI with mouse reporting on
+  (`CSI ?1003h`) emits one report per pointer motion, on the same IPC channel as
+  keystrokes, and until 2026-09-02 each of them pushed the clock. **Measured that
+  day on the real CLI**, composer emptied with Ctrl+U, no key touched: pointer
+  resting *over* the terminal, a trigger waited its full 30 s and was then
+  refused — `{"ok":false,"reason":"the last keystroke landed 47 ms ago, inside
+  the 3000 ms quiet window","waited_ms":30046}`; pointer moved *off* the
+  terminal, the same trigger took `waited_ms":15504` to find 3 s of silence. The
+  earlier claim here — "at most ~3 s each time, never a refusal on its own" —
+  was wrong: with the user simply present at the machine, triggers were
+  unusable. Reports now count as neither text nor activity, so a chunk holding
+  only reports changes nothing at all, clock included. The exemption is
+  deliberately narrow: SGR reports (`CSI < b ; x ; y M|m`), X10 reports (`CSI M`
+  plus exactly three payload bytes), and focus reports (`CSI I`, `CSI O`) with
+  no parameter. A near-miss — a parameter too few or too many, a non-numeric
+  one, another final byte, a report cut short by the end of a chunk — is *not*
+  recognised and still counts as input. Doubt resolves to busy here too: a wrong
+  exemption would be a false "free", and a false "free" types over the user's
+  sentence.
 - Escape does **not** clear the composer on Claude Code v2.1.258 (measured), so
   treating it as neutral is correct *today*. A CLI change would turn it into a
   false "free".

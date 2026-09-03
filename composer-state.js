@@ -151,6 +151,34 @@ function matchEscape(buf, i) {
   return { len: 2, kind: 'esc', final: next };
 }
 
+// ── Terminal reports ─────────────────────────────────────────────────────────
+// Mouse and focus reports ride the same channel as keystrokes but are not user
+// input: neither text nor activity. Recognition is deliberately strict — see
+// .ai/contexts/trigger-watcher.md.
+
+const SGR_MOUSE_PARAMS_RE = /^<\d{1,10};\d{1,10};\d{1,10}$/;
+
+const REPORT_INCOMPLETE = -1;
+
+/**
+ * How many bytes of terminal report start at `buf[i]`, `seq` having matched
+ * there. 0 when the sequence is not a report. REPORT_INCOMPLETE when it opens
+ * an X10 mouse report whose three payload bytes have not all arrived.
+ */
+function reportLength(buf, i, seq) {
+  if (seq.kind !== 'csi') return 0;
+  const { final, params } = seq;
+  // SGR (CSI ?1006h): `CSI < b ; x ; y M` press, `… m` release.
+  if ((final === 'M' || final === 'm') && SGR_MOUSE_PARAMS_RE.test(params)) return seq.len;
+  // X10 / normal tracking: `CSI M` then exactly three raw payload bytes.
+  if (final === 'M' && params === '') {
+    return i + seq.len + 3 <= buf.length ? seq.len + 3 : REPORT_INCOMPLETE;
+  }
+  // Focus in / focus out (CSI ?1004h).
+  if ((final === 'I' || final === 'O') && params === '') return seq.len;
+  return 0;
+}
+
 // A kitty Enter is a line break only when it carries a modifier parameter;
 // bare `ESC [ 13 u` is a submission.
 const KITTY_ENTER_RE = /^13;[0-9:;]+$/;
@@ -228,6 +256,9 @@ function insertRun(state, run, atBufferEnd) {
 /**
  * Fold one chunk of renderer keystrokes into `state`.
  *
+ * A chunk made only of terminal reports leaves the state untouched, clock
+ * included; anything else pushes `lastInputAt`.
+ *
  * @param {object} state  from createComposerState()
  * @param {string|Buffer} data  bytes the user just sent to the PTY
  * @param {number} now  epoch ms
@@ -237,16 +268,21 @@ function noteUserInput(state, data, now) {
   const chunk = typeof data === 'string' ? data : String(data ?? '');
   if (chunk.length === 0) return state;
 
-  state.lastInputAt = now;
-
   const buf = state.partial + chunk;
   state.partial = '';
+
+  let counted = false;
+  const finish = () => {
+    if (counted) state.lastInputAt = now;
+    return sync(state);
+  };
 
   let i = 0;
   while (i < buf.length) {
     const c = buf[i];
 
     if (state.inPaste) {
+      counted = true;
       if (buf.startsWith(PASTE_END, i)) {
         state.inPaste = false;
         i += PASTE_END.length;
@@ -254,7 +290,7 @@ function noteUserInput(state, data, now) {
       }
       if (c === '\x1b' && isTruncatedPrefixOf(buf, i, PASTE_END)) {
         state.partial = buf.slice(i);
-        return sync(state);
+        return finish();
       }
       let j = i;
       while (j < buf.length && buf[j] !== '\x1b') j++;
@@ -266,26 +302,42 @@ function noteUserInput(state, data, now) {
 
     if (c === '\x1b') {
       if (buf.startsWith(PASTE_START, i)) {
+        counted = true;
         state.inPaste = true;
         i += PASTE_START.length;
         continue;
       }
       if (isTruncatedPrefixOf(buf, i, PASTE_START)) {
+        counted = true;
         state.partial = buf.slice(i);
-        return sync(state);
+        return finish();
       }
 
       const seq = matchEscape(buf, i);
       if (!seq) {
+        counted = true;
         const tail = buf.slice(i);
         if (tail.length > MAX_PARTIAL) {
           insertText(state, OPAQUE);
-          return sync(state);
+          return finish();
         }
         state.partial = tail;
-        return sync(state);
+        return finish();
       }
 
+      const report = reportLength(buf, i, seq);
+      if (report === REPORT_INCOMPLETE) {
+        // Half an X10 report: hold it, resolve towards busy for this chunk.
+        counted = true;
+        state.partial = buf.slice(i);
+        return finish();
+      }
+      if (report > 0) {
+        i += report;
+        continue;
+      }
+
+      counted = true;
       if (seq.kind === 'csi') applyCsi(state, seq);
       else if (seq.kind === 'ss3') applySs3(state, seq);
       else if (seq.kind === 'esc') applyEsc(state, seq);
@@ -293,6 +345,7 @@ function noteUserInput(state, data, now) {
       continue;
     }
 
+    counted = true;
     if (c === '\r' || c === '\n' || c === '\x15' || c === '\x03') {
       clearAll(state);
     } else if (c === '\x7f' || c === '\b') {
@@ -317,7 +370,7 @@ function noteUserInput(state, data, now) {
     i += 1;
   }
 
-  return sync(state);
+  return finish();
 }
 
 module.exports = { createComposerState, noteUserInput, isComposerEmpty, MAX_PARTIAL };
