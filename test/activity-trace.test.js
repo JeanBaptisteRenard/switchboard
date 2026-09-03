@@ -351,10 +351,13 @@ test('the trace file is timestamped so a new run never overwrites the last', asy
   const t = createActivityTrace({ enabled: true, nowMs: () => Date.parse('2026-08-22T09:15:00') });
   const file = t.init(dir);
   t.trace('osc.title', 's1', { cp: codePoints('◐', 1) });
-  t.close();
 
   assert.match(path.basename(file), /^activity-trace-\d{8}-\d{6}\.jsonl$/);
-  await new Promise(r => setTimeout(r, 30));
+  // Wait on the flush, not on a duration — see docs/activity-trace.md
+  // "Testing the async prune path"; a fixed 30 ms loses that race under the
+  // full suite's parallel load.
+  await new Promise(r => t.close(r));
+  await waitUntil(() => readEntries([file]).length === 1);
   const written = fs.readFileSync(file, 'utf8').trim().split('\n');
   assert.equal(written.length, 1);
   assert.equal(JSON.parse(written[0]).cp, 'U+25D0');
@@ -725,5 +728,69 @@ test('readTraceTail never pads with NULs when the file shrinks under it', () => 
   assert.equal(result.content.indexOf('\u0000'), -1, 'not one NUL reached the caller');
   assert.ok(result.shown <= 512, `shown must report what was read, got ${result.shown}`);
   assert.ok(result.content.length <= 512);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('rotation still fires at the cap after repeated toggles inside one second', async () => {
+  // The byte counter measures the file, not the window. Restarting it at zero
+  // on every activation lets one segment grow past the cap once per toggle,
+  // and past the cap it never rotates again — the ceiling stops existing.
+  const dir = tmpTraceDir('cap-across-toggles');
+  const now = Date.parse('2026-09-04T09:15:00.000Z');
+  const cap = 4000;
+  const t = createActivityTrace({ enabled: true, maxSegmentBytes: cap, maxSegments: 4, nowMs: () => now });
+  t.init(dir);
+
+  const pad = 'x'.repeat(120);
+  for (let cycle = 0; cycle < 10; cycle++) {
+    for (let i = 0; i < 10; i++) t.trace('fill', 's1', { cycle, i, pad });
+    await new Promise(r => t.setEnabled(false, r));
+    t.setEnabled(true);
+  }
+  await new Promise(r => t.close(r));
+
+  const files = jsonlIn(dir);
+  assert.ok(files.length > 1, `the run must have rotated at all, produced ${files.length} file(s)`);
+
+  // No retained segment may sit meaningfully past the cap. One line of
+  // overshoot is inherent: the threshold is checked after the write.
+  const longest = Math.max(...files.map(f => fs.statSync(path.join(dir, f)).size));
+  assert.ok(longest < cap * 1.25, `a segment grew to ${longest} bytes against a ${cap} cap`);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('re-enabling in the same second resumes the window instead of reopening its first segment', async () => {
+  const dir = tmpTraceDir('resume-segment');
+  const now = Date.parse('2026-09-04T09:15:00.000Z');
+  const cap = 900;
+  const t = createActivityTrace({ enabled: true, maxSegmentBytes: cap, maxSegments: 4, nowMs: () => now });
+  const first = t.init(dir);
+
+  const pad = 'y'.repeat(200);
+  for (let i = 0; i < 8; i++) t.trace('fill', 's1', { i, pad });
+  const rotatedAway = t.currentFile;
+  assert.notEqual(rotatedAway, first, 'the window rotated past its first segment');
+
+  await new Promise(r => t.setEnabled(false, r));
+  const resumed = t.setEnabled(true);
+  assert.notEqual(resumed, first, 'a re-enable must not reopen the already-rotated segment 0');
+  await new Promise(r => t.close(r));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('the file being flushed cannot be deleted out from under the flush', async () => {
+  const dir = tmpTraceDir('flush-window');
+  const t = createActivityTrace({ enabled: true });
+  const file = t.init(dir);
+  for (let i = 0; i < 3000; i++) t.trace('fill', 's1', { i, pad: 'z'.repeat(60) });
+
+  // Synchronously after asking to disable, the flush is still in flight; the
+  // panel's delete guard keys on currentFile, so it must still name the file.
+  const flushed = new Promise(r => t.setEnabled(false, r));
+  assert.equal(t.currentFile, file, 'still current while its buffer drains');
+
+  await flushed;
+  assert.equal(t.currentFile, null, 'released once the flush completed');
+  assert.equal(readEntries([file]).length, 3000, 'and every line reached disk');
   fs.rmSync(dir, { recursive: true, force: true });
 });

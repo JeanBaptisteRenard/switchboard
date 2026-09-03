@@ -57,13 +57,17 @@ function collect(src) {
   const looseTrace = [];
   const looseHelpers = [];
 
-  const openGuardAbove = (i) => {
-    for (let j = i - 1; j >= 0 && j > i - 12; j--) {
-      if (/^\s*if \(TRACE\.on\) \{\s*$/.test(lines[j])) return true;
-      if (/^\s*\}/.test(lines[j])) return false;
+  // The real extent of every `if (TRACE.on) {` block, so a helper call deep
+  // inside a long one is not mistaken for an unguarded call.
+  const guardedRanges = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\s*if \(TRACE\.on\) \{\s*$/.test(lines[i])) continue;
+    const indent = lines[i].match(/^\s*/)[0];
+    for (let j = i + 1; j < lines.length; j++) {
+      if (lines[j].trimEnd() === indent + '}') { guardedRanges.push([i, j]); break; }
     }
-    return false;
-  };
+  }
+  const openGuardAbove = (i) => guardedRanges.some(([from, to]) => i > from && i < to);
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];

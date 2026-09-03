@@ -235,6 +235,9 @@ function createActivityTrace(options = {}) {
     });
     stream = opened;
     currentPath = file;
+    // Reopening appends, so the rotation threshold has to measure the file and
+    // not the current window: starting this counter at 0 would let a segment
+    // grow past the cap once per toggle and, once past it, never rotate again.
     let existing = 0;
     try { existing = fs.statSync(file).size; } catch {}
     bytes = existing;
@@ -254,10 +257,16 @@ function createActivityTrace(options = {}) {
 
   // see docs/activity-trace.md "Turning it off, and on again"
   function startSegment() {
-    baseName = 'activity-trace-' + timestampSlug(new Date(nowMs()));
-    segment = 0;
+    const name = 'activity-trace-' + timestampSlug(new Date(nowMs()));
+    // Same second, same window: resume where that window stopped rather than
+    // reopening its already-rotated segment 0.
+    if (name !== baseName) {
+      baseName = name;
+      segment = 0;
+    }
     fs.mkdirSync(dir, { recursive: true });
     openSegment();
+    if (bytes >= maxSegmentBytes) rotate();
   }
 
   function init(dataDir) {
@@ -299,9 +308,14 @@ function createActivityTrace(options = {}) {
     state.on = false;
     const old = stream;
     stream = null;
-    currentPath = null;
-    if (old) old.end(done);
-    else if (done) done();
+    // currentPath outlives the stream until the flush completes: it is what
+    // stops the panel deleting a file that is still being written out.
+    if (old) {
+      old.end(() => { currentPath = null; if (done) done(); });
+    } else {
+      currentPath = null;
+      if (done) done();
+    }
     return null;
   }
 
@@ -326,9 +340,12 @@ function createActivityTrace(options = {}) {
   function close(done) {
     const old = stream;
     stream = null;
-    currentPath = null;
-    if (old) old.end(done);
-    else if (done) done();
+    if (old) {
+      old.end(() => { currentPath = null; if (done) done(); });
+    } else {
+      currentPath = null;
+      if (done) done();
+    }
   }
 
   return {

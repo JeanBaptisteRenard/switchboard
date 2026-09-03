@@ -64,11 +64,18 @@ rotation bookkeeping is per-file. `seq` does not restart — it is process-wide,
 and it is what orders the two halves of a session.
 
 The stamp has one-second resolution, so an off/on inside the same second
-resolves to the same name and **reopens that file** instead of creating a
-second one indistinguishable from it. That is the correct reading of the name:
-the window is the second it is stamped with. The byte counter is re-read from
-the file on open, so the rotation threshold still measures the file rather than
-the last window.
+resolves to the same name and **resumes that window** instead of creating a
+second one indistinguishable from it: it reopens the segment the window was
+last writing to, not its first. That is the correct reading of the name — the
+window is the second it is stamped with.
+
+The byte counter is re-read from the file on open, so the rotation threshold
+measures the file rather than the last window. That detail is load-bearing, not
+housekeeping: starting the counter at zero on each activation lets one segment
+grow past the cap once per toggle, and once past it the threshold is met on
+every write, so rotation never fires again and the 64 MB ceiling stops
+applying. A segment that is already at the cap when it is reopened rotates
+immediately rather than taking one more line first.
 
 That case is not hypothetical — it is a double-click on the switch, and it used
 to be destructive: the same path went into the retained-segment list twice, the
