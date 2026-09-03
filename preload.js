@@ -55,10 +55,17 @@ contextBridge.exposeInMainWorld('api', {
   readClipboard: () => ipcRenderer.invoke('read-clipboard'),
   clipboardHasImage: () => ipcRenderer.invoke('clipboard-has-image'),
 
-  // Opt-in activity trace — see docs/activity-trace.md. Main resolves the flag
-  // (activity-trace.js) and passes it as an argument; never re-parsed here.
+  // Opt-in activity trace — see docs/activity-trace.md. Main resolves the state
+  // (activity-trace.js) and passes the startup value as an argument; never
+  // re-parsed here. Later changes arrive on the onActivityTraceState channel.
   activityTraceEnabled: process.argv.includes('--switchboard-activity-trace'),
   traceActivity: (cat, sid, fields) => ipcRenderer.send('activity-trace', cat, sid, fields),
+  getActivityTraceState: () => ipcRenderer.invoke('get-activity-trace-state'),
+  setActivityTraceEnabled: (enabled) => ipcRenderer.invoke('set-activity-trace-enabled', enabled),
+  listActivityTraceFiles: () => ipcRenderer.invoke('list-activity-trace-files'),
+  readActivityTraceFile: (filePath) => ipcRenderer.invoke('read-activity-trace-file', filePath),
+  deleteActivityTraceFile: (filePath) => ipcRenderer.invoke('delete-activity-trace-file', filePath),
+  onActivityTraceState: (cb) => ipcRenderer.on('activity-trace-state', (_e, enabled) => cb(enabled)),
 
   // Send (fire-and-forget)
   sendInput: (id, data) => ipcRenderer.send('terminal-input', id, data),

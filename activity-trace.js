@@ -1,6 +1,7 @@
 'use strict';
 
-// Opt-in activity trace, off unless SWITCHBOARD_ACTIVITY_TRACE is set.
+// Opt-in activity trace. The environment variable sets the state at startup;
+// it can be toggled at runtime afterwards.
 // See docs/activity-trace.md and .ai/contexts/ipc-bridge.md "Activity trace".
 
 const fs = require('fs');
@@ -20,6 +21,19 @@ function envEnabled(env) {
   if (typeof raw !== 'string') return false;
   const v = raw.trim().toLowerCase();
   return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+
+// true / false / null, where null means the variable was not set.
+function envState(env) {
+  const raw = env && env[ENV_VAR];
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  return envEnabled(env);
+}
+
+// see docs/activity-trace.md "Turning it on"
+function initialEnabled(env, stored) {
+  const fromEnv = envState(env);
+  return fromEnv === null ? stored === true : fromEnv;
 }
 
 function envMaxBytes(env) {
@@ -95,6 +109,44 @@ function formatEntry(envelope, fields) {
   }
 }
 
+const TRACE_FILE_RE = /^activity-trace-\d{8}-\d{6}(\.\d{3})?\.jsonl$/;
+
+// An allowlist of exactly one directory and one name shape — see
+// .ai/contexts/ipc-bridge.md "Activity trace".
+function resolveTraceFilePath(dir, filePath) {
+  if (typeof dir !== 'string' || typeof filePath !== 'string' || filePath === '') return null;
+  let resolved;
+  try { resolved = path.resolve(filePath); } catch { return null; }
+  if (path.dirname(resolved) !== path.resolve(dir)) return null;
+  if (!TRACE_FILE_RE.test(path.basename(resolved))) return null;
+  return resolved;
+}
+
+// The last `cap` bytes, cut at the next line break so the result is still
+// one-JSON-object-per-line. A segment is 16 MB by default.
+function readTraceTail(filePath, cap) {
+  const size = fs.statSync(filePath).size;
+  if (size <= cap) {
+    return { content: fs.readFileSync(filePath, 'utf8'), size, truncated: false, shown: size };
+  }
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buf = Buffer.alloc(cap);
+    // The file can shrink between the stat and the read (a rotation, a delete
+    // and recreate): honour what was actually read, never the buffer length.
+    const bytesRead = fs.readSync(fd, buf, 0, cap, size - cap);
+    if (bytesRead <= 0) return { content: '', size, truncated: true, shown: 0 };
+    const text = buf.toString('utf8', 0, bytesRead);
+    const firstBreak = text.indexOf('\n');
+    return {
+      content: firstBreak === -1 ? text : text.slice(firstBreak + 1),
+      size, truncated: true, shown: bytesRead,
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function timestampSlug(date) {
   const p = (n, w = 2) => String(n).padStart(w, '0');
   return date.getFullYear() + p(date.getMonth() + 1) + p(date.getDate())
@@ -102,7 +154,7 @@ function timestampSlug(date) {
 }
 
 function createActivityTrace(options = {}) {
-  const enabled = !!options.enabled;
+  const state = { on: !!options.enabled };
   const maxSegmentBytes = options.maxSegmentBytes || envMaxBytes(process.env);
   const maxSegments = options.maxSegments || DEFAULT_SEGMENTS;
   const nowMs = options.nowMs || (() => Date.now());
@@ -112,6 +164,10 @@ function createActivityTrace(options = {}) {
   const origin = process.hrtime.bigint();
   let seq = 0;
   let stream = null;
+  // The file `stream` writes to, and null the moment there is no live stream.
+  // Derived from the stream rather than from the queue — see
+  // docs/activity-trace.md "Turning it off, and on again".
+  let currentPath = null;
   let bytes = 0;
   let segment = 0;
   let dir = null;
@@ -124,15 +180,33 @@ function createActivityTrace(options = {}) {
     return path.join(dir, index === 0 ? baseName + '.jsonl' : baseName + '.' + String(index + 1).padStart(3, '0') + '.jsonl');
   }
 
+  // The queue holds paths, and a path can come back: two activations inside the
+  // same second resolve to the same name. Re-queue rather than duplicate, or
+  // the ceiling would count one file twice and prune it while it is still live.
+  function trackSegment(file) {
+    const at = segments.indexOf(file);
+    if (at !== -1) segments.splice(at, 1);
+    segments.push(file);
+  }
+
   // A stale segment stays queued until it is actually gone: a locked file (a
   // tail or an editor open on it mid-investigation) is retried at the next
   // rotation rather than dropped off the ceiling and forgotten.
   function pruneSegments() {
     while (segments.length > maxSegments) {
       const stale = segments[0];
+      // Redundant with trackSegment's de-duplication, kept as a backstop.
+      if (stale === currentPath) return;
       try {
         unlink(stale);
       } catch (err) {
+        // Already gone — the panel's Delete button, or a hand on the directory.
+        // Retrying that forever would jam the queue and void the ceiling.
+        if (err && err.code === 'ENOENT') {
+          segments.shift();
+          unlinkFailures.delete(stale);
+          continue;
+        }
         if (!unlinkFailures.has(stale)) {
           unlinkFailures.add(stale);
           warning = true; // this write must not trigger a nested rotation
@@ -155,37 +229,98 @@ function createActivityTrace(options = {}) {
     const file = segmentPath(segment);
     // createWriteStream is lazy; pruning must not race a file that has no inode yet.
     fs.writeFileSync(file, '', { flag: 'a' });
-    stream = fs.createWriteStream(file, { flags: 'a' });
-    stream.on('error', () => { stream = null; });
-    bytes = 0;
-    segments.push(file);
+    const opened = fs.createWriteStream(file, { flags: 'a' });
+    opened.on('error', () => {
+      if (stream === opened) { stream = null; currentPath = null; }
+    });
+    stream = opened;
+    currentPath = file;
+    // Reopening appends, so the rotation threshold has to measure the file and
+    // not the current window: starting this counter at 0 would let a segment
+    // grow past the cap once per toggle and, once past it, never rotate again.
+    let existing = 0;
+    try { existing = fs.statSync(file).size; } catch {}
+    bytes = existing;
+    trackSegment(file);
   }
 
   function rotate() {
     if (warning) return; // the prune-failure line must not re-enter rotation
     const old = stream;
     stream = null;
+    currentPath = null;
     segment += 1;
-    try { openSegment(); } catch { stream = null; }
+    try { openSegment(); } catch { stream = null; currentPath = null; }
     // Windows refuses to unlink a handle that is still open.
     if (old) old.end(pruneSegments); else pruneSegments();
   }
 
+  // see docs/activity-trace.md "Turning it off, and on again"
+  function startSegment() {
+    const name = 'activity-trace-' + timestampSlug(new Date(nowMs()));
+    // Same second, same window: resume where that window stopped rather than
+    // reopening its already-rotated segment 0.
+    if (name !== baseName) {
+      baseName = name;
+      segment = 0;
+    }
+    fs.mkdirSync(dir, { recursive: true });
+    openSegment();
+    if (bytes >= maxSegmentBytes) rotate();
+  }
+
   function init(dataDir) {
-    if (!enabled || write || stream || !dataDir) return null;
+    if (write || !dataDir) return null;
     dir = dataDir;
-    baseName = 'activity-trace-' + timestampSlug(new Date(nowMs()));
+    if (!state.on || stream) return null;
     try {
-      fs.mkdirSync(dir, { recursive: true });
-      openSegment();
+      startSegment();
     } catch {
       stream = null;
+      currentPath = null;
     }
-    return stream ? segments[segments.length - 1] : null;
+    return currentPath;
+  }
+
+  function setEnabled(value, done) {
+    const next = !!value;
+    // An enable whose open failed leaves state.on true with no stream; a plain
+    // `next === state.on` no-op would then never retry it.
+    const needsOpen = next && !write && !!dir && !stream;
+    if (next === state.on && !needsOpen) {
+      if (done) done();
+      return currentPath;
+    }
+    if (next) {
+      state.on = true;
+      if (needsOpen) {
+        try {
+          startSegment();
+          pruneSegments();
+        } catch {
+          stream = null;
+          currentPath = null;
+        }
+      }
+      if (done) done();
+      return currentPath;
+    }
+    state.on = false;
+    const old = stream;
+    stream = null;
+    // currentPath outlives the stream until the flush completes: it is what
+    // stops the panel deleting a file that is still being written out.
+    if (old) {
+      old.end(() => { currentPath = null; if (done) done(); });
+    } else {
+      currentPath = null;
+      if (done) done();
+    }
+    return null;
   }
 
   function trace(cat, sid, fields, src) {
-    if (!enabled) return;
+    if (!state.on) return;
     if (!stream && !write) return;
     seq += 1;
     const line = formatEntry({
@@ -202,31 +337,41 @@ function createActivityTrace(options = {}) {
     if (bytes >= maxSegmentBytes) rotate();
   }
 
-  function close() {
+  function close(done) {
     const old = stream;
     stream = null;
-    if (old) old.end();
+    if (old) {
+      old.end(() => { currentPath = null; if (done) done(); });
+    } else {
+      currentPath = null;
+      if (done) done();
+    }
   }
 
   return {
-    enabled,
+    state,
+    get enabled() { return state.on; },
+    setEnabled,
     init,
     trace,
     close,
     get sequence() { return seq; },
     get files() { return segments.slice(); },
-    get currentFile() { return segments.length ? segments[segments.length - 1] : null; },
+    get currentFile() { return currentPath; },
   };
 }
 
 const singleton = createActivityTrace({ enabled: envEnabled(process.env) });
 
 module.exports = {
-  enabled: singleton.enabled,
+  state: singleton.state,
+  get enabled() { return singleton.enabled; },
+  setEnabled: singleton.setEnabled,
   init: singleton.init,
   trace: singleton.trace,
   close: singleton.close,
   currentFile: () => singleton.currentFile,
+  files: () => singleton.files,
   createActivityTrace,
   formatEntry,
   codePoints,
@@ -234,4 +379,9 @@ module.exports = {
   busyDecision,
   progressDecision,
   envEnabled,
+  envState,
+  initialEnabled,
+  resolveTraceFilePath,
+  readTraceTail,
+  TRACE_FILE_RE,
 };

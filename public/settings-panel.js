@@ -79,6 +79,12 @@
     const autoUpdateValue = fieldValue('autoUpdate', true);
     const shellProfileValue = fieldValue('shellProfile', 'auto');
 
+    // Live switch, not a form field — main owns the state. See docs/activity-trace.md.
+    let traceState = { enabled: false };
+    if (!isProject) {
+      try { traceState = (await window.api.getActivityTraceState()) || traceState; } catch {};
+    }
+
     // Working copy of the (global-only) re-bindable keyboard shortcuts.
     let scShortcuts = normalizeShortcuts(isProject ? null : current.shortcuts);
     const scIsMac = typeof isMac !== 'undefined' ? isMac : /Mac|iPhone|iPad/.test(navigator.platform);
@@ -323,6 +329,36 @@
         </div>
       </div>` : ''}
 
+      ${!isProject ? `<div class="settings-section">
+        <div class="settings-section-title">Diagnostics</div>
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">Debug Mode</span>
+            <div class="settings-description">Record an activity trace of the sidebar's activity indicators — both processes into one ordered JSONL file, next to the database. Takes effect immediately, without a restart, and is remembered across launches. Turn it on only while investigating.</div>
+          </div>
+          <div class="settings-field-control">
+            <label class="settings-toggle"><input type="checkbox" id="sv-activity-trace" ${traceState.enabled ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
+          </div>
+        </div>
+        <div class="settings-field settings-field-wide">
+          <div class="settings-field-info">
+            <span class="settings-label">What it records</span>
+            <div class="settings-description">
+              For every chunk sent to a terminal it records the chunk's length, and code points <strong>only from the chunk's first control character</strong> (C0 or DEL) onwards. A chunk of printable text has no control character, so it contributes a length and nothing else — no code points at all. That rule is what stops the probe from being a keylogger.<br>
+              The bound of that guarantee: ten code points are kept from the control character, so a chunk whose sequence is followed by text — a bracketed paste, <code>ESC [ 200 ~</code> then the pasted content — can still carry a few characters of it. No chunk of plain text is ever rendered, and no rendering ever starts before a control character.<br>
+              Disk use is bounded: at most 4 rotating segments of 16 MB each, a 64 MB ceiling by default. When the cap is reached the oldest segment is deleted.
+            </div>
+          </div>
+        </div>
+        <div class="settings-field settings-field-wide">
+          <div class="settings-field-info">
+            <span class="settings-label">Trace files</span>
+            <div class="settings-description">${escapeHtml(traceState.dir || '')}</div>
+            <div class="activity-trace-list" id="sv-activity-trace-list"></div>
+          </div>
+        </div>
+      </div>` : ''}
+
       <div class="settings-btn-row">
         <button class="settings-cancel-btn" id="sv-cancel-btn">Cancel</button>
         <button class="settings-save-btn" id="sv-save-btn">Save Settings</button>
@@ -330,6 +366,13 @@
       </div>
     </div>
   `;
+
+    // Debug mode is a live switch: it does not go through Save.
+    if (!isProject && typeof wireActivityTraceToggle === 'function') {
+      const traceList = settingsViewerBody.querySelector('#sv-activity-trace-list');
+      wireActivityTraceToggle(settingsViewerBody.querySelector('#sv-activity-trace'), traceList);
+      renderActivityTraceFiles(traceList);
+    }
 
     // Use-global checkboxes toggle field disabled state
     settingsViewerBody.querySelectorAll('.use-global-cb').forEach(cb => {

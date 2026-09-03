@@ -19,14 +19,74 @@ investigating.
 
 ## Turning it on
 
+Settings → **Diagnostics** → **Debug Mode**. The switch takes effect the moment
+it is flipped: no restart, no relaunch, no session lost. That is the point of
+it — the symptoms this trace exists to catch correlate with session activity,
+and restarting the app to arm a diagnostic destroys the state you wanted to
+observe. The panel also lists the trace files, with their size and date, and
+can open or delete one.
+
+The choice is remembered across launches: it is stored as `activityTrace` in
+the `global` settings row, the same object every other app-wide preference
+lives in.
+
+At startup, from a shell:
+
 ```bash
 SWITCHBOARD_ACTIVITY_TRACE=1 task dev
 ```
 
-Accepted values: `1`, `true`, `yes`, `on` (case-insensitive). Anything else —
-including unset — leaves the trace off. The variable is read **once**, by the
-main process (`activity-trace.js`); the renderer never parses it, it is told
-the answer through a launch argument, so the two halves cannot disagree.
+Accepted values: `1`, `true`, `yes`, `on` (case-insensitive); `0`, `no`, `off`
+and anything else unrecognised mean off. The variable remains the **startup**
+path, for scripts and CI: when it is set at all it decides the state the app
+boots with, in either direction, and the stored preference is ignored for that
+launch. When it is unset or blank, the stored preference decides. Neither locks
+the switch — the panel can toggle the trace either way once the app is running.
+
+The variable is read **once**, by the main process (`activity-trace.js`); the
+renderer never parses it, it is told the startup answer through a launch
+argument and every later change over the `activity-trace-state` event, so the
+two halves cannot disagree.
+
+### Turning it off, and on again
+
+Turning the trace off closes the file properly: the write stream is `end()`ed,
+which flushes everything already handed to it before the descriptor closes, so
+the last lines written are not lost. Probes stop at the same instant — the
+state is read before any payload is built, so nothing is constructed for a
+line that will not be written.
+
+Turning it back on **opens a new segment** rather than appending to the closed
+one. Two reasons: the file name is stamped with the moment the observation
+window opened, and appending would put two disjoint windows with an unexplained
+gap between them into one file whose name describes only the first; and the
+rotation bookkeeping is per-file. `seq` does not restart — it is process-wide,
+and it is what orders the two halves of a session.
+
+The stamp has one-second resolution, so an off/on inside the same second
+resolves to the same name and **resumes that window** instead of creating a
+second one indistinguishable from it: it reopens the segment the window was
+last writing to, not its first. That is the correct reading of the name — the
+window is the second it is stamped with.
+
+The byte counter is re-read from the file on open, so the rotation threshold
+measures the file rather than the last window. That detail is load-bearing, not
+housekeeping: starting the counter at zero on each activation lets one segment
+grow past the cap once per toggle, and once past it the threshold is met on
+every write, so rotation never fires again and the 64 MB ceiling stops
+applying. A segment that is already at the cap when it is reopened rotates
+immediately rather than taking one more line first.
+
+That case is not hypothetical — it is a double-click on the switch, and it used
+to be destructive: the same path went into the retained-segment list twice, the
+ceiling counted one file as two, and the queue eventually unlinked the segment
+the trace was still writing to. The queue now re-queues a returning path
+instead of duplicating it.
+
+The disk ceiling is not per-window: the retained-segment list spans the whole
+process, so four short observation windows leave the same four segments a
+single long one would. Rotation works identically whether the trace was armed
+at launch or an hour later.
 
 The file lands in the app's data directory, next to `switchboard.db`:
 
@@ -212,14 +272,22 @@ jq -c 'select(.cat=="busy.emit" or .cat=="recv.cli-busy-state")' $TRACE
 
 Nothing is built, sent, or written.
 
-- **Main process** — `SWITCHBOARD_ACTIVITY_TRACE` is read once at require time
-  into a `const TRACE`. Every probe is `if (TRACE) trace(...)`, so with the
-  trace off the payload literal is never evaluated. The `activity-trace` IPC
-  handler is not even registered.
-- **Renderer** — `preload.js` resolves the same flag and exposes it as
+- **Main process** — `TRACE` is the trace module's state object, `{ on }`.
+  Every probe is `if (TRACE.on) trace(...)`: one property load on a plain
+  object, no allocation, and the payload literal is never evaluated with the
+  trace off. The object rather than a boolean is what makes the switch work at
+  all — a `const TRACE = activityTrace.enabled` would freeze the value at
+  require time, and every probe would be pinned to whatever the environment
+  said at launch. The `activity-trace` IPC handler *is* registered
+  unconditionally, so that arming the trace needs no new listener; the renderer
+  does not send to it while off, and `trace()` drops the line if anything does.
+- **Renderer** — `preload.js` resolves the startup flag and exposes it as
   `window.api.activityTraceEnabled`; `public/activity-trace.js` reduces it to
-  `window.ATRACE`. Probes are `if (window.ATRACE) window.atrace(...)`: one
-  property load, no allocation, no IPC.
+  `window.ATRACE` and keeps that flag following main's state pushes. Probes are
+  `if (window.ATRACE) window.atrace(...)`: one property load, no allocation, no
+  IPC. `window.atrace` is the real forwarder whenever the preload bridge exists
+  — gating the function itself on the startup flag would leave the renderer
+  permanently mute whatever main said later.
 - The trace function also short-circuits on its own first line, so a stray
   call from anywhere is inert.
 
@@ -227,6 +295,21 @@ Nothing is built, sent, or written.
 this: a disabled trace never advances its sequence counter, never opens a file,
 and never reads a payload property (the tests hand it an object with a
 throwing/counting getter).
+
+`test/activity-trace-probe-guards.test.js` pins it at the call sites, and does
+so by reading the source rather than by running it. Running a guarded statement
+in a sandbox of exploding stubs only demonstrates that `if (false) X` does not
+evaluate `X` — a property of the language. What actually goes wrong is a helper
+called on the line *above* the guard, which such a rig never loads. So the
+checks are scans: every call to `trace`, `codePoints`, `controlOffset`,
+`busyDecision` or `progressDecision` in `main.js` must sit under `if (TRACE.on)`,
+and the probe categories are named so a probe deleted in a refactor fails the
+suite instead of quietly reducing a count.
+
+One call is exempt and pinned by its exact text: the OSC 0 `log.debug` line
+renders a code point into a template literal on every title, whatever the trace
+is doing. It predates this feature (c07ab13, 2026-03) and is on `main`; the
+exemption exists so that it stays the only one.
 
 This matters because of
 [ADR 0002](decisions/0002-discrete-steps-sidebar-animations.md) — the
@@ -272,6 +355,13 @@ file stays queued and is retried at the next rotation, and a
 `trace.prune-failed` line records it. So the ceiling can be temporarily
 exceeded, but never silently: grep the trace for `prune-failed` if disk use
 surprises you.
+
+A segment that is simply **gone** is the one failure that is not retried: it is
+dropped from the queue and the ceiling moves on. Deleting an old segment from
+the Diagnostics panel, or by hand in the directory, would otherwise wedge the
+queue head on a file that can never be unlinked again, and the 64 MB ceiling
+would stop applying for the rest of the run. The panel refuses to delete the
+segment currently being written; every other one is fair game.
 
 ```bash
 # 256 MB ceiling instead of 64

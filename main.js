@@ -33,7 +33,7 @@ log.transports.console.level = app.isPackaged ? 'info' : 'debug';
 
 // Opt-in activity trace — see docs/activity-trace.md.
 const activityTrace = require('./activity-trace');
-const { enabled: TRACE, trace, codePoints, controlOffset, busyDecision, progressDecision } = activityTrace;
+const { state: TRACE, trace, codePoints, controlOffset, busyDecision, progressDecision } = activityTrace;
 
 const { classifyTitleActivity } = require('./classify-title-activity');
 
@@ -138,9 +138,13 @@ const {
 
 // The trace file sits next to switchboard.db — DB_PATH is the one resolution
 // of SWITCHBOARD_DATA_DIR, never re-derived here.
-if (TRACE) {
-  const traceFile = activityTrace.init(path.dirname(DB_PATH));
-  log.info(`[activity-trace] enabled → ${traceFile || '(failed to open)'}`);
+const TRACE_DIR = path.dirname(DB_PATH);
+activityTrace.init(TRACE_DIR);
+activityTrace.setEnabled(
+  activityTrace.initialEnabled(process.env, (getSetting('global') || {}).activityTrace)
+);
+if (TRACE.on) {
+  log.info(`[activity-trace] enabled → ${activityTrace.currentFile() || '(failed to open)'}`);
 }
 
 // One-shot cleanup: the Plans tab was removed, so nothing indexes or clears
@@ -256,7 +260,7 @@ function createWindow() {
       contextIsolation: true,
       // The sandboxed preload cannot require activity-trace.js, so main's
       // resolution of the flag is handed to it instead of parsed twice.
-      additionalArguments: TRACE ? ['--switchboard-activity-trace'] : [],
+      additionalArguments: TRACE.on ? ['--switchboard-activity-trace'] : [],
     },
   });
 
@@ -1423,7 +1427,7 @@ ipcMain.handle('get-active-sessions', () => {
   for (const [sessionId, session] of activeSessions) {
     if (!session.exited) active.push({ sessionId, busy: !!session._cliBusy });
   }
-  if (TRACE) trace('poll.snapshot', null, { count: active.length, entries: active });
+  if (TRACE.on) trace('poll.snapshot', null, { count: active.length, entries: active });
   return active;
 });
 
@@ -2038,12 +2042,12 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         if (code === '0') {
           const { busy: isBusy, idle: isIdle, via } = classifyTitleActivity(payload, { allowFallback: !session.isPlainTerminal });
           log.debug(`[OSC 0] session=${currentId} cp=${codePoints(payload, 1)} rule=${via} busy=${isBusy} idle=${isIdle} wasBusy=${!!session._cliBusy}`);
-          if (TRACE) trace('osc.title', currentId, { cp: codePoints(payload, 3), title: payload.slice(0, 60), busy: isBusy, idle: isIdle, rule: via, was: !!session._cliBusy, decision: busyDecision(isBusy, isIdle, !!session._cliBusy) });
+          if (TRACE.on) trace('osc.title', currentId, { cp: codePoints(payload, 3), title: payload.slice(0, 60), busy: isBusy, idle: isIdle, rule: via, was: !!session._cliBusy, decision: busyDecision(isBusy, isIdle, !!session._cliBusy) });
           if (isBusy && !session._cliBusy) {
             session._cliBusy = true;
             session._oscIdle = false;
             log.debug(`[OSC 0] session=${currentId} → BUSY`);
-            if (TRACE) trace('busy.emit', currentId, { busy: true, via: 'osc0', sent: !!(mainWindow && !mainWindow.isDestroyed()) });
+            if (TRACE.on) trace('busy.emit', currentId, { busy: true, via: 'osc0', sent: !!(mainWindow && !mainWindow.isDestroyed()) });
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('cli-busy-state', currentId, true);
             }
@@ -2051,7 +2055,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
             session._cliBusy = false;
             session._oscIdle = true;
             log.debug(`[OSC 0] session=${currentId} → IDLE`);
-            if (TRACE) trace('busy.emit', currentId, { busy: false, via: 'osc0', sent: !!(mainWindow && !mainWindow.isDestroyed()) });
+            if (TRACE.on) trace('busy.emit', currentId, { busy: false, via: 'osc0', sent: !!(mainWindow && !mainWindow.isDestroyed()) });
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('cli-busy-state', currentId, false);
             }
@@ -2067,12 +2071,12 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
           const level = payload.split(';')[1];
           if (level === '0') continue; // 4;0 is also used for clearing, making it unreliable as an idle signal
           log.debug(`[OSC 9;4] session=${currentId} level=${level} payload="${payload}" wasBusy=${!!session._cliBusy}`);
-          if (TRACE) trace('osc.progress', currentId, { level, payload: payload.slice(0, 60), was: !!session._cliBusy, decision: progressDecision(level, !!session._cliBusy) });
+          if (TRACE.on) trace('osc.progress', currentId, { level, payload: payload.slice(0, 60), was: !!session._cliBusy, decision: progressDecision(level, !!session._cliBusy) });
           if ((level === '1' || level === '2' || level === '3') && !session._cliBusy) {
             session._cliBusy = true;
             session._oscIdle = false;
             log.debug(`[OSC 9;4] session=${currentId} → BUSY`);
-            if (TRACE) trace('busy.emit', currentId, { busy: true, via: 'osc9.4', sent: !!(mainWindow && !mainWindow.isDestroyed()) });
+            if (TRACE.on) trace('busy.emit', currentId, { busy: true, via: 'osc9.4', sent: !!(mainWindow && !mainWindow.isDestroyed()) });
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('cli-busy-state', currentId, true);
             }
@@ -2080,7 +2084,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         } else {
           // Regular notification (attention, permission, etc.)
           log.info(`[OSC 9] session=${currentId} message="${payload}"`);
-          if (TRACE) trace('osc.notify', currentId, { message: payload.slice(0, 120), sent: !!(mainWindow && !mainWindow.isDestroyed()) });
+          if (TRACE.on) trace('osc.notify', currentId, { message: payload.slice(0, 120), sent: !!(mainWindow && !mainWindow.isDestroyed()) });
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('terminal-notification', currentId, payload);
           }
@@ -2123,7 +2127,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     session.mcpServer = null;
 
     const realId = session.realSessionId || sessionId;
-    if (TRACE) trace('pty.exit', realId, { exitCode, alsoUnder: realId !== sessionId ? sessionId : null, wasBusy: !!session._cliBusy, sent: !!(mainWindow && !mainWindow.isDestroyed()) });
+    if (TRACE.on) trace('pty.exit', realId, { exitCode, alsoUnder: realId !== sessionId ? sessionId : null, wasBusy: !!session._cliBusy, sent: !!(mainWindow && !mainWindow.isDestroyed()) });
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('process-exited', realId, exitCode);
       // If a fork transition re-keyed this session under realId but the PTY
@@ -2146,15 +2150,87 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
 });
 
 // --- IPC: activity-trace (fire-and-forget, opt-in) ---
-if (TRACE) {
-  ipcMain.on('activity-trace', (_event, cat, sid, fields) => {
-    trace(typeof cat === 'string' ? cat : 'renderer', sid, fields, 'renderer');
-  });
+// Registered unconditionally — see .ai/contexts/ipc-bridge.md "Activity trace".
+ipcMain.on('activity-trace', (_event, cat, sid, fields) => {
+  trace(typeof cat === 'string' ? cat : 'renderer', sid, fields, 'renderer');
+});
+
+// --- IPC: activity-trace control (the Diagnostics panel) ---
+// see docs/activity-trace.md "Toggling it at runtime"
+const TRACE_FILE_RE = activityTrace.TRACE_FILE_RE;
+const TRACE_READ_CAP = 4 * 1024 * 1024;
+
+function listActivityTraceFiles() {
+  let names;
+  try { names = fs.readdirSync(TRACE_DIR); } catch { return []; }
+  const current = activityTrace.currentFile();
+  const files = [];
+  for (const name of names) {
+    if (!TRACE_FILE_RE.test(name)) continue;
+    const filePath = path.join(TRACE_DIR, name);
+    try {
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile()) continue;
+      files.push({ name, filePath, size: stat.size, modified: stat.mtime.toISOString(), current: filePath === current });
+    } catch {}
+  }
+  files.sort((a, b) => (a.modified < b.modified ? 1 : a.modified > b.modified ? -1 : 0));
+  return files;
 }
+
+function resolveTraceFile(filePath) {
+  return activityTrace.resolveTraceFilePath(TRACE_DIR, filePath);
+}
+
+function activityTraceState() {
+  return {
+    enabled: TRACE.on,
+    dir: TRACE_DIR,
+    currentFile: activityTrace.currentFile(),
+    fromEnv: activityTrace.envState(process.env) !== null,
+  };
+}
+
+ipcMain.handle('get-activity-trace-state', () => activityTraceState());
+
+ipcMain.handle('set-activity-trace-enabled', async (_event, enabled) => {
+  const on = !!enabled;
+  await new Promise((resolve) => activityTrace.setEnabled(on, resolve));
+  const global = getSetting('global') || {};
+  global.activityTrace = on;
+  setSetting('global', global);
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('activity-trace-state', on);
+  log.info(`[activity-trace] ${on ? 'enabled' : 'disabled'} from the UI → ${activityTrace.currentFile() || '(closed)'}`);
+  return activityTraceState();
+});
+
+ipcMain.handle('list-activity-trace-files', () => listActivityTraceFiles());
+
+ipcMain.handle('read-activity-trace-file', (_event, filePath) => {
+  const resolved = resolveTraceFile(filePath);
+  if (!resolved) return { ok: false, error: 'not an activity-trace file' };
+  try {
+    return { ok: true, ...activityTrace.readTraceTail(resolved, TRACE_READ_CAP) };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('delete-activity-trace-file', (_event, filePath) => {
+  const resolved = resolveTraceFile(filePath);
+  if (!resolved) return { ok: false, error: 'not an activity-trace file' };
+  if (resolved === activityTrace.currentFile()) return { ok: false, error: 'the trace is writing to this file — turn debug mode off first' };
+  try {
+    fs.unlinkSync(resolved);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
 
 // --- IPC: terminal-input (fire-and-forget) ---
 ipcMain.on('terminal-input', (_event, sessionId, data) => {
-  if (TRACE) {
+  if (TRACE.on) {
     const chunk = typeof data === 'string' ? data : String(data ?? '');
     const at = controlOffset(chunk);
     trace('pty.input', sessionId, at === -1
@@ -2493,7 +2569,8 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
-  if (TRACE) { trace('app.quit', null, {}); activityTrace.close(); }
+  if (TRACE.on) trace('app.quit', null, {});
+  activityTrace.close();
 
   // Shut down all MCP servers
   shutdownAllMcp();

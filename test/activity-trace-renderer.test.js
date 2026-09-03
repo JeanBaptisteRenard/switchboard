@@ -26,10 +26,12 @@ function setup({ traceEnabled }) {
   const { window } = dom;
 
   const sent = [];
+  let pushState = null;
   Object.defineProperty(window, 'api', {
     value: {
       activityTraceEnabled: traceEnabled,
       traceActivity: (cat, sid, fields) => sent.push({ cat, sid, fields }),
+      onActivityTraceState: (cb) => { pushState = cb; },
     },
     writable: true, configurable: true,
   });
@@ -40,7 +42,14 @@ function setup({ traceEnabled }) {
     const full = path.join(PUBLIC_DIR, file);
     vm.runInContext(fs.readFileSync(full, 'utf8'), ctx, { filename: full });
   }
-  return { window, sent, run: (expr) => vm.runInContext(expr, ctx) };
+  return {
+    window, sent,
+    run: (expr) => vm.runInContext(expr, ctx),
+    pushTraceState: (on) => {
+      assert.ok(pushState, 'the renderer subscribed to state pushes');
+      pushState(on);
+    },
+  };
 }
 
 test('the renderer trace is off unless the preload says otherwise', () => {
@@ -182,4 +191,43 @@ test('a bootstrap spawn is distinguishable from a real one in the trace', () => 
     assert.equal(probe.fields.bootstrap, true);
     assert.equal(probe.fields.applied, true);
   } finally { ctx.destroy(); }
+});
+
+// --- runtime toggling, renderer side -----------------------------------------
+
+test('a state push from main arms the renderer without a reload', () => {
+  const { window, sent, run, pushTraceState } = setup({ traceEnabled: false });
+  assert.equal(window.ATRACE, false);
+
+  run('setActivity("s1", true, "before")');
+  assert.deepEqual(sent, [], 'silent while off');
+
+  pushTraceState(true);
+  assert.equal(window.ATRACE, true);
+
+  run('setActivity("s1", false, "after")');
+  const mutation = sent.find(e => e.cat === 'store.mutate' && e.fields.map === 'sessionBusyState');
+  assert.ok(mutation, 'the same probe now forwards');
+  assert.equal(mutation.fields.via, 'after');
+});
+
+test('a state push from main disarms the renderer again', () => {
+  const { window, sent, run, pushTraceState } = setup({ traceEnabled: true });
+  run('setActivity("s1", true, "on")');
+  const before = sent.length;
+  assert.ok(before > 0);
+
+  pushTraceState(false);
+  assert.equal(window.ATRACE, false);
+
+  run('setActivity("s1", false, "off")');
+  assert.equal(sent.length, before, 'not one probe fired after the push');
+});
+
+test('the forwarder survives a startup-off launch, so a later enable can use it', () => {
+  // Gating window.atrace itself on the startup flag would leave the renderer
+  // permanently mute whatever main later says.
+  const { window } = setup({ traceEnabled: false });
+  assert.equal(typeof window.atrace, 'function');
+  assert.equal(window.atrace.name, 'atrace', 'the real forwarder, not the disabled stub');
 });

@@ -14,7 +14,7 @@ const { spawnSync } = require('node:child_process');
 
 const {
   createActivityTrace, formatEntry, codePoints, controlOffset, busyDecision, progressDecision,
-  envEnabled,
+  envEnabled, envState, initialEnabled, resolveTraceFilePath, readTraceTail,
 } = require('../activity-trace');
 
 function capture(options = {}) {
@@ -351,12 +351,446 @@ test('the trace file is timestamped so a new run never overwrites the last', asy
   const t = createActivityTrace({ enabled: true, nowMs: () => Date.parse('2026-08-22T09:15:00') });
   const file = t.init(dir);
   t.trace('osc.title', 's1', { cp: codePoints('◐', 1) });
-  t.close();
 
   assert.match(path.basename(file), /^activity-trace-\d{8}-\d{6}\.jsonl$/);
-  await new Promise(r => setTimeout(r, 30));
+  // Wait on the flush, not on a duration — see docs/activity-trace.md
+  // "Testing the async prune path"; a fixed 30 ms loses that race under the
+  // full suite's parallel load.
+  await new Promise(r => t.close(r));
+  await waitUntil(() => readEntries([file]).length === 1);
   const written = fs.readFileSync(file, 'utf8').trim().split('\n');
   assert.equal(written.length, 1);
   assert.equal(JSON.parse(written[0]).cp, 'U+25D0');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// --- runtime toggling: arming the trace without losing the state under study --
+
+function tmpTraceDir(tag) {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'sb-trace-' + tag + '-'));
+}
+
+function jsonlIn(dir) {
+  return fs.readdirSync(dir).filter(f => f.endsWith('.jsonl')).sort();
+}
+
+test('envState separates an unset variable from an explicit off', () => {
+  assert.equal(envState({}), null);
+  assert.equal(envState({ SWITCHBOARD_ACTIVITY_TRACE: '' }), null);
+  assert.equal(envState({ SWITCHBOARD_ACTIVITY_TRACE: '   ' }), null);
+  assert.equal(envState({ SWITCHBOARD_ACTIVITY_TRACE: '0' }), false);
+  assert.equal(envState({ SWITCHBOARD_ACTIVITY_TRACE: 'no' }), false);
+  assert.equal(envState({ SWITCHBOARD_ACTIVITY_TRACE: '1' }), true);
+  assert.equal(envState({ SWITCHBOARD_ACTIVITY_TRACE: ' ON ' }), true);
+});
+
+test('the environment decides the startup state, the preference decides when it is unset', () => {
+  // Unset: the stored preference is the whole answer.
+  assert.equal(initialEnabled({}, true), true);
+  assert.equal(initialEnabled({}, false), false);
+  assert.equal(initialEnabled({}, undefined), false);
+  // Set: it wins over the preference, in both directions.
+  assert.equal(initialEnabled({ SWITCHBOARD_ACTIVITY_TRACE: '1' }, false), true);
+  assert.equal(initialEnabled({ SWITCHBOARD_ACTIVITY_TRACE: '0' }, true), false);
+});
+
+test('a trace armed at runtime starts writing where it wrote nothing before', async () => {
+  const dir = tmpTraceDir('arm');
+  const t = createActivityTrace({ enabled: false });
+
+  assert.equal(t.init(dir), null, 'init on a disabled trace opens no file');
+  t.trace('osc.title', 's1', { busy: true });
+  assert.equal(t.sequence, 0, 'nothing was written while off');
+  assert.deepEqual(jsonlIn(dir), [], 'no segment on disk while off');
+
+  const file = t.setEnabled(true);
+  assert.ok(file, 'enabling opened a segment');
+  t.trace('osc.title', 's1', { busy: true });
+  assert.equal(t.sequence, 1);
+
+  await new Promise(r => t.close(r));
+  assert.deepEqual(readEntries([file]).map(e => e.cat), ['osc.title']);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('disabling flushes what was already written and then stops writing', async () => {
+  const dir = tmpTraceDir('flush');
+  const t = createActivityTrace({ enabled: true });
+  const file = t.init(dir);
+
+  // Well past the stream's 16 KB high-water mark, so a plain `stream = null`
+  // without an end() would strand the tail in the buffer.
+  for (let i = 0; i < 4000; i++) t.trace('fill', 's1', { i, pad: 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy' });
+  const written = t.sequence;
+  assert.equal(written, 4000);
+
+  await new Promise(r => t.setEnabled(false, r));
+  assert.equal(readEntries([file]).length, written, 'every line written before the toggle reached disk');
+
+  t.trace('osc.title', 's1', { busy: true });
+  assert.equal(t.sequence, written, 'the sequence did not advance after disabling');
+  assert.equal(readEntries([file]).length, written, 'nothing was appended after disabling');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('disabling never touches the payload of a later probe', () => {
+  const lines = [];
+  const t = createActivityTrace({ enabled: true, write: (l) => lines.push(l) });
+  t.setEnabled(false);
+  let touched = false;
+  t.trace('osc.title', 's1', { get busy() { touched = true; return true; } });
+  assert.equal(touched, false);
+  assert.equal(lines.length, 0);
+});
+
+test('re-enabling opens a fresh segment instead of appending to the closed one', async () => {
+  const dir = tmpTraceDir('resume');
+  let now = Date.parse('2026-08-22T09:15:00.000Z');
+  const t = createActivityTrace({ enabled: true, nowMs: () => now });
+
+  const first = t.init(dir);
+  t.trace('first.window', null, {});
+  await new Promise(r => t.setEnabled(false, r));
+
+  now += 65_000;
+  const second = t.setEnabled(true);
+  assert.notEqual(second, first, 'the second window has its own timestamped file');
+  t.trace('second.window', null, {});
+  await new Promise(r => t.setEnabled(false, r));
+
+  assert.deepEqual(readEntries([first]).map(e => e.cat), ['first.window']);
+  assert.deepEqual(readEntries([second]).map(e => e.cat), ['second.window']);
+  // The sequence is process-wide: it is what orders the two halves of a session.
+  assert.deepEqual(readEntries([first, second]).map(e => e.seq), [1, 2]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('rotation still bounds the disk when the trace was armed at runtime', async () => {
+  const dir = tmpTraceDir('armrot');
+  const t = createActivityTrace({ enabled: false, maxSegmentBytes: 200, maxSegments: 2 });
+  t.init(dir);
+  t.setEnabled(true);
+
+  for (let i = 0; i < 60; i++) t.trace('fill', 's1', { i, pad: 'xxxxxxxxxxxxxxxxxxxx' });
+  assert.ok(t.files.length > 2, 'the run produced more segments than it retains');
+  await new Promise(r => t.close(r));
+
+  let files = [];
+  await waitUntil(() => { files = jsonlIn(dir); return files.length <= 2; });
+  assert.equal(files.length, 2, 'older segments are unlinked, disk use stays bounded');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('the segment ceiling holds across repeated toggles, not just within one window', async () => {
+  const dir = tmpTraceDir('toggle-cap');
+  let now = Date.parse('2026-08-22T09:15:00.000Z');
+  const t = createActivityTrace({ enabled: false, maxSegments: 2, nowMs: () => now });
+  t.init(dir);
+
+  for (let i = 0; i < 4; i++) {
+    now += 60_000;
+    t.setEnabled(true);
+    t.trace('window', null, { i });
+    await new Promise(r => t.setEnabled(false, r));
+  }
+
+  let files = [];
+  await waitUntil(() => { files = jsonlIn(dir); return files.length <= 2; });
+  assert.equal(files.length, 2, 'four observation windows still leave only the retained segments');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// --- the queue and the live segment ----------------------------------------
+//
+// segments[] and pruneSegments() were written for a startSegment() called once
+// per process. Toggling calls it repeatedly, and the panel's Delete button
+// removes files behind their back; these pin both.
+
+test('two activations inside the same second never queue the same file twice', async () => {
+  const dir = tmpTraceDir('same-second');
+  const now = Date.parse('2026-09-03T09:15:00.000Z');
+  const t = createActivityTrace({ enabled: true, maxSegments: 4, nowMs: () => now });
+  t.init(dir);
+
+  for (let i = 0; i < 5; i++) {
+    await new Promise(r => t.setEnabled(false, r));
+    t.setEnabled(true);
+  }
+
+  assert.equal(t.files.length, new Set(t.files).size, 'no path is queued twice');
+  assert.equal(jsonlIn(dir).length, 1, 'one second, one file');
+  await new Promise(r => t.close(r));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('pruning never unlinks the segment the trace is writing to', async () => {
+  const dir = tmpTraceDir('live-segment');
+  const now = Date.parse('2026-09-03T09:15:00.000Z');
+  // A ceiling of one is the sharpest version: every prune has the live file
+  // within reach of the queue head.
+  const t = createActivityTrace({ enabled: true, maxSegments: 1, nowMs: () => now });
+  t.init(dir);
+  t.trace('first', null, {});
+
+  for (let i = 0; i < 5; i++) {
+    await new Promise(r => t.setEnabled(false, r));
+    t.setEnabled(true);
+  }
+
+  const live = t.currentFile;
+  assert.ok(live, 'the trace still has a segment');
+  assert.equal(fs.existsSync(live), true, 'the live segment was not deleted under it');
+
+  t.trace('after.cycles', null, {});
+  await new Promise(r => t.setEnabled(false, r));
+  const cats = readEntries([live]).map(e => e.cat);
+  assert.deepEqual(cats, ['first', 'after.cycles'], 'both lines survived the cycling');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a segment already gone drains the queue instead of jamming it', async () => {
+  // A file the panel's Delete button removed is not a retryable failure: the
+  // queue head can never succeed, so retrying it forever voids the ceiling.
+  const dir = tmpTraceDir('enoent');
+  const attempts = [];
+  const t = createActivityTrace({
+    enabled: true, maxSegmentBytes: 300, maxSegments: 2,
+    unlink: (file) => {
+      attempts.push(path.basename(file));
+      const err = new Error('no such file or directory');
+      err.code = 'ENOENT';
+      throw err;
+    },
+  });
+  t.init(dir);
+
+  for (let i = 0; i < 40; i++) t.trace('fill', 's1', { pad: 'x'.repeat(250) });
+  await new Promise(r => t.close(r));
+  await waitUntil(() => t.files.length <= 2);
+
+  assert.ok(t.files.length <= 2, `the queue drained past the missing files, holding ${t.files.length}`);
+  assert.ok(attempts.length >= 3, 'the retired segments were actually attempted');
+  assert.equal(new Set(attempts).size, attempts.length, 'no missing file was attempted twice');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('currentFile follows the stream, not the queue', async () => {
+  const dir = tmpTraceDir('current');
+  const t = createActivityTrace({ enabled: true });
+  const file = t.init(dir);
+  assert.equal(t.currentFile, file);
+
+  await new Promise(r => t.setEnabled(false, r));
+  assert.equal(t.currentFile, null, 'nothing is being written once the trace is off');
+  assert.ok(t.files.includes(file), 'the file is still tracked for the ceiling');
+
+  t.setEnabled(true);
+  assert.equal(t.currentFile, t.files[t.files.length - 1]);
+  await new Promise(r => t.close(r));
+  assert.equal(t.currentFile, null, 'close() clears it too');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('setEnabled calls back on every path, including the no-ops', { timeout: 10000 }, async () => {
+  // main.js awaits this callback before answering the IPC; a path that never
+  // calls it leaves the settings toggle disabled for the rest of the session.
+  const dir = tmpTraceDir('callback');
+  const t = createActivityTrace({ enabled: false });
+  t.init(dir);
+  const seen = [];
+
+  await new Promise(r => t.setEnabled(true, () => { seen.push('enable'); r(); }));
+  await new Promise(r => t.setEnabled(true, () => { seen.push('enable-noop'); r(); }));
+  await new Promise(r => t.setEnabled(false, () => { seen.push('disable'); r(); }));
+  await new Promise(r => t.setEnabled(false, () => { seen.push('disable-noop'); r(); }));
+  await new Promise(r => t.close(() => { seen.push('close-noop'); r(); }));
+
+  assert.deepEqual(seen, ['enable', 'enable-noop', 'disable', 'disable-noop', 'close-noop']);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('an enable whose open failed is retried instead of latching on', () => {
+  const base = tmpTraceDir('failed-open');
+  const blocked = path.join(base, 'not-a-directory');
+  fs.writeFileSync(blocked, 'x');
+
+  const t = createActivityTrace({ enabled: false });
+  t.init(blocked);
+  assert.equal(t.setEnabled(true), null, 'the open could not succeed');
+  assert.equal(t.enabled, true);
+  assert.equal(t.currentFile, null, 'the state says on but nothing is open');
+
+  fs.rmSync(blocked);
+  fs.mkdirSync(blocked);
+  const file = t.setEnabled(true);
+  assert.ok(file, 'a second enable retried rather than short-circuiting as a no-op');
+  t.trace('recovered', null, {});
+  assert.equal(t.sequence, 1);
+  t.close();
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test('an error on a rotated-out stream does not kill the live one', async () => {
+  const dir = tmpTraceDir('stale-error');
+  const realCreate = fs.createWriteStream;
+  const made = [];
+  fs.createWriteStream = (...args) => { const s = realCreate.apply(fs, args); made.push(s); return s; };
+  try {
+    const t = createActivityTrace({ enabled: true, maxSegmentBytes: 300, maxSegments: 4 });
+    t.init(dir);
+    t.trace('fill', 's1', { pad: 'x'.repeat(400) }); // forces a rotation
+    await waitUntil(() => made.length >= 2);
+    const live = t.currentFile;
+
+    made[0].emit('error', new Error('late error on the retired stream'));
+
+    assert.equal(t.currentFile, live, 'the live segment is untouched');
+    t.trace('after.stale.error', null, {});
+    await new Promise(r => t.close(r));
+    const cats = readEntries([live]).map(e => e.cat);
+    assert.ok(cats.includes('after.stale.error'), 'the trace kept writing after the stale error');
+  } finally {
+    fs.createWriteStream = realCreate;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- the panel's file handlers ---------------------------------------------
+
+test('resolveTraceFilePath accepts only trace segments in the trace directory', () => {
+  const dir = path.join(os.tmpdir(), 'sb-trace-allow');
+  const ok = path.join(dir, 'activity-trace-20260903-101500.jsonl');
+  const okRotated = path.join(dir, 'activity-trace-20260903-101500.002.jsonl');
+
+  assert.equal(resolveTraceFilePath(dir, ok), path.resolve(ok));
+  assert.equal(resolveTraceFilePath(dir, okRotated), path.resolve(okRotated));
+
+  // Wrong directory, including a sibling whose name merely starts the same.
+  assert.equal(resolveTraceFilePath(dir, path.join(dir, 'sub', 'activity-trace-20260903-101500.jsonl')), null);
+  assert.equal(resolveTraceFilePath(dir, path.join(dir + '-evil', 'activity-trace-20260903-101500.jsonl')), null);
+  // Traversal that lands back outside.
+  assert.equal(resolveTraceFilePath(dir, path.join(dir, '..', 'activity-trace-20260903-101500.jsonl')), null);
+  // Right directory, wrong name.
+  assert.equal(resolveTraceFilePath(dir, path.join(dir, 'switchboard.db')), null);
+  assert.equal(resolveTraceFilePath(dir, path.join(dir, 'activity-trace-nope.jsonl')), null);
+  // Nothing usable at all: these must answer null, not throw, or the IPC
+  // handler rejects instead of returning { ok: false } and the button dies.
+  for (const bad of [undefined, null, 0, {}, [], '', Buffer.from('x')]) {
+    assert.equal(resolveTraceFilePath(dir, bad), null, `rejected ${String(bad)}`);
+  }
+  assert.equal(resolveTraceFilePath(undefined, ok), null);
+});
+
+test('readTraceTail returns a whole small file and a line-aligned tail of a big one', () => {
+  const dir = tmpTraceDir('tail');
+  const file = path.join(dir, 'activity-trace-20260903-101500.jsonl');
+  const lines = [];
+  for (let i = 0; i < 400; i++) lines.push(JSON.stringify({ seq: i, pad: 'a'.repeat(100) }));
+  fs.writeFileSync(file, lines.join('\n') + '\n');
+  const size = fs.statSync(file).size;
+
+  const whole = readTraceTail(file, size + 10);
+  assert.equal(whole.truncated, false);
+  assert.equal(whole.content.split('\n').filter(Boolean).length, 400);
+
+  const tail = readTraceTail(file, 2000);
+  assert.equal(tail.truncated, true);
+  assert.equal(tail.size, size);
+  assert.ok(tail.shown <= 2000);
+  // Every line must still parse: a raw byte cut would leave a broken first one.
+  for (const line of tail.content.split('\n').filter(Boolean)) JSON.parse(line);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('readTraceTail never pads with NULs when the file shrinks under it', () => {
+  // A rotation, or a delete-and-recreate, between the stat and the read. The
+  // buffer is cap-sized; returning all of it would hand the viewer megabytes
+  // of NUL and call it trace content.
+  const dir = tmpTraceDir('shrink');
+  const file = path.join(dir, 'activity-trace-20260903-101500.jsonl');
+  const line = JSON.stringify({ seq: 1, pad: 'a'.repeat(200) }) + '\n';
+  fs.writeFileSync(file, line.repeat(3000));
+  const cap = 4096;
+
+  const realStat = fs.statSync;
+  let result;
+  try {
+    fs.statSync = (p, ...rest) => {
+      const stat = realStat.call(fs, p, ...rest);
+      if (p === file) fs.truncateSync(file, 512);
+      return stat;
+    };
+    result = readTraceTail(file, cap);
+  } finally {
+    fs.statSync = realStat;
+  }
+
+  assert.equal(result.content.indexOf('\u0000'), -1, 'not one NUL reached the caller');
+  assert.ok(result.shown <= 512, `shown must report what was read, got ${result.shown}`);
+  assert.ok(result.content.length <= 512);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('rotation still fires at the cap after repeated toggles inside one second', async () => {
+  // The byte counter measures the file, not the window. Restarting it at zero
+  // on every activation lets one segment grow past the cap once per toggle,
+  // and past the cap it never rotates again — the ceiling stops existing.
+  const dir = tmpTraceDir('cap-across-toggles');
+  const now = Date.parse('2026-09-04T09:15:00.000Z');
+  const cap = 4000;
+  const t = createActivityTrace({ enabled: true, maxSegmentBytes: cap, maxSegments: 4, nowMs: () => now });
+  t.init(dir);
+
+  const pad = 'x'.repeat(120);
+  for (let cycle = 0; cycle < 10; cycle++) {
+    for (let i = 0; i < 10; i++) t.trace('fill', 's1', { cycle, i, pad });
+    await new Promise(r => t.setEnabled(false, r));
+    t.setEnabled(true);
+  }
+  await new Promise(r => t.close(r));
+
+  const files = jsonlIn(dir);
+  assert.ok(files.length > 1, `the run must have rotated at all, produced ${files.length} file(s)`);
+
+  // No retained segment may sit meaningfully past the cap. One line of
+  // overshoot is inherent: the threshold is checked after the write.
+  const longest = Math.max(...files.map(f => fs.statSync(path.join(dir, f)).size));
+  assert.ok(longest < cap * 1.25, `a segment grew to ${longest} bytes against a ${cap} cap`);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('re-enabling in the same second resumes the window instead of reopening its first segment', async () => {
+  const dir = tmpTraceDir('resume-segment');
+  const now = Date.parse('2026-09-04T09:15:00.000Z');
+  const cap = 900;
+  const t = createActivityTrace({ enabled: true, maxSegmentBytes: cap, maxSegments: 4, nowMs: () => now });
+  const first = t.init(dir);
+
+  const pad = 'y'.repeat(200);
+  for (let i = 0; i < 8; i++) t.trace('fill', 's1', { i, pad });
+  const rotatedAway = t.currentFile;
+  assert.notEqual(rotatedAway, first, 'the window rotated past its first segment');
+
+  await new Promise(r => t.setEnabled(false, r));
+  const resumed = t.setEnabled(true);
+  assert.notEqual(resumed, first, 'a re-enable must not reopen the already-rotated segment 0');
+  await new Promise(r => t.close(r));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('the file being flushed cannot be deleted out from under the flush', async () => {
+  const dir = tmpTraceDir('flush-window');
+  const t = createActivityTrace({ enabled: true });
+  const file = t.init(dir);
+  for (let i = 0; i < 3000; i++) t.trace('fill', 's1', { i, pad: 'z'.repeat(60) });
+
+  // Synchronously after asking to disable, the flush is still in flight; the
+  // panel's delete guard keys on currentFile, so it must still name the file.
+  const flushed = new Promise(r => t.setEnabled(false, r));
+  assert.equal(t.currentFile, file, 'still current while its buffer drains');
+
+  await flushed;
+  assert.equal(t.currentFile, null, 'released once the flush completed');
+  assert.equal(readEntries([file]).length, 3000, 'and every line reached disk');
   fs.rmSync(dir, { recursive: true, force: true });
 });
