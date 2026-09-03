@@ -2,6 +2,7 @@
 'use strict';
 
 const { noteUserInput } = require('./composer-state');
+const { writePty } = require('./pty-ops');
 
 /**
  * Handle one chunk of renderer keystrokes for `sessionId`.
@@ -15,7 +16,7 @@ function handleTerminalInput(activeSessions, sessionId, data, now) {
   const session = activeSessions.get(sessionId);
   if (session && !session.exited) {
     if (session.composerState) noteUserInput(session.composerState, data, now);
-    session.pty.write(data);
+    writePty(session, data, sessionId);
   }
 }
 

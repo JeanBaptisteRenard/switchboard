@@ -110,6 +110,7 @@ This file is the **canonical inventory** of the IPC surface. When you add a new 
 - **Path-touching IPCs (`read-work-file`, `delete-work-file`, `read-memory`, etc.) MUST guard their paths**. Pattern: `path.resolve(input).includes('/.work-files/')` for the work-files IPC. Audit every new path IPC.
 - **Trust boundary is the contextBridge call**. Anything passed across must survive structured-clone serialization. No functions, no DOM nodes, no class instances — only plain JSON.
 - **Async handlers return promises**. Renderer uses `await window.api.foo(...)`. Throws cross the boundary as rejected promises; return `{ok, error}` if you want graceful failure handling on the renderer side.
+- **Never call a method on `session.pty` directly.** Go through `pty-ops.js` (`resizePty` / `killPty` / `writePty`, or the generic `withPty`). See "PTY operations race the exit" below.
 
 ## Non-obvious behaviors
 
@@ -117,6 +118,38 @@ This file is the **canonical inventory** of the IPC surface. When you add a new 
 - **Webcontents `send` events vs `invoke`**: `invoke`/`handle` is request-response (returns a promise). `send`/`on` is fire-and-forget (no return). Pick based on whether the caller needs the result.
 - **`webUtils.getPathForFile(file)`** is the only way to get the absolute path of a drag-and-dropped file in Electron 28+. Exposed at `window.api.getPathForFile`.
 - **Updater events use a single `onUpdaterEvent(type, data)` callback** for all 5+ event types — different from the per-event onSubagentSpawned/Completed pattern. Inconsistency tax.
+
+### PTY operations race the exit
+
+`session.exited` is set from `ptyProcess.onExit`, which fires on a later tick
+than the child's actual death. So `if (!session.exited) session.pty.resize(...)`
+is a check-then-act: node-pty can still throw `Cannot resize a pty that has
+already exited` between the test and the call. In a `ipcMain.on` handler that
+throw is fire-and-forget — nothing awaits it, so it surfaces as an uncaught
+exception in the main process and Electron pops the "A JavaScript error occurred
+in the main process" dialog at the user.
+
+The path that produced it: the user closes a session → the PTY exits → the
+renderer re-lays out the remaining terminals and emits one `terminal-resize` per
+tile, including for the session that just went away.
+
+`pty-ops.js` is the single place a session PTY is touched. It keeps the liveness
+check as a cheap fast path but wraps the call, the way `trigger-watcher.js`
+already reasoned about its writes ("an exit between the liveness probe and the
+write is bounded by the try/catch on the write"). Callers get a boolean instead
+of an exception; the first-resize nudge uses it to skip its follow-up when the
+PTY is already gone.
+
+Swallowed errors are not silent: `setPtyOpLogger(log)` in `main.js` routes them
+to `log.debug` as `[pty] <op> skipped session=<id> reason=<message>`. Debug level
+is deliberate — the file transport is at `info` in packaged builds, so a resize
+storm against a dying PTY costs nothing in production, and the line is there in
+dev when someone next has to diagnose this.
+
+Not covered by `pty-ops.js`, on purpose: `trigger-watcher.js` writes (already
+bounded by their callers' try/catch, plus a `process.kill(pid, 0)` liveness
+probe) and the `clear` shim write in `open-terminal`, which happens before a
+session object exists.
 
 ### Busy-state reconciliation
 
