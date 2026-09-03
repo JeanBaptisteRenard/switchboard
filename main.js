@@ -2153,6 +2153,10 @@ if (TRACE) {
 
 // --- IPC: terminal-input (fire-and-forget) ---
 ipcMain.on('terminal-input', (_event, sessionId, data) => {
+  if (TRACE) {
+    const chunk = typeof data === 'string' ? data : String(data ?? '');
+    trace('pty.input', sessionId, { cp: codePoints(chunk, 10), len: chunk.length });
+  }
   handleTerminalInput(activeSessions, sessionId, data, Date.now());
 });
 
