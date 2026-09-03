@@ -442,16 +442,16 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     }
   }
 
+  try {
+
   // ── 1. lstat + size guard (C1 + C2) ──────────────────────────────────────
   let stat;
   try {
     stat = fs.lstatSync(triggerPath); // C2: lstat does NOT follow symlinks
   } catch (err) {
-    if (err.code !== 'ENOENT') {
-      ctx.log.error('[trigger-watcher] Trigger file could not be inspected, will not be run again:',
-        name, err.message);
-      if (onEntryRetained) onEntryRetained();
-    }
+    if (err.code === 'ENOENT') return; // gone before we could inspect it
+    ctx.log.error('[trigger-watcher] Trigger file could not be inspected:', name, err.message);
+    await writeResult({ ok: false, error: 'trigger could not be inspected: ' + err.message });
     return;
   }
 
@@ -926,6 +926,13 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     steps,
     total_waited_ms:  totalWaitedMs,
   });
+
+  } catch (err) {
+    // see .ai/contexts/trigger-watcher.md, "Removing the entry"
+    ctx.log.error('[trigger-watcher] Trigger processing threw, writing a generic failure result:',
+      name, err && err.message);
+    await writeResult({ ok: false, error: 'internal error: ' + (err && err.message) });
+  }
 }
 
 /**

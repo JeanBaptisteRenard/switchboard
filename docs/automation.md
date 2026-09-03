@@ -253,13 +253,23 @@ The two reserved values are easy to confuse and mean opposite things, so:
   stays the free-text `session exited during wait`, but `submitted` is `no`,
   `partial` is `false`, and `reason` says nothing was written.
 
+**An exception anywhere while deciding a trigger's fate** — not just the
+anticipated validation refusals above — still ends in a result file and a
+deletion. A trigger body that parses as valid JSON but isn't a usable shape
+(the bare value `null`, a `chain` step that isn't an object) is caught and
+reported as `{ "ok": false, "error": "internal error: <message>" }`, rather
+than left on disk with no result at all.
+
 **When the deletion itself fails** (permissions, a locked file, an entry that is
 not a regular file), the trigger stays on disk. The result file is still
 written, the failure is logged at error level, and that name is remembered for
 the lifetime of the process so a later filesystem event on it can never run the
 command a second time — the leftover file is inert, not pending. A trigger whose
 name sits in `processed/` has been processed, whatever the trigger directory
-still shows.
+still shows. This is the only case that leaves a name non-replayable; an
+internal exception on its own does not — once the result is written and the
+trigger deleted, a later trigger dropped under the same name is a fresh
+attempt.
 
 **`processed/` has no retention policy**: result files accumulate there for as
 long as the directory lives, and nothing in the app ever removes them. Callers

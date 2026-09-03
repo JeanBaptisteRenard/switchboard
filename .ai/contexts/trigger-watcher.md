@@ -264,28 +264,48 @@ Trigger file is **deleted** after processing (success or failure).
 
 `writeResult()` is the single place a trigger's fate is decided: it writes the
 result atomically (`.tmp` + rename) and then unlinks the trigger. Every `return`
-in `processTriggerFile()` that produces a result goes through it, so there is no
-"processed but left behind" path — the trigger directory lists exactly what is
-still pending. Two consequences worth knowing:
+in `processTriggerFile()` that produces a result goes through it. The body of
+`processTriggerFile()` (everything past the `*.json` filename check) also runs
+inside one `try`/`catch`: any exception raised anywhere in it — shape
+validation, session lookup, the PTY write, a step in a `chain` — is caught and
+turned into `writeResult({ ok: false, error: 'internal error: ' + err.message })`
+before the function returns. Between the two, there is no "processed but left
+behind" path — the trigger directory lists exactly what is still pending.
+Two review findings on the previous version of this file (a `null` trigger
+body, and a `chain` step that is not an object) both threw *before* any
+`writeResult()` call was reached; the wrapping `try`/`catch` is what closes
+that gap, rather than validating every field defensively before use.
+
+Two consequences worth knowing:
 
 - **`ENOENT` on the unlink is not a failure.** Two `rename` events for the same
   file can both reach processing; the loser finds the file already gone. That is
-  the intended end state, so it stays silent.
-- **Any other unlink error, and any non-`ENOENT` `lstat` error, marks the name
-  `retained`.** The entry could not be removed, so a later filesystem event on
-  that name would re-run a command that already ran. `retained` (a `Set` in
-  `start()`) makes the watcher ignore the name for the process's lifetime, and
-  the failure is logged at error level rather than swallowed. This trades
-  "processed at least once" for "never processed twice", which is the direction
-  the transport must fail in: the result file is already written, so nothing is
-  lost by refusing to look at the leftover again. The `Set` only ever holds
-  names whose removal failed, so it does not grow in normal operation.
+  the intended end state, so it stays silent. The same holds for the initial
+  `lstat`: `ENOENT` there means the file vanished before it could be inspected,
+  and returns without writing a result — there is nothing to report.
+- **Any other unlink error marks the name `retained`.** This is the only path
+  that still adds to `retained` in the running process. The entry could not be
+  removed, so a later filesystem event on that name would re-run a command that
+  already ran. `retained` (a `Set` in `start()`) makes the watcher ignore the
+  name for the process's lifetime, and the failure is logged at error level
+  rather than swallowed. This trades "processed at least once" for "never
+  processed twice", which is the direction the transport must fail in: the
+  result file is already written, so nothing is lost by refusing to look at the
+  leftover again. The `Set` only ever holds names whose removal failed, so it
+  does not grow in normal operation.
 
-A rejected `processTriggerFile()` promise is caught in `dispatch()` and marks the
-name `retained` too: a throw leaves the entry in an unknown state — the command
-may or may not have reached the PTY — and replaying it is the one outcome that
-cannot be undone. No result file is written in that case; the error log is the
-only trace.
+A non-`ENOENT` `lstat` error no longer returns silently either: it goes through
+`writeResult()` like everything else, with `error: 'trigger could not be
+inspected: ' + err.message`. It does not call into `retained` directly — if the
+unlink that follows inside `writeResult()` also fails, that is caught by the
+one `retained` path described above, same as for any other trigger.
+
+`dispatch()` still wraps the call to `processTriggerFile()` in a `.catch()`
+that logs and marks the name `retained`. With the internal `try`/`catch` now
+covering the whole function body, this outer `.catch()` should never fire in
+practice — but it stays as a last-resort backstop (a broken `ctx.log`, say)
+where genuinely nothing is known about whether a result was written, and
+`retained` is the only safe call left.
 
 **Known gap, deliberately not fixed**: if writing the result file fails, the
 trigger is deleted anyway. The two invariants ("always a result", "never twice")
@@ -296,9 +316,9 @@ and nothing prunes them.
 
 ## Invariants
 
-- **Never throws out of the watcher callback** — every anticipated error path lands in the result file, and an unanticipated rejection is caught in `dispatch()` (logged, name retained, no result file).
+- **Never throws out of the watcher callback** — `processTriggerFile()`'s body runs inside one `try`/`catch`; any exception, anticipated or not, lands in the result file via `writeResult()` before the function returns. `dispatch()`'s own `.catch()` is a backstop for the case that should no longer occur.
 - **Deduplication via `inFlight` Set** — noisy `rename` events for the same file (common on Linux inotify) are coalesced; a file is processed at most once per appearance.
-- **A processed trigger never runs twice** — normally because it was deleted; when the deletion fails, because its name is in `retained`.
+- **A processed trigger never runs twice** — normally because it was deleted; when the deletion fails, because its name is in `retained`. A trigger that threw internally is not exempt from this: it still gets a result and a deletion, so it is not "retained" on that account.
 - **`accessSync` guard** — the `rename` event fires both on file creation and deletion; the existence check prevents processing a deletion event.
 - **Directories ignored** — non-`*.json` filenames and any name containing `/` or `path.sep` are skipped.
 - **Invalid `timeout_ms` releases the semaphore** — validation happens before the session look-up and before acquiring an idle-wait slot; a bad value produces a result file and returns without counting against `MAX_INFLIGHT`.

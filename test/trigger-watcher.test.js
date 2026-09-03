@@ -2570,7 +2570,7 @@ test('unremovable entry: a later event on the same name is never processed again
   }
 });
 
-test('a throwing ctx does not leave an unhandled rejection, and the entry is not retried', async () => {
+test('a throwing ctx yields a definitive result (no unhandled rejection), and a later attempt is not blocked', async () => {
   const tmp = mkTmp();
   let watcher;
   const rejections = [];
@@ -2585,14 +2585,28 @@ test('a throwing ctx does not leave an unhandled rejection, and the entry is not
     const ctx        = makeCtx(SESSION_ID);
     ctx.log          = recordingLog();
     let calls = 0;
-    ctx.getComposerState = () => { calls++; throw new Error('composer state unavailable'); };
+    let shouldThrow = true;
+    ctx.getComposerState = (id) => {
+      calls++;
+      if (shouldThrow) throw new Error('composer state unavailable');
+      return { pending: 0, lastInputAt: 0 };
+    };
     watcher = start(ctx);
 
-    const uuid = 'throwing-' + Date.now();
-    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+    const uuid         = 'throwing-' + Date.now();
+    const triggerPath  = writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+    const processedDir = path.join(tmp, 'processed');
+    const resultPath   = path.join(processedDir, uuid + '.result.json');
 
-    await new Promise(r => setTimeout(r, 600));
+    await waitForFile(resultPath);
     assert.ok(calls > 0, 'precondition: the throwing hook was reached');
+
+    const firstResult = readResult(processedDir, uuid);
+    assert.equal(firstResult.ok, false);
+    assert.match(firstResult.error, /composer state unavailable/,
+      'the caught exception surfaces in the result, not just the log');
+    assert.equal(fs.existsSync(triggerPath), false,
+      'the trigger file must be deleted even though processing threw');
 
     assert.deepEqual(rejections, [], 'the watcher must not leave an unhandled rejection');
     assert.ok(
@@ -2600,13 +2614,141 @@ test('a throwing ctx does not leave an unhandled rejection, and the entry is not
       'the failure must be logged; got: ' + JSON.stringify(ctx.log._errors),
     );
 
-    // Same name reappearing must not be retried: it is in an unknown state.
+    // Nothing was left unresolved by the first attempt — a result was written
+    // and the trigger was deleted — so a fresh trigger dropped under the same
+    // name afterwards is a new attempt, not a replay, and must go through.
+    shouldThrow = false;
+    fs.rmSync(resultPath);
     writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
-    await new Promise(r => setTimeout(r, 400));
-    assert.deepEqual(ctx._written, [], 'an entry left in an unknown state is never replayed');
+    await waitForFile(resultPath, 2000);
+
+    const secondResult = readResult(processedDir, uuid);
+    assert.equal(secondResult.ok, true, 'a fresh trigger with the same name must not be blocked by retained');
+    assert.ok(ctx._written.includes('/compact'), 'the second, valid attempt reaches the PTY');
 
   } finally {
     process.removeListener('unhandledRejection', onRejection);
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// ── Defects found in adversarial review of PR #166 ────────────────────────────
+// Two paths could decide a trigger's fate without ever calling writeResult():
+// a throw before/during shape validation (destructuring `null`, or a chain
+// step that isn't an object), and a non-ENOENT lstat failure. Both used to
+// leave the trigger on disk forever with no result file. See
+// .ai/contexts/trigger-watcher.md, "Removing the entry".
+
+test('trigger body is JSON null: destructuring throws, but the entry is still resolved', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const ctx = makeCtx('any-session');
+    watcher = start(ctx);
+
+    const uuid         = 'null-body-' + Date.now();
+    const triggerPath  = path.join(tmp, uuid + '.json');
+    fs.writeFileSync(triggerPath, 'null', 'utf8'); // valid JSON; destructuring it throws
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /internal error/i);
+    assert.equal(fs.existsSync(triggerPath), false,
+      'trigger file must be deleted, not left behind forever');
+    assert.deepEqual(ctx._written, [], 'no PTY write for a null trigger body');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('chain step is not an object: property access throws, but the entry is still resolved', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const ctx = makeCtx('any-session');
+    watcher = start(ctx);
+
+    const uuid        = 'chain-null-step-' + Date.now();
+    const triggerPath = writeTrigger(tmp, uuid, { sessionId: 'any-session', chain: [null] });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /internal error/i);
+    assert.equal(fs.existsSync(triggerPath), false,
+      'trigger file must be deleted, not left behind forever');
+    assert.deepEqual(ctx._written, [], 'no PTY write for a chain with a non-object step');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('lstat fails with a non-ENOENT error: result written and trigger deleted, not silently returned', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  const realLstatSync = fs.lstatSync;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-lstat-eperm-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    watcher = start(ctx);
+
+    const uuid        = 'lstat-eperm-' + Date.now();
+    const triggerPath = path.join(tmp, uuid + '.json');
+
+    // Simulate a share-lock / permission error a real filesystem can raise —
+    // distinct from ENOENT, which is the one case this function must still
+    // treat as "nothing to report" (see the ENOENT branch just above).
+    fs.lstatSync = (p, ...rest) => {
+      if (p === triggerPath) {
+        const err = new Error('EPERM: operation not permitted, lstat ' + p);
+        err.code  = 'EPERM';
+        throw err;
+      }
+      return realLstatSync.call(fs, p, ...rest);
+    };
+
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /could not be inspected/i);
+    assert.equal(fs.existsSync(triggerPath), false,
+      'trigger file must be deleted even when lstat itself fails');
+    assert.deepEqual(ctx._written, [], 'no PTY write when lstat fails');
+
+  } finally {
+    fs.lstatSync = realLstatSync;
     if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
