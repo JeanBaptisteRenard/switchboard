@@ -13,7 +13,8 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const {
-  createActivityTrace, formatEntry, codePoints, busyDecision, progressDecision, envEnabled,
+  createActivityTrace, formatEntry, codePoints, controlOffset, busyDecision, progressDecision,
+  envEnabled,
 } = require('../activity-trace');
 
 function capture(options = {}) {
@@ -44,6 +45,30 @@ test('codePoints tolerates empty and non-string payloads', () => {
   assert.equal(codePoints(''), '');
   assert.equal(codePoints(undefined), '');
   assert.equal(codePoints(null), '');
+});
+
+// --- controlOffset: what keeps pty.input from transcribing keystrokes ------
+
+test('controlOffset returns -1 when the chunk is printable text', () => {
+  assert.equal(controlOffset('hello'), -1);
+  assert.equal(controlOffset('◐ claude'), -1);
+  assert.equal(controlOffset(''), -1);
+  assert.equal(controlOffset(undefined), -1);
+});
+
+test('controlOffset finds the first C0 control or DEL', () => {
+  assert.equal(controlOffset('\x1b[24;80R'), 0);
+  assert.equal(controlOffset('abc\r'), 3);
+  assert.equal(controlOffset('abc\x7f'), 3);
+  assert.equal(controlOffset('ab\x1bc\r'), 2);
+});
+
+test('controlOffset slices a typed chunk down to nothing renderable', () => {
+  const typed = 'the password is hunter2';
+  assert.equal(controlOffset(typed), -1);
+  // -1 is the signal to record no `cp` at all; the length still gets through.
+  const submitted = typed + '\r';
+  assert.equal(codePoints(submitted.slice(controlOffset(submitted)), 10), 'U+000D');
 });
 
 // --- decision helpers mirror the main.js branches --------------------------

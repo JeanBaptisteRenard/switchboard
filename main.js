@@ -33,7 +33,7 @@ log.transports.console.level = app.isPackaged ? 'info' : 'debug';
 
 // Opt-in activity trace — see docs/activity-trace.md.
 const activityTrace = require('./activity-trace');
-const { enabled: TRACE, trace, codePoints, busyDecision, progressDecision } = activityTrace;
+const { enabled: TRACE, trace, codePoints, controlOffset, busyDecision, progressDecision } = activityTrace;
 
 const { classifyTitleActivity } = require('./classify-title-activity');
 
@@ -2155,7 +2155,10 @@ if (TRACE) {
 ipcMain.on('terminal-input', (_event, sessionId, data) => {
   if (TRACE) {
     const chunk = typeof data === 'string' ? data : String(data ?? '');
-    trace('pty.input', sessionId, { cp: codePoints(chunk, 10), len: chunk.length });
+    const at = controlOffset(chunk);
+    trace('pty.input', sessionId, at === -1
+      ? { len: chunk.length }
+      : { at, cp: codePoints(chunk.slice(at), 10), len: chunk.length });
   }
   handleTerminalInput(activeSessions, sessionId, data, Date.now());
 });

@@ -153,17 +153,20 @@ a resting pointer emits nothing). What remains, unproven, is xterm.js *answering
 queries the CLI emits while redrawing — CPR, DA, DECRQM, OSC replies — or a
 sequence whose final byte `applyCsi` does not handle. The activity trace's
 `pty.input` probe (`main.js`, in `ipcMain.on('terminal-input')`) settles it by
-recording every chunk the renderer sends to the PTY:
+recording every chunk the renderer sends to the PTY — its length always, its
+code points only from the first control character onwards, so a typed chunk
+leaves a length and nothing readable:
 
 ```bash
 SWITCHBOARD_ACTIVITY_TRACE=1 task dev
 TRACE=~/.switchboard-dev/activity-trace-*.jsonl
 
-# What arrives, in order, with its leading code points
-jq -r 'select(.cat=="pty.input") | "\(.wall)\t\(.len)\t\(.cp)"' $TRACE
+# What arrives, in order. A line with no `cp` was a chunk of printable text —
+# the probe records its length only, never its content (docs/activity-trace.md).
+jq -r 'select(.cat=="pty.input") | "\(.wall)\t\(.len)\t\(.at // "-")\t\(.cp // "-")"' $TRACE
 
-# Which chunks dominate
-jq -r 'select(.cat=="pty.input") | .cp' $TRACE | sort | uniq -c | sort -rn
+# Which control sequences dominate — the suspects are all in here
+jq -r 'select(.cat=="pty.input" and .cp) | .cp' $TRACE | sort | uniq -c | sort -rn
 ```
 
 **Take four control shots, not two.** The two measurements taken so far were
