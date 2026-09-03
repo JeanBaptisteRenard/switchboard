@@ -1,21 +1,26 @@
 // The probe sites in main.js must cost nothing while the trace is off.
 //
-// The runtime tests below do not describe the guard, they run it: each probe
-// statement is lifted verbatim out of main.js and evaluated in a sandbox where
-// every helper it could call and every value it could read explodes on contact.
-// With the guard intact and the state off, nothing detonates. The control case
-// flips the same state on and requires every one of them to detonate, so a
-// green off-case cannot be an inert rig.
+// What protects that property is syntax, and this file says so plainly rather
+// than dressing it up. An earlier version of these tests lifted each guarded
+// statement into a sandbox of exploding stubs and asserted that nothing
+// detonated with the state off. That proved only that `if (false) X` does not
+// evaluate `X` — a guarantee of the language, not of this code: work done
+// *before* a guard sits on a different line, which such a rig never even
+// loads. A realistic faulty probe (`const cp = codePoints(payload, 3);` above
+// the guard at the osc.title site) passed it untouched.
+//
+// So the checks below are source scans, and they are the only thing standing
+// between the codebase and an unguarded probe. They are deliberately blunt:
+// every call to a trace helper in main.js must sit under `if (TRACE.on)`.
 
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const vm = require('node:vm');
 
-const mainSrc = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-const lines = mainSrc.split('\n');
+const MAIN_PATH = path.join(__dirname, '..', 'main.js');
+const mainSrc = fs.readFileSync(MAIN_PATH, 'utf8');
 
 // Naming the categories rather than counting them: a probe silently deleted in
 // a refactor is the failure this guards against, and a bare count would let one
@@ -25,90 +30,69 @@ const EXPECTED_PROBES = [
   'osc.progress', 'osc.title', 'poll.snapshot', 'pty.exit', 'pty.input',
 ];
 
+// Everything whose evaluation costs something: the writer and the four payload
+// helpers that render code points and mirror the OSC decisions.
+const TRACE_HELPERS = ['trace', 'codePoints', 'controlOffset', 'busyDecision', 'progressDecision'];
+const HELPER_CALL = new RegExp('(?<![.\\w])(' + TRACE_HELPERS.join('|') + ')\\s*\\(');
+
 // The forwarder behind the `activity-trace` IPC channel is deliberately
 // unguarded: it must stay registered so a runtime enable needs no new
 // listener, and trace() drops the line itself while the trace is off.
 const UNGUARDED_FORWARDER = /trace\(typeof cat === 'string'/;
 
-function probeStatements() {
-  const inline = [];
-  const blocks = [];
+// Split on either ending: with core.autocrlf=true and no .gitattributes, a
+// fresh clone on Windows hands these tests CRLF, and a strict `=== '}'` would
+// fail there while CI stays green.
+function sourceLines(src) {
+  return src.split(/\r?\n/);
+}
+
+function isCommentLine(line) {
+  return /^\s*(\/\/|\*|\/\*)/.test(line);
+}
+
+function collect(src) {
+  const lines = sourceLines(src);
+  const probes = [];
+  const looseTrace = [];
+  const looseHelpers = [];
+
+  const openGuardAbove = (i) => {
+    for (let j = i - 1; j >= 0 && j > i - 12; j--) {
+      if (/^\s*if \(TRACE\.on\) \{\s*$/.test(lines[j])) return true;
+      if (/^\s*\}/.test(lines[j])) return false;
+    }
+    return false;
+  };
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+
     if (/^\s*if \(TRACE\.on\) trace\(/.test(line)) {
-      inline.push({ line: i + 1, code: line.trim() });
+      probes.push({ line: i + 1, code: line.trim() });
       continue;
     }
+
     if (/^\s*if \(TRACE\.on\) \{\s*$/.test(line)) {
       const indent = line.match(/^\s*/)[0];
       let end = -1;
       for (let j = i + 1; j < lines.length; j++) {
-        if (lines[j] === indent + '}') { end = j; break; }
+        if (lines[j].trimEnd() === indent + '}') { end = j; break; }
       }
       assert.notEqual(end, -1, `unclosed TRACE.on block at main.js:${i + 1}`);
       const body = lines.slice(i, end + 1).join('\n');
-      if (/(?<![.\w])trace\(/.test(body)) blocks.push({ line: i + 1, code: body });
+      if (/(?<![.\w])trace\(/.test(body)) probes.push({ line: i + 1, code: body });
+      continue;
     }
+
+    if (isCommentLine(line)) continue;
+    if (openGuardAbove(i)) continue;
+
+    if (/(?<![.\w])trace\(/.test(line)) looseTrace.push({ line: i + 1, code: line.trim() });
+    else if (HELPER_CALL.test(line)) looseHelpers.push({ line: i + 1, code: line.trim() });
   }
-  return [...inline, ...blocks];
-}
 
-function unguardedTraceCalls() {
-  const out = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!/(?<![.\w])trace\(/.test(line)) continue;
-    if (/^\s*(\/\/|\*)/.test(line)) continue;
-    if (/^\s*if \(TRACE\.on\) trace\(/.test(line)) continue;
-    // Inside a `if (TRACE.on) {` block: an open guard above, not yet closed.
-    let inBlock = false;
-    for (let j = i - 1; j >= 0 && j > i - 12; j--) {
-      if (/^\s*if \(TRACE\.on\) \{\s*$/.test(lines[j])) { inBlock = true; break; }
-      if (/^\s*\}/.test(lines[j])) break;
-    }
-    if (inBlock) continue;
-    out.push({ line: i + 1, code: line.trim() });
-  }
-  return out;
-}
-
-// A value that cannot be touched without saying so.
-function landmine(label) {
-  return new Proxy({}, {
-    get(_t, key) {
-      if (key === Symbol.toPrimitive || key === 'then') return undefined;
-      throw new Error(`${label}.${String(key)} was read while the trace was off`);
-    },
-  });
-}
-
-function sandboxFor(state, calls) {
-  const boom = (name) => () => {
-    calls.push(name);
-    throw new Error(`${name}() was called while the trace was off`);
-  };
-  return {
-    TRACE: state,
-    trace: boom('trace'),
-    codePoints: boom('codePoints'),
-    controlOffset: boom('controlOffset'),
-    busyDecision: boom('busyDecision'),
-    progressDecision: boom('progressDecision'),
-    // Every free value the probe statements can reach.
-    active: landmine('active'),
-    currentId: landmine('currentId'),
-    payload: landmine('payload'),
-    session: landmine('session'),
-    mainWindow: landmine('mainWindow'),
-    isBusy: landmine('isBusy'),
-    isIdle: landmine('isIdle'),
-    via: landmine('via'),
-    level: landmine('level'),
-    realId: landmine('realId'),
-    sessionId: landmine('sessionId'),
-    exitCode: landmine('exitCode'),
-    data: landmine('data'),
-  };
+  return { probes, looseTrace, looseHelpers };
 }
 
 test('main.js binds TRACE to the live state object, not a boolean snapshot', () => {
@@ -125,7 +109,7 @@ test('main.js binds TRACE to the live state object, not a boolean snapshot', () 
 
 test('main.js still carries every guarded probe site, by category', () => {
   const found = [];
-  for (const probe of probeStatements()) {
+  for (const probe of collect(mainSrc).probes) {
     const m = probe.code.match(/trace\('([^']+)'/);
     assert.ok(m, `main.js:${probe.line} guards something that is not a trace() call`);
     found.push(m[1]);
@@ -134,44 +118,48 @@ test('main.js still carries every guarded probe site, by category', () => {
 });
 
 test('every trace() call in main.js is guarded, except the IPC forwarder', () => {
-  const loose = unguardedTraceCalls();
-  for (const call of loose) {
+  const { looseTrace } = collect(mainSrc);
+  for (const call of looseTrace) {
     assert.match(
       call.code, UNGUARDED_FORWARDER,
       `main.js:${call.line} calls trace() outside an if (TRACE.on) guard: ${call.code}`,
     );
   }
-  assert.equal(loose.length, 1, 'the renderer forwarder is the only unguarded call');
+  assert.equal(looseTrace.length, 1, 'the renderer forwarder is the only unguarded call');
 });
 
-test('with the trace off, no probe statement calls a helper or reads a payload value', () => {
-  const probes = probeStatements();
-  assert.equal(probes.length, EXPECTED_PROBES.length);
-  const calls = [];
-  const sandbox = sandboxFor({ on: false }, calls);
-  vm.createContext(sandbox);
-  for (const probe of probes) {
-    assert.doesNotThrow(
-      () => vm.runInContext(probe.code, sandbox, { filename: `main.js:${probe.line}` }),
-      `main.js:${probe.line} did work while the trace was off`,
-    );
-  }
-  assert.deepEqual(calls, [], 'no trace helper ran while the trace was off');
+// One call predates the trace: the OSC 0 debug log renders a code point into a
+// template literal on every title, whatever the trace is doing. It is a real
+// cost on a hot path and it is not this feature's to remove — it came in with
+// c07ab13 (2026-03) and is on main. Pinned by its exact text so that it stays
+// the *only* exception: anything new fails the assertion below.
+const KNOWN_UNGUARDED_HELPERS = [
+  'log.debug(`[OSC 0] session=${currentId} cp=${codePoints(payload, 1)} rule=${via} busy=${isBusy} idle=${isIdle} wasBusy=${!!session._cliBusy}`);',
+];
+
+test('no trace payload helper is called outside a guard', () => {
+  // This is the check the sandbox rig could not make: work done before the
+  // guard, on its own line, is exactly how the off-path stops being free.
+  const { looseHelpers } = collect(mainSrc);
+  assert.deepEqual(
+    looseHelpers.map(c => c.code), KNOWN_UNGUARDED_HELPERS,
+    'codePoints / controlOffset / busyDecision / progressDecision must only run under if (TRACE.on)',
+  );
 });
 
-test('control: with the trace on, every one of those statements detonates', () => {
-  // Without this, the test above would pass just as well against a rig that
-  // cannot observe anything at all.
-  const probes = probeStatements();
-  const calls = [];
-  const sandbox = sandboxFor({ on: true }, calls);
-  vm.createContext(sandbox);
-  for (const probe of probes) {
-    assert.throws(
-      () => vm.runInContext(probe.code, sandbox, { filename: `main.js:${probe.line}` }),
-      `main.js:${probe.line} evaluated to nothing with the trace on — it is not a live probe`,
-    );
-  }
+test('the scan reads a CRLF checkout the same way as an LF one', () => {
+  // core.autocrlf=true is set on the maintainer's machine and the repo carries
+  // no .gitattributes, so a fresh clone gets CRLF while CI stays LF. A scan
+  // that only understands one of them is green in CI and red on the desk.
+  const lf = collect(mainSrc.replace(/\r\n/g, '\n'));
+  const crlf = collect(mainSrc.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n'));
+  assert.deepEqual(
+    crlf.probes.map(p => p.line), lf.probes.map(p => p.line),
+    'the probe sites must be found identically under CRLF',
+  );
+  assert.equal(crlf.probes.length, EXPECTED_PROBES.length);
+  assert.deepEqual(crlf.looseTrace.map(c => c.line), lf.looseTrace.map(c => c.line));
+  assert.deepEqual(crlf.looseHelpers, lf.looseHelpers);
 });
 
 test('the renderer half keeps its flag mutable and follows the main process', () => {

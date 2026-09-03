@@ -60,10 +60,21 @@ Turning it back on **opens a new segment** rather than appending to the closed
 one. Two reasons: the file name is stamped with the moment the observation
 window opened, and appending would put two disjoint windows with an unexplained
 gap between them into one file whose name describes only the first; and the
-rotation bookkeeping (bytes written into the current segment) is per-file, so
-resuming would mean stat-ing the old file to rebuild a counter that has no
-reason to survive. `seq` does not restart — it is process-wide, and it is what
-orders the two halves of a session.
+rotation bookkeeping is per-file. `seq` does not restart — it is process-wide,
+and it is what orders the two halves of a session.
+
+The stamp has one-second resolution, so an off/on inside the same second
+resolves to the same name and **reopens that file** instead of creating a
+second one indistinguishable from it. That is the correct reading of the name:
+the window is the second it is stamped with. The byte counter is re-read from
+the file on open, so the rotation threshold still measures the file rather than
+the last window.
+
+That case is not hypothetical — it is a double-click on the switch, and it used
+to be destructive: the same path went into the retained-segment list twice, the
+ceiling counted one file as two, and the queue eventually unlinked the segment
+the trace was still writing to. The queue now re-queues a returning path
+instead of duplicating it.
 
 The disk ceiling is not per-window: the retained-segment list spans the whole
 process, so four short observation windows leave the same four segments a
@@ -278,14 +289,20 @@ this: a disabled trace never advances its sequence counter, never opens a file,
 and never reads a payload property (the tests hand it an object with a
 throwing/counting getter).
 
-`test/activity-trace-probe-guards.test.js` pins it at the call sites rather
-than in the module. It lifts each guarded statement verbatim out of `main.js`
-and evaluates it in a sandbox where every helper it could call and every value
-it could read throws on contact: with the state off, none of them detonates.
-A control case flips the same state on and requires every one of them to
-detonate, so a green off-case cannot be an inert rig. It also names the probe
-categories, so a probe deleted in a refactor fails the suite instead of quietly
-reducing a count.
+`test/activity-trace-probe-guards.test.js` pins it at the call sites, and does
+so by reading the source rather than by running it. Running a guarded statement
+in a sandbox of exploding stubs only demonstrates that `if (false) X` does not
+evaluate `X` — a property of the language. What actually goes wrong is a helper
+called on the line *above* the guard, which such a rig never loads. So the
+checks are scans: every call to `trace`, `codePoints`, `controlOffset`,
+`busyDecision` or `progressDecision` in `main.js` must sit under `if (TRACE.on)`,
+and the probe categories are named so a probe deleted in a refactor fails the
+suite instead of quietly reducing a count.
+
+One call is exempt and pinned by its exact text: the OSC 0 `log.debug` line
+renders a code point into a template literal on every title, whatever the trace
+is doing. It predates this feature (c07ab13, 2026-03) and is on `main`; the
+exemption exists so that it stays the only one.
 
 This matters because of
 [ADR 0002](decisions/0002-discrete-steps-sidebar-animations.md) — the
@@ -331,6 +348,13 @@ file stays queued and is retried at the next rotation, and a
 `trace.prune-failed` line records it. So the ceiling can be temporarily
 exceeded, but never silently: grep the trace for `prune-failed` if disk use
 surprises you.
+
+A segment that is simply **gone** is the one failure that is not retried: it is
+dropped from the queue and the ceiling moves on. Deleting an old segment from
+the Diagnostics panel, or by hand in the directory, would otherwise wedge the
+queue head on a file that can never be unlinked again, and the 64 MB ceiling
+would stop applying for the rest of the run. The panel refuses to delete the
+segment currently being written; every other one is fair game.
 
 ```bash
 # 256 MB ceiling instead of 64

@@ -2157,7 +2157,7 @@ ipcMain.on('activity-trace', (_event, cat, sid, fields) => {
 
 // --- IPC: activity-trace control (the Diagnostics panel) ---
 // see docs/activity-trace.md "Toggling it at runtime"
-const TRACE_FILE_RE = /^activity-trace-\d{8}-\d{6}(\.\d{3})?\.jsonl$/;
+const TRACE_FILE_RE = activityTrace.TRACE_FILE_RE;
 const TRACE_READ_CAP = 4 * 1024 * 1024;
 
 function listActivityTraceFiles() {
@@ -2179,10 +2179,7 @@ function listActivityTraceFiles() {
 }
 
 function resolveTraceFile(filePath) {
-  const resolved = path.resolve(filePath);
-  if (path.dirname(resolved) !== path.resolve(TRACE_DIR)) return null;
-  if (!TRACE_FILE_RE.test(path.basename(resolved))) return null;
-  return resolved;
+  return activityTrace.resolveTraceFilePath(TRACE_DIR, filePath);
 }
 
 function activityTraceState() {
@@ -2213,16 +2210,7 @@ ipcMain.handle('read-activity-trace-file', (_event, filePath) => {
   const resolved = resolveTraceFile(filePath);
   if (!resolved) return { ok: false, error: 'not an activity-trace file' };
   try {
-    const size = fs.statSync(resolved).size;
-    if (size <= TRACE_READ_CAP) return { ok: true, content: fs.readFileSync(resolved, 'utf8'), size, truncated: false };
-    const fd = fs.openSync(resolved, 'r');
-    try {
-      const buf = Buffer.alloc(TRACE_READ_CAP);
-      fs.readSync(fd, buf, 0, TRACE_READ_CAP, size - TRACE_READ_CAP);
-      const text = buf.toString('utf8');
-      const firstBreak = text.indexOf('\n');
-      return { ok: true, content: firstBreak === -1 ? text : text.slice(firstBreak + 1), size, truncated: true, shown: TRACE_READ_CAP };
-    } finally { fs.closeSync(fd); }
+    return { ok: true, ...activityTrace.readTraceTail(resolved, TRACE_READ_CAP) };
   } catch (err) {
     return { ok: false, error: err.message };
   }

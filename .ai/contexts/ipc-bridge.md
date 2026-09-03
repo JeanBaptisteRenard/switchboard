@@ -314,9 +314,16 @@ Two constraints shaped the API:
   whose directory is the trace directory and whose basename matches the segment
   name pattern — an allowlist of exactly one directory, tighter than
   `isSensitivePath`, because the legitimate surface here is a single generated
-  file family. Deleting the segment currently being written is refused rather
-  than attempted. A read over 4 MB returns the tail and says so, so a 16 MB
-  segment does not go into an editor whole.
+  file family. Both the check (`resolveTraceFilePath`) and the capped read
+  (`readTraceTail`) live in `activity-trace.js` rather than inline in the
+  handler, for the same reason `fts-match.js` and `terminal-input.js` do:
+  a handler body cannot be unit-tested without booting Electron, and these two
+  carry the parts worth testing — a non-string path must answer `null` rather
+  than throw (a rejected invoke leaves the button dead with no message), and a
+  file that shrinks between the `stat` and the `read` must not come back as
+  megabytes of NUL presented as trace content. Deleting the segment currently
+  being written is refused rather than attempted; `currentFile` follows the
+  stream, so switching debug mode off releases it immediately.
 - **The probes must stay one line each.** The interesting sites live in files
   that other branches touch (`session-transitions.js`, `public/sidebar.js`),
   so every probe is a single inserted statement and all the logic —

@@ -3,9 +3,18 @@
 // See docs/activity-trace.md and .ai/contexts/ipc-bridge.md "Activity trace".
 
 let activityTracePanel = null;
+// The list the Diagnostics section last rendered into, so a delete made from
+// the viewer's own toolbar refreshes it too.
+let activityTraceListEl = null;
 
 function activityTraceViewerEl() {
   return document.getElementById('activity-trace-viewer');
+}
+
+function refreshActivityTraceList() {
+  if (activityTraceListEl && activityTraceListEl.isConnected) {
+    renderActivityTraceFiles(activityTraceListEl);
+  }
 }
 
 function getActivityTracePanel() {
@@ -17,8 +26,16 @@ function getActivityTracePanel() {
     language: 'auto', storageKey: 'activityTracePreviewMode',
     format: true,
     onDelete: async (filePath) => {
-      const result = await window.api.deleteActivityTraceFile(filePath);
-      if (result && result.ok) container.style.display = 'none';
+      let result;
+      try {
+        result = await window.api.deleteActivityTraceFile(filePath);
+      } catch (err) {
+        return { ok: false, error: (err && err.message) || String(err) };
+      }
+      if (result && result.ok) {
+        container.style.display = 'none';
+        refreshActivityTraceList();
+      }
       return result;
     },
     onClose: () => { container.style.display = 'none'; },
@@ -43,7 +60,12 @@ function formatTraceDate(iso) {
 async function openActivityTraceFile(file) {
   const panel = getActivityTracePanel();
   if (!panel) return;
-  const result = await window.api.readActivityTraceFile(file.filePath);
+  let result;
+  try {
+    result = await window.api.readActivityTraceFile(file.filePath);
+  } catch (err) {
+    result = { ok: false, error: (err && err.message) || String(err) };
+  }
   if (!result || !result.ok) {
     window.alert(`Could not read ${file.name}: ${(result && result.error) || 'unknown error'}`);
     return;
@@ -96,7 +118,15 @@ function buildActivityTraceRow(file, listEl) {
   deleteBtn.textContent = 'Delete';
   deleteBtn.addEventListener('click', async () => {
     if (!window.confirm(`Delete "${file.name}"?\n\nThis cannot be undone.`)) return;
-    const result = await window.api.deleteActivityTraceFile(file.filePath);
+    deleteBtn.disabled = true;
+    let result;
+    try {
+      result = await window.api.deleteActivityTraceFile(file.filePath);
+    } catch (err) {
+      result = { ok: false, error: (err && err.message) || String(err) };
+    } finally {
+      deleteBtn.disabled = false;
+    }
     if (result && result.ok) {
       renderActivityTraceFiles(listEl);
     } else {
@@ -113,8 +143,9 @@ function buildActivityTraceRow(file, listEl) {
 
 async function renderActivityTraceFiles(listEl) {
   if (!listEl) return;
+  activityTraceListEl = listEl;
   let files = [];
-  try { files = await window.api.listActivityTraceFiles(); } catch { files = []; }
+  try { files = (await window.api.listActivityTraceFiles()) || []; } catch { files = []; }
   listEl.innerHTML = '';
   if (!files.length) {
     const empty = document.createElement('div');

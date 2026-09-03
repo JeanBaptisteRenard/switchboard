@@ -68,14 +68,19 @@ function setup({ traceState, files = [], readResult, deleteResult = { ok: true }
   });
 
   const opened = [];
+  const panelOpts = [];
   Object.defineProperty(window, 'ViewerPanel', {
-    value: class { open(title, filePath, content) { opened.push({ title, filePath, content }); } },
+    value: class {
+      constructor(_container, opts) { panelOpts.push(opts); }
+      open(title, filePath, content) { opened.push({ title, filePath, content }); }
+    },
     writable: true, configurable: true,
   });
 
   const confirms = [];
+  const alerts = [];
   window.confirm = (msg) => { confirms.push(msg); return window.__confirmAnswer !== false; };
-  window.alert = () => {};
+  window.alert = (msg) => { alerts.push(String(msg)); };
 
   evalInWindow(dom, path.join(PUBLIC_DIR, 'utils.js'));
   evalInWindow(dom, path.join(PUBLIC_DIR, 'shortcuts.js'));
@@ -84,7 +89,7 @@ function setup({ traceState, files = [], readResult, deleteResult = { ok: true }
   evalInWindow(dom, path.join(PUBLIC_DIR, 'activity-trace-panel.js'));
 
   return {
-    window, document: window.document, calls, opened, confirms,
+    window, document: window.document, calls, opened, confirms, panelOpts, alerts,
     body: () => window.document.getElementById('settings-viewer-body'),
     destroy() { window.close(); },
   };
@@ -250,5 +255,48 @@ test('a rejected delete leaves the list alone and does not lie about it', async 
     ctx.body().querySelectorAll('.activity-trace-file')[0].querySelectorAll('button')[1].click();
     await settle();
     assert.equal(ctx.body().querySelectorAll('.activity-trace-file').length, 2);
+  } finally { ctx.destroy(); }
+});
+
+test('a delete made from the viewer toolbar refreshes the list behind it', async () => {
+  const ctx = setup({ files: SAMPLE_FILES, readResult: { ok: true, content: '{}', size: 10, truncated: false } });
+  try {
+    await ctx.window.openSettingsViewer('global');
+    await settle();
+    // Open a file so the ViewerPanel exists, then delete through its toolbar.
+    ctx.body().querySelectorAll('.activity-trace-file')[1].querySelectorAll('button')[0].click();
+    await settle();
+    assert.equal(ctx.panelOpts.length, 1, 'the viewer panel was constructed');
+
+    const result = await ctx.panelOpts[0].onDelete(SAMPLE_FILES[1].filePath);
+    await settle();
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(ctx.calls.deleted, [SAMPLE_FILES[1].filePath]);
+    assert.equal(ctx.body().querySelectorAll('.activity-trace-file').length, 1,
+      'the row deleted from the toolbar is gone from the list too');
+  } finally { ctx.destroy(); }
+});
+
+test('an IPC rejection is reported instead of leaving a dead button', async () => {
+  const ctx = setup({ files: SAMPLE_FILES });
+  try {
+    await ctx.window.openSettingsViewer('global');
+    await settle();
+    // A main-process handler that throws rejects the invoke promise.
+    ctx.window.api = new Proxy({}, {
+      get(_t, prop) {
+        if (prop === 'deleteActivityTraceFile') return async () => { throw new Error('handler exploded'); };
+        if (prop === 'listActivityTraceFiles') return async () => SAMPLE_FILES;
+        return () => Promise.resolve({ ok: true });
+      },
+    });
+    const btn = ctx.body().querySelectorAll('.activity-trace-file')[1].querySelectorAll('button')[1];
+    btn.click();
+    await settle();
+
+    assert.equal(btn.disabled, false, 'the button is usable again');
+    assert.equal(ctx.alerts.length, 1, 'the failure was surfaced');
+    assert.match(ctx.alerts[0], /handler exploded/);
   } finally { ctx.destroy(); }
 });
