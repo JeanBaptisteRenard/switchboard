@@ -151,11 +151,27 @@ slash-command completion empties the box while the CLI refills it.
   only reports changes nothing at all, clock included. The exemption is
   deliberately narrow: SGR reports (`CSI < b ; x ; y M|m`) and focus reports
   (`CSI I`, `CSI O`) with no parameter — those two forms and nothing else. A
-  near-miss — a parameter too few or too many, a non-numeric
-  one, another final byte, a report cut short by the end of a chunk — is *not*
-  recognised and still counts as input. Doubt resolves to busy here too: a wrong
-  exemption would be a false "free", and a false "free" types over the user's
-  sentence.
+  near-miss — a parameter too few or too many, a non-numeric one, another final
+  byte, a report cut short by the end of a chunk — is *not* recognised and still
+  counts as input. Doubt resolves to busy here too: a wrong exemption would be a
+  false "free", and a false "free" types over the user's sentence.
+- The exemption covers those two forms only, and xterm.js writes more than
+  reports on that channel. Its own replies still count as input and still push
+  the quiet clock (measured: `lastInputAt` stamped, `pending` unchanged) — the
+  OSC colour reply `ESC ] 11 ; rgb:… ST`, the XTWINOPS size replies
+  `CSI 4 ; h ; w t` and `CSI 6 ; ch ; cw t`, DA1 (`CSI ?1;2c`) and CPR
+  (`CSI r ; c R`). Each costs a trigger up to one quiet window. **Their
+  periodicity has not been verified**: they answer a query, so they are
+  presumably one-off rather than repeating — that is a reserve, not a
+  guarantee.
+- In the alternate screen buffer with mouse tracking *off*, xterm translates the
+  wheel into arrow keys and sends them as ordinary input. A bare `ESC [ A` is a
+  history recall to this model, so it inserts one opaque placeholder: **three
+  wheel notches put `pending` at 3** (measured) and every trigger for that
+  session renounces until the next Enter, Ctrl+U or Ctrl+C. The direction is the
+  safe one — the trigger gives up rather than typing over something — but this
+  is the next "the trigger never fires", and it is not fixed here: deciding what
+  a wheel-driven arrow key means to the composer is a change of its own.
 - Escape does **not** clear the composer on Claude Code v2.1.258 (measured), so
   treating it as neutral is correct *today*. A CLI change would turn it into a
   false "free".

@@ -108,6 +108,16 @@ the catastrophic direction. And the renderer independently drops `ESC [ I` /
 the focus branch is defence in depth rather than the live path — do not delete
 either half on the grounds that the other exists.
 
+**Two blind spots the exemption does not close**, both written up in the
+"Politeness" section of `docs/automation.md`. xterm.js puts more than reports on
+that channel — the OSC colour reply, the XTWINOPS size replies, DA1 and CPR —
+and those still push the quiet clock; their periodicity is unverified, so
+"solicited, therefore one-off" is a reserve rather than a fact. Worse: in the
+alternate buffer with mouse tracking off, the wheel becomes arrow keys, and a
+bare `ESC [ A` reads as a history recall here, so three notches put `pending` at
+3 and mute every trigger for that session until an Enter or a Ctrl+U. That one
+predates the report work and is deliberately left alone.
+
 One of them is worth repeating here because it is a **dated measurement, not a
 property**: on Claude Code v2.1.258, measured on an isolated PTY with a screen
 dump, plain `ESC [ A` and `ESC O A` recall history and fill the composer (the
