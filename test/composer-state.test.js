@@ -247,6 +247,37 @@ test('composer-state: a bare CSI M never swallows the bytes that follow it', () 
   assert.equal(state.pending, 1);
 });
 
+// ── The quiet clock during a bracketed paste ─────────────────────────────────
+// A paste is the case where "doubt resolves to busy" matters most: its bytes
+// are the user's, and a chunk that lands wholly inside one carries no marker of
+// its own. Each of the three tests below is the only cover for one of the
+// stamps in noteUserInput's paste branches.
+
+test('composer-state: a chunk wholly inside a paste pushes the quiet clock', () => {
+  const state = createComposerState();
+  noteUserInput(state, '\x1b[200~', 1000);
+  noteUserInput(state, 'pasted', 2000);
+  assert.equal(state.pending, 6, 'the bytes land in the composer');
+  assert.equal(state.lastInputAt, 2000, 'and the chunk is not silence');
+  assert.equal(state.inPaste, true, 'the paste is still open');
+});
+
+test('composer-state: opening a paste pushes the quiet clock on its own', () => {
+  // The opener adds no text, so nothing else in the chunk can stamp the clock.
+  const state = createComposerState();
+  noteUserInput(state, '\x1b[200~', 2000);
+  assert.equal(state.pending, 0);
+  assert.equal(state.lastInputAt, 2000, 'an opener alone is still input');
+});
+
+test('composer-state: a paste opener cut mid-chunk pushes the quiet clock', () => {
+  const state = createComposerState();
+  noteUserInput(state, '\x1b[2', 2000);
+  assert.equal(state.partial, '\x1b[2', 'the head is buffered for the next chunk');
+  assert.equal(state.pending, 0, 'and never typed as text');
+  assert.equal(state.lastInputAt, 2000, 'but half an opener is not proof of silence');
+});
+
 test('composer-state: lastInputAt advances on any chunk carrying real input', () => {
   const state = createComposerState();
   noteUserInput(state, 'a', 5000);
