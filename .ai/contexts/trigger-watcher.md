@@ -49,9 +49,12 @@ submitted.  `waitForComposerFree(sessionId, ctx, deadlineMs)` polls every
 `IDLE_POLL_INTERVAL` and calls the composer free only when `pending === 0` **and**
 `now - lastInputAt >= quietMs` (`SWITCHBOARD_TRIGGER_QUIET_MS`, default 3000 ms).
 It gates every PTY write: the single-`command` path, every `chain` step, and the
-bare recovery `` inside `submitWithVerify` — that last one is the sharp edge,
-since a lone `` on somebody's half-typed sentence submits the sentence.  Every
-wait is bounded by the deadline already in force; the recovery `` is bounded by
+bare recovery `
+` inside `submitWithVerify` — that last one is the sharp edge,
+since a lone `
+` on somebody's half-typed sentence submits the sentence.  Every
+wait is bounded by the deadline already in force; the recovery `
+` is bounded by
 the shorter of that deadline and one verify window.
 
 Two consequences beyond hygiene, both measured on Claude Code v2.1.258: a
@@ -83,6 +86,53 @@ is unknowable without the text — and left `pending` positive for good after an
 of them, which mutes every later trigger for that session. See the "Politeness"
 section of `docs/automation.md` for the full table and the blind spots; they are
 part of the contract, not an implementation detail.
+
+**Terminal reports are not user input — fixed 2026-09-02 after a real-world
+measurement.** Mouse tracking reports arrive on the same IPC channel as
+keystrokes, one per pointer motion, so `noteUserInput` — which stamped
+`lastInputAt` at its head for any non-empty chunk — read a resting pointer as
+continuous typing. On the real CLI, composer emptied with Ctrl+U and no key
+touched: with the pointer over the terminal a trigger waited its whole 30 s and
+was **refused** (`"the last keystroke landed 47 ms ago, inside the 3000 ms quiet
+window"`, `waited_ms: 30046`); with the pointer off the terminal the same
+trigger needed `waited_ms: 15504` to find 3 s of silence. `docs/automation.md`
+had promised the opposite ("at most ~3 s each time, never a refusal on its
+own"), so the feature was in practice unusable whenever the user sat in front of
+the machine. The parser now has a third category — recognised, but touching
+neither the text nor the clock — holding exactly two forms: SGR mouse reports
+and focus reports. `lastInputAt` is stamped after parsing, only if at least one
+element of the chunk counted. Reports still reach the PTY untouched: the TUI
+needs them. Two things to keep in mind before widening this. The exemption is
+strict by design — a near-miss (wrong parameter count, non-numeric parameter,
+another final byte, a report truncated at a chunk boundary) still counts as
+input, because a wrong exemption produces a false "free", and a false "free" is
+the catastrophic direction. And the renderer independently drops `ESC [ I` /
+`ESC [ O` before the IPC send (`public/terminal-manager.js`, in `onData`), so
+the focus branch is defence in depth rather than the live path — do not delete
+either half on the grounds that the other exists.
+
+**X10 mouse reports were tried here and removed — do not add them back without
+first wiring `terminal.onBinary`.** xterm.js sends the DEFAULT (X10) encoding
+through `triggerBinaryEvent`, and nothing in this repo subscribes to that
+channel, so `ESC [ M` + 3 payload bytes can never arrive on the input path. The
+only producer of `ESC [ M` on `onData` is therefore a person: Escape emits
+`ESC` alone, then `[`, then `M`. Exempting it meant that typing Escape, `[M`
+and up to three more characters left `pending` at 0 on a composer holding real
+text — a false "free", the one the guard exists to prevent — and that half an
+X10 report held in `state.partial` swallowed the next SGR report and inserted
+its remainder as text, freezing the composer until an Enter. Both paths were
+safe before the exemption was added. The branch protected an unreachable case
+at the cost of a reachable regression.
+
+**Two blind spots the exemption does not close**, both written up in the
+"Politeness" section of `docs/automation.md`. xterm.js puts more than reports on
+that channel — the OSC colour reply, the XTWINOPS size replies, DA1 and CPR —
+and those still push the quiet clock; their periodicity is unverified, so
+"solicited, therefore one-off" is a reserve rather than a fact. Worse: in the
+alternate buffer with mouse tracking off, the wheel becomes arrow keys, and a
+bare `ESC [ A` reads as a history recall here, so three notches put `pending` at
+3 and mute every trigger for that session until an Enter or a Ctrl+U. That one
+predates the report work and is deliberately left alone.
 
 One of them is worth repeating here because it is a **dated measurement, not a
 property**: on Claude Code v2.1.258, measured on an isolated PTY with a screen

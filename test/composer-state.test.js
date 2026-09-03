@@ -127,7 +127,158 @@ test('composer-state: isComposerEmpty tracks the counter', () => {
   assert.equal(isComposerEmpty(state), true);
 });
 
-test('composer-state: lastInputAt advances on any non-empty chunk', () => {
+// ── Terminal reports ─────────────────────────────────────────────────────────
+// Regression cover for the 2026-09-02 measurement: a resting pointer over a
+// mouse-tracking session pushed the quiet clock and got a trigger refused.
+// See docs/automation.md ("Politeness") for the numbers.
+
+const SGR_PRESS   = '\x1b[<0;42;13M';
+const SGR_RELEASE = '\x1b[<0;42;13m';
+const SGR_MOVE    = '\x1b[<35;120;40M';
+const FOCUS_IN    = '\x1b[I';
+const FOCUS_OUT   = '\x1b[O';
+
+/** Feed `chunks` on top of a composer holding "hi", asserting nothing moved. */
+function assertInert(chunks) {
+  const state = createComposerState();
+  noteUserInput(state, 'hi', 1000);
+  assert.equal(state.pending, 2);
+  let t = 2000;
+  for (const chunk of chunks) noteUserInput(state, chunk, (t += 1000));
+  assert.equal(state.pending, 2, `${JSON.stringify(chunks)} must not touch the text`);
+  assert.equal(state.lastInputAt, 1000, `${JSON.stringify(chunks)} must not push the clock`);
+  assert.equal(state.partial, '', 'nothing should be left buffered');
+  return state;
+}
+
+test('composer-state: an SGR mouse report is neither text nor activity', () => {
+  assertInert([SGR_MOVE]);
+  assertInert([SGR_PRESS, SGR_RELEASE]);
+  // A whole flick of the wrist in one chunk is still silence.
+  assertInert([SGR_MOVE.repeat(12)]);
+});
+
+test('composer-state: a focus report is neither text nor activity', () => {
+  assertInert([FOCUS_IN]);
+  assertInert([FOCUS_OUT]);
+  assertInert([FOCUS_OUT, FOCUS_IN]);
+});
+
+test('composer-state: a chunk mixing a report and a keystroke counts the keystroke', () => {
+  const state = createComposerState();
+  noteUserInput(state, 'hi', 1000);
+  noteUserInput(state, SGR_MOVE + 'x', 5000);
+  assert.equal(state.pending, 3, 'the keystroke lands in the composer');
+  assert.equal(state.lastInputAt, 5000, 'and pushes the quiet clock');
+
+  const trailing = createComposerState();
+  noteUserInput(trailing, 'a' + FOCUS_IN, 6000);
+  assert.equal(trailing.pending, 1);
+  assert.equal(trailing.lastInputAt, 6000);
+});
+
+test('composer-state: a report split across chunks is never counted as text', () => {
+  // The head is buffered, the tail completes it, and no byte reaches the box.
+  const sgr = createComposerState();
+  noteUserInput(sgr, '\x1b[<35;120', 1000);
+  assert.equal(sgr.pending, 0, 'a half report is held back, not typed');
+  assert.equal(sgr.partial, '\x1b[<35;120');
+  noteUserInput(sgr, ';40M', 2000);
+  assert.equal(sgr.pending, 0, 'the completed report adds nothing');
+  assert.equal(sgr.partial, '');
+  assert.equal(sgr.lastInputAt, 1000, 'the completing chunk is silence');
+});
+
+test('composer-state: an unrecognised sequence still counts as input', () => {
+  // The safety principle: only sequences actually recognised as reports are
+  // exempt. A near-miss must resolve towards busy, never towards free — a false
+  // "idle" is what lets a trigger type over the user's sentence.
+  const cases = [
+    ['\x1b[<0;42M',     'an SGR report short of a parameter'],
+    ['\x1b[<0;42;13;9M', 'an SGR report with a parameter too many'],
+    ['\x1b[5M',          'CSI 5 M — delete lines, not a mouse report'],
+    ['\x1b[<a;b;cM',     'non-numeric SGR parameters'],
+    ['\x1b[2I',          'a parameterised CSI I'],
+    ['\x1b[1;2O',        'a modified CSI O'],
+    ['\x1bOM',           'SS3 M, not CSI M'],
+    ['\x1b[<0;42;13X',   'the right shape with the wrong final byte'],
+  ];
+  for (const [seq, why] of cases) {
+    const state = createComposerState();
+    noteUserInput(state, 'hi', 1000);
+    noteUserInput(state, seq, 9000);
+    assert.equal(state.lastInputAt, 9000, `${why} must push the quiet clock`);
+  }
+});
+
+test('composer-state: a truncated report resolves towards busy for its own chunk', () => {
+  const state = createComposerState();
+  noteUserInput(state, '\x1b[<35;120', 4000);
+  assert.equal(state.lastInputAt, 4000, 'half a report is not proof of silence');
+  assert.equal(state.pending, 0, 'but it is not text either');
+});
+
+test('composer-state: a typed ESC [ M is input, not a mouse report', () => {
+  // Nothing in the repo subscribes to xterm's onBinary channel, so a
+  // DEFAULT-encoded mouse report never reaches this model: `ESC [ M` arriving
+  // on onData is a person pressing Escape, then [, then M.
+  const oneChunk = createComposerState();
+  noteUserInput(oneChunk, '\x1b[Mabc', 2000);
+  assert.equal(oneChunk.text, 'abc', 'the letters after it are typed text');
+  assert.equal(oneChunk.pending, 3);
+  assert.equal(oneChunk.lastInputAt, 2000, 'and the chunk pushes the quiet clock');
+
+  const keyByKey = createComposerState();
+  let now = 1000;
+  for (const key of ['\x1b', '[', 'M', 'i', 's', 'e']) noteUserInput(keyByKey, key, (now += 1000));
+  assert.equal(keyByKey.text, 'ise');
+  assert.equal(keyByKey.pending, 3);
+  assert.equal(keyByKey.lastInputAt, 7000);
+});
+
+test('composer-state: a bare CSI M never swallows the bytes that follow it', () => {
+  // Treating it as the head of a report misaligned the next chunk and left the
+  // composer frozen on a phantom count.
+  const state = createComposerState();
+  noteUserInput(state, '\x1b[M ', 1000);
+  assert.equal(state.partial, '', 'nothing is held back waiting for a payload');
+  noteUserInput(state, '\x1b[<0;1;1M', 2000);
+  assert.equal(state.text, ' ', 'the SGR report that follows stays inert');
+  assert.equal(state.pending, 1);
+});
+
+// ── The quiet clock during a bracketed paste ─────────────────────────────────
+// A paste is the case where "doubt resolves to busy" matters most: its bytes
+// are the user's, and a chunk that lands wholly inside one carries no marker of
+// its own. Each of the three tests below is the only cover for one of the
+// stamps in noteUserInput's paste branches.
+
+test('composer-state: a chunk wholly inside a paste pushes the quiet clock', () => {
+  const state = createComposerState();
+  noteUserInput(state, '\x1b[200~', 1000);
+  noteUserInput(state, 'pasted', 2000);
+  assert.equal(state.pending, 6, 'the bytes land in the composer');
+  assert.equal(state.lastInputAt, 2000, 'and the chunk is not silence');
+  assert.equal(state.inPaste, true, 'the paste is still open');
+});
+
+test('composer-state: opening a paste pushes the quiet clock on its own', () => {
+  // The opener adds no text, so nothing else in the chunk can stamp the clock.
+  const state = createComposerState();
+  noteUserInput(state, '\x1b[200~', 2000);
+  assert.equal(state.pending, 0);
+  assert.equal(state.lastInputAt, 2000, 'an opener alone is still input');
+});
+
+test('composer-state: a paste opener cut mid-chunk pushes the quiet clock', () => {
+  const state = createComposerState();
+  noteUserInput(state, '\x1b[2', 2000);
+  assert.equal(state.partial, '\x1b[2', 'the head is buffered for the next chunk');
+  assert.equal(state.pending, 0, 'and never typed as text');
+  assert.equal(state.lastInputAt, 2000, 'but half an opener is not proof of silence');
+});
+
+test('composer-state: lastInputAt advances on any chunk carrying real input', () => {
   const state = createComposerState();
   noteUserInput(state, 'a', 5000);
   assert.equal(state.lastInputAt, 5000);
