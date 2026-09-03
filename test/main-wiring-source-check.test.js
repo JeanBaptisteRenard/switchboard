@@ -132,3 +132,58 @@ test('main-wiring source check: the open-terminal session carries composerState'
     'the session built in open-terminal must carry composerState: createComposerState()',
   );
 });
+
+test('main-wiring source check: no PTY method is called bare on a session', () => {
+  // The crash this guards: a `terminal-resize` for a session whose pty exited
+  // between the `!exited` check and the call. See .ai/contexts/ipc-bridge.md.
+  const bare = /\bsession\.pty\.(resize|kill|write|pause|resume)\s*\(/g;
+  const found = mainSrc.match(bare) || [];
+  assert.deepEqual(
+    found, [],
+    'main.js must reach a session pty through pty-ops, not call it directly: ' + found.join(', '),
+  );
+  assert.match(
+    mainSrc, /require\('\.\/pty-ops'\)/,
+    'main.js must require ./pty-ops',
+  );
+  assert.match(
+    mainSrc, /\bsetPtyOpLogger\(\s*log\s*\)/,
+    'main.js must hand electron-log to pty-ops so swallowed errors stay diagnosable',
+  );
+});
+
+test('main-wiring source check: terminal-resize goes through resizePty, nudge included', () => {
+  const args = argsOf("ipcMain.on('terminal-resize'", 'ipcMain.on');
+  assert.match(
+    args, /resizePty\(\s*session\s*,\s*cols\s*,\s*rows\s*,\s*sessionId\s*\)/,
+    'the primary resize must go through resizePty(session, cols, rows, sessionId)',
+  );
+  assert.match(
+    args, /resizePty\(\s*session\s*,\s*cols\s*\+\s*1\s*,\s*rows\s*,\s*sessionId\s*\)/,
+    'the first-resize nudge must go through resizePty too',
+  );
+  assert.equal(
+    (args.match(/resizePty\(/g) || []).length, 3,
+    'all three resizes on this path must be guarded',
+  );
+});
+
+test('main-wiring source check: stop-session kills through killPty', () => {
+  const args = argsOf("ipcMain.handle('stop-session'", 'ipcMain.handle');
+  assert.match(
+    args, /killPty\(\s*session\s*,\s*sessionId\s*\)/,
+    'stop-session must kill through killPty — a bare kill() rejects the invoke',
+  );
+});
+
+test('main-wiring source check: the keystroke path writes through pty-ops', () => {
+  const inputSrc = fs.readFileSync(path.join(__dirname, '..', 'terminal-input.js'), 'utf8');
+  assert.doesNotMatch(
+    inputSrc, /\bsession\.pty\.write\s*\(/,
+    'terminal-input.js must write through writePty, not straight at the pty',
+  );
+  assert.match(
+    inputSrc, /writePty\(\s*session\s*,\s*data\s*,\s*sessionId\s*\)/,
+    'terminal-input.js must call writePty(session, data, sessionId)',
+  );
+});

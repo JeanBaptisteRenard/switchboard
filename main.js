@@ -75,9 +75,12 @@ const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 const { isSensitivePath, isAllowedMemoryPath: _isAllowedMemoryPath } = require('./ipc-path-validator');
 const { normalizePtySize } = require('./pty-size');
+const { setPtyOpLogger, resizePty, killPty } = require('./pty-ops');
 const { createComposerState } = require('./composer-state');
 const { handleTerminalInput } = require('./terminal-input');
 const { createTriggerContext } = require('./trigger-context');
+
+setPtyOpLogger(log);
 
 
 // --- Auto-updater (only in packaged builds) ---
@@ -352,9 +355,7 @@ function createWindow() {
     // Kill all running PTY processes so orphaned `claude` processes don't
     // accumulate in the background with no way for the user to interact.
     for (const [id, session] of activeSessions) {
-      if (!session.exited) {
-        try { session.pty.kill(); } catch {}
-      }
+      if (!session.exited) killPty(session, id);
       activeSessions.delete(id);
     }
     // Release all subagent file watchers (closes fs.watch handles + clears any
@@ -1441,7 +1442,7 @@ ipcMain.handle('get-active-terminals', () => {
 ipcMain.handle('stop-session', (_event, sessionId) => {
   const session = activeSessions.get(sessionId);
   if (!session || session.exited) return { ok: false, error: 'not running' };
-  session.pty.kill();
+  killPty(session, sessionId);
   return { ok: true };
 });
 
@@ -2171,7 +2172,7 @@ ipcMain.on('terminal-resize', (_event, sessionId, cols, rows) => {
     // accumulating prompt redraws that pollute reattach replay
     if (session.isPlainTerminal) session._suppressBuffer = true;
 
-    session.pty.resize(cols, rows);
+    resizePty(session, cols, rows, sessionId);
 
     if (session.isPlainTerminal) {
       setTimeout(() => { session._suppressBuffer = false; }, 200);
@@ -2181,12 +2182,8 @@ ipcMain.on('terminal-resize', (_event, sessionId, cols, rows) => {
     if (session.firstResize && !session.isPlainTerminal) {
       session.firstResize = false;
       setTimeout(() => {
-        try {
-          session.pty.resize(cols + 1, rows);
-          setTimeout(() => {
-            try { session.pty.resize(cols, rows); } catch {}
-          }, 50);
-        } catch {}
+        if (!resizePty(session, cols + 1, rows, sessionId)) return;
+        setTimeout(() => resizePty(session, cols, rows, sessionId), 50);
       }, 50);
     }
   }
@@ -2509,10 +2506,8 @@ app.on('before-quit', () => {
   cliSessionState.stop();
 
   // Kill all PTY processes on quit
-  for (const [, session] of activeSessions) {
-    if (!session.exited) {
-      try { session.pty.kill(); } catch {}
-    }
+  for (const [id, session] of activeSessions) {
+    if (!session.exited) killPty(session, id);
   }
 });
 
