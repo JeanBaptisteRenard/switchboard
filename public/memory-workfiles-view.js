@@ -12,6 +12,8 @@ function hideAllViewers() {
   statsViewer.style.display = 'none';
   memoryViewer.style.display = 'none';
   workFilesViewer.style.display = 'none';
+  const traceViewer = document.getElementById('activity-trace-viewer');
+  if (traceViewer) traceViewer.style.display = 'none';
   settingsViewer.style.display = 'none';
   jsonlViewer.style.display = 'none';
   terminalArea.style.display = '';
