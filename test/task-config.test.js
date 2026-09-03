@@ -101,7 +101,7 @@ test('resolves parallel and sequential compound dependency graphs', () => {
   assert.equal(graph.task.dependsOrder, 'parallel');
 });
 
-test('reports missing dependencies, cycles, and unsupported variables', () => {
+test('reports missing dependencies and cycles', () => {
   const missing = load(JSON.stringify({
     version: '2.0.0', tasks: [{ label: 'all', dependsOn: 'missing' }],
   }));
@@ -115,10 +115,42 @@ test('reports missing dependencies, cycles, and unsupported variables', () => {
   }));
   assert.throws(() => resolveTaskGraph(cyclic, 'one'), /cycle detected/);
 
+});
+
+test('an unlabelled task still fails the whole file', () => {
   assert.throws(() => load(JSON.stringify({
     version: '2.0.0',
-    tasks: [{ label: 'bad', type: 'shell', command: '${command:pickSomething}' }],
-  })), /Unsupported task variable/);
+    tasks: [{ type: 'shell', command: '${command:pickSomething}' }],
+  })), /must have a string label/);
+});
+
+test('an unresolvable variable disables only its own task', () => {
+  const tasks = load(JSON.stringify({
+    version: '2.0.0',
+    tasks: [
+      { label: 'unit', type: 'shell', command: 'pytest', args: ['tests/unit/'] },
+      {
+        label: 'current file',
+        detail: 'run the focused test',
+        type: 'shell',
+        command: 'pytest',
+        args: ['${relativeFile}'],
+      },
+    ],
+  }));
+
+  assert.deepEqual(tasks.map(task => task.label), ['unit', 'current file']);
+
+  const runnable = tasks[0];
+  assert.equal(runnable.supported, true);
+  assert.deepEqual(runnable.args, ['tests/unit/']);
+
+  const disabled = tasks[1];
+  assert.equal(disabled.supported, false);
+  assert.match(disabled.error, /Unsupported task variable \$\{relativeFile\}/);
+  assert.equal(disabled.detail, 'run the focused test');
+  assert.equal(disabled.cwd, workspaceFolder);
+  assert.throws(() => resolveTaskGraph(tasks, 'current file'), /Unsupported task variable/);
 });
 
 test('worktrees inherit the parent tasks file when they do not define one', () => {

@@ -31,7 +31,7 @@ function resolveFolderPath(folder) {
 let PROJECTS_DIR, activeSessions, getMainWindow, log;
 let deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession;
 let deleteSearchFolder, deleteSearchSession, upsertSearchEntries;
-let setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName;
+let setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, setSetting, getMeta, setName;
 let updateCachedAiTitle, updateSearchTitle;
 
 function init(ctx) {
@@ -52,10 +52,91 @@ function init(ctx) {
   getAllMeta = ctx.db.getAllMeta;
   getAllCached = ctx.db.getAllCached;
   getSetting = ctx.db.getSetting;
+  setSetting = ctx.db.setSetting;
   getMeta = ctx.db.getMeta;
   setName = ctx.db.setName;
   updateCachedAiTitle = ctx.db.updateCachedAiTitle;
   updateSearchTitle = ctx.db.updateSearchTitle;
+}
+
+/**
+ * Give hidden projects from older builds a baseline time. Without one, the
+ * first ordinary rescan after upgrading could mistake an old transcript for a
+ * newly-created session and immediately undo the user's hide choice.
+ */
+function initializeHiddenProjectTimestamps(now = Date.now()) {
+  const global = getSetting('global') || {};
+  const hidden = Array.isArray(global.hiddenProjects) ? global.hiddenProjects : [];
+  const timestamps = (global.hiddenProjectTimestamps
+    && typeof global.hiddenProjectTimestamps === 'object'
+    && !Array.isArray(global.hiddenProjectTimestamps))
+    ? { ...global.hiddenProjectTimestamps }
+    : {};
+  let changed = false;
+
+  for (const projectPath of hidden) {
+    if (!Number.isFinite(Number(timestamps[projectPath]))) {
+      timestamps[projectPath] = now;
+      changed = true;
+    }
+  }
+  for (const projectPath of Object.keys(timestamps)) {
+    if (!hidden.includes(projectPath)) {
+      delete timestamps[projectPath];
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    global.hiddenProjectTimestamps = timestamps;
+    setSetting('global', global);
+  }
+}
+
+/**
+ * Restore a hidden project when indexing finds a transcript file created after
+ * the project was hidden. File birth time distinguishes a new session from an
+ * old hidden session merely receiving more output; transcript `created` is a
+ * second signal for filesystems with coarse or unavailable birth times.
+ */
+function restoreProjectsWithNewSessions(sessions) {
+  if (!sessions.length) return [];
+
+  const global = getSetting('global') || {};
+  const hidden = new Set(global.hiddenProjects || []);
+  if (!hidden.size) return [];
+  const timestamps = global.hiddenProjectTimestamps || {};
+  const restored = new Set();
+
+  for (const session of sessions) {
+    if (!hidden.has(session.projectPath)) continue;
+    const hiddenAt = Number(timestamps[session.projectPath]);
+    if (!Number.isFinite(hiddenAt)) continue;
+
+    const creationTimes = [];
+    if (session.sessionFile) {
+      try {
+        const birthtimeMs = fs.statSync(session.sessionFile).birthtimeMs;
+        if (Number.isFinite(birthtimeMs) && birthtimeMs > 0) creationTimes.push(birthtimeMs);
+      } catch {}
+    }
+    const transcriptCreatedAt = Date.parse(session.created);
+    if (Number.isFinite(transcriptCreatedAt)) creationTimes.push(transcriptCreatedAt);
+    const createdAt = creationTimes.length ? Math.max(...creationTimes) : NaN;
+
+    if (Number.isFinite(createdAt) && createdAt >= hiddenAt) {
+      restored.add(session.projectPath);
+    }
+  }
+
+  if (!restored.size) return [];
+  global.hiddenProjects = [...hidden].filter(projectPath => !restored.has(projectPath));
+  const nextTimestamps = { ...timestamps };
+  for (const projectPath of restored) delete nextTimestamps[projectPath];
+  global.hiddenProjectTimestamps = nextTimestamps;
+  setSetting('global', global);
+  for (const projectPath of restored) log.info(`[projects] restored hidden project after new session: ${projectPath}`);
+  return [...restored];
 }
 
 /**
@@ -215,6 +296,8 @@ function refreshFolder(folder) {
     deleteCachedSession(sessionId);
     deleteSearchSession(sessionId);
   }
+
+  restoreProjectsWithNewSessions(sessionsToUpsert);
 
   // Update folder mtime
   setFolderMeta(folder, folderProject, getFolderIndexMtimeMs(folderPath));
@@ -439,6 +522,7 @@ function populateCacheViaWorker() {
           };
         }));
       }
+      restoreProjectsWithNewSessions(sessions);
       setFolderMeta(folder, projectPath, indexMtimeMs);
     }
 
@@ -478,4 +562,5 @@ module.exports = {
   sendStatus,
   populateCacheViaWorker,
   refreshHarnessTitles,
+  initializeHiddenProjectTimestamps,
 };

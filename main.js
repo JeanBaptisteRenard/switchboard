@@ -273,13 +273,13 @@ sessionCache.init({
   db: {
     deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession,
     deleteSearchFolder, deleteSearchSession, upsertSearchEntries,
-    setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName,
+    setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, setSetting, getMeta, setName,
     updateCachedAiTitle, updateSearchTitle,
   },
 });
 const { refreshFolder, reconcileCacheFromFilesystem, buildProjectsFromCache,
         notifyRendererProjectsChanged, sendStatus, populateCacheViaWorker,
-        refreshHarnessTitles } = sessionCache;
+        refreshHarnessTitles, initializeHiddenProjectTimestamps } = sessionCache;
 
 // --- IPC: browse-folder ---
 ipcMain.handle('browse-folder', async () => {
@@ -302,6 +302,9 @@ ipcMain.handle('add-project', (_event, projectPath) => {
     const global = getSetting('global') || {};
     if (global.hiddenProjects && global.hiddenProjects.includes(projectPath)) {
       global.hiddenProjects = global.hiddenProjects.filter(p => p !== projectPath);
+      if (global.hiddenProjectTimestamps) {
+        delete global.hiddenProjectTimestamps[projectPath];
+      }
       setSetting('global', global);
     }
 
@@ -339,6 +342,10 @@ ipcMain.handle('remove-project', (_event, projectPath) => {
     const hidden = global.hiddenProjects || [];
     if (!hidden.includes(projectPath)) hidden.push(projectPath);
     global.hiddenProjects = hidden;
+    global.hiddenProjectTimestamps = {
+      ...(global.hiddenProjectTimestamps || {}),
+      [projectPath]: Date.now(),
+    };
     setSetting('global', global);
 
     // Clean up DB cache and search index for this folder
@@ -997,6 +1004,7 @@ ipcMain.handle('list-tasks-for-projects', (_event, projectPaths) => taskManager.
 ipcMain.handle('get-task-run', (_event, projectPath, label) => taskManager.getRun(projectPath, label));
 ipcMain.handle('start-task', (_event, projectPath, label) => taskManager.startTask(projectPath, label));
 ipcMain.handle('stop-task', (_event, projectPath, label) => taskManager.stopTask(projectPath, label));
+ipcMain.handle('stop-all-tasks', (_event, projectPath) => taskManager.stopAllTasks(projectPath));
 ipcMain.handle('restart-task', (_event, projectPath, label) => taskManager.restartTask(projectPath, label));
 ipcMain.on('task-input', (_event, projectPath, label, data) => taskManager.sendInput(projectPath, label, data));
 ipcMain.on('task-resize', (_event, projectPath, label, cols, rows) => taskManager.resize(projectPath, label, cols, rows));
@@ -1805,6 +1813,7 @@ if (!gotSingleInstanceLock) {
 
   app.whenReady().then(() => {
     buildMenu();
+    initializeHiddenProjectTimestamps();
     createWindow();
     startProjectsWatcher();
     startHarnessWatchers();

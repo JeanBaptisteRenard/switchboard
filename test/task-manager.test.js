@@ -64,6 +64,23 @@ test('starts a shell task, retains output, accepts input, and stops it', async (
 
   assert.deepEqual(manager.stopTask('/project', 'dev'), { ok: true });
   assert.equal(manager.getRun('/project', 'dev').state, 'stopped');
+  assert.match(manager.getRun('/project', 'dev').output, /\[Task stopped\]/);
+});
+
+test('starts a process task through the login shell with quoted argv', async () => {
+  const task = {
+    label: 'server', type: 'process', executable: 'tool with spaces', args: ['serve', 'two words'],
+    cwd: process.cwd(), env: {}, useShell: false, dependsOn: [], dependsOrder: 'parallel', supported: true,
+  };
+  const { manager, spawns } = makeManager([task]);
+
+  manager.startTask('/project', 'server');
+  await nextTurn();
+
+  assert.equal(spawns.length, 1);
+  assert.equal(spawns[0].executable, '/bin/zsh');
+  assert.deepEqual(spawns[0].args.slice(0, -1), ['-l', '-i', '-c']);
+  assert.equal(spawns[0].args.at(-1), "'tool with spaces' 'serve' 'two words'");
 });
 
 test('runs compound dependencies in parallel and combines their logs', async () => {
@@ -88,6 +105,7 @@ test('runs compound dependencies in parallel and combines their logs', async () 
   assert.equal(manager.getRun('/project', 'all').state, 'running');
   spawns[1].process.exit(0);
   assert.equal(manager.getRun('/project', 'all').state, 'exited');
+  assert.match(manager.getRun('/project', 'all').output, /\[Task exited with code 0\]/);
 });
 
 test('reports unsupported and missing tasks without spawning', () => {
@@ -97,4 +115,23 @@ test('reports unsupported and missing tasks without spawning', () => {
   assert.match(manager.startTask('/project', 'docker').error, /not supported/);
   assert.match(manager.startTask('/project', 'missing').error, /was not found/);
   assert.equal(spawns.length, 0);
+});
+
+test('stop all is scoped to one project and stops every running task there', async () => {
+  const task = label => ({
+    label, type: 'process', executable: 'node', args: [label], cwd: process.cwd(), env: {},
+    useShell: false, dependsOn: [], dependsOrder: 'parallel', supported: true,
+  });
+  const { manager, spawns } = makeManager([task('api'), task('web')]);
+  manager.startTask('/project', 'api');
+  manager.startTask('/project', 'web');
+  manager.startTask('/other-project', 'api');
+  await nextTurn();
+  assert.equal(spawns.length, 3);
+
+  assert.deepEqual(manager.stopAllTasks('/project'), { ok: true, stopped: 2 });
+  assert.equal(manager.getRun('/project', 'api').state, 'stopped');
+  assert.equal(manager.getRun('/project', 'web').state, 'stopped');
+  assert.equal(manager.getRun('/other-project', 'api').state, 'running');
+  manager.shutdown();
 });

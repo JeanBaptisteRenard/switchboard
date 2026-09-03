@@ -3159,6 +3159,35 @@ body { display: flex; flex-direction: column; }
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.task-popover-stop-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 5px;
+  color: #b65a6c;
+  background: transparent;
+  font: inherit;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+}
+
+.task-popover-stop-all:hover {
+  color: #e26b7e;
+  background: rgba(224,80,112,0.1);
+}
+
+.task-popover-stop-all:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .task-popover-error {
@@ -3167,6 +3196,13 @@ body { display: flex; flex-direction: column; }
   font-size: 11px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.task-popover-empty {
+  padding: 10px 8px 11px;
+  color: #85859b;
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .task-popover-row {
@@ -3191,24 +3227,6 @@ body { display: flex; flex-direction: column; }
 .task-popover-row.unsupported {
   opacity: 0.55;
   cursor: default;
-}
-
-.task-row-icon {
-  width: 20px;
-  height: 20px;
-  flex: 0 0 20px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: #8d93ff;
-}
-
-.task-running-pulse {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #3ecf5a;
-  box-shadow: 0 0 7px rgba(62,207,90,0.6);
 }
 
 .task-row-copy {

@@ -31,6 +31,7 @@ straight away. At least one CLI always stays on.
 
 - **Session Browser** — All your sessions from every supported CLI, organized by project, searchable by content
 - **Built-in Terminal** — Connect to running sessions or launch new ones without leaving the app
+- **Project Tasks & Server Logs** — Run `.vscode/tasks.json` commands from a compact project or worktree menu and view their live logs in the built-in terminal
 - **Status Notifications** — In-app alerts when a session is waiting for permission approval or user input
 - **Fork & Resume** — Branch off from any point in a session's history
 - **Full-Text Search** — Find any session by what was discussed, not just when it happened
@@ -39,6 +40,67 @@ straight away. At least one CLI always stays on.
 - **Plans & Memory** (Claude only) — Browse and edit your plan files and CLAUDE.md memory in one place
 - **Activity Stats** — Heatmap of your coding activity across all projects
 - **Session Names** (Claude only) — Picks up session names from Claude Code's `/rename` command automatically
+
+## Project Tasks and Server Logs
+
+Switchboard can run the commands in a project's `.vscode/tasks.json` without
+requiring a debugger. Use it for development servers, workers, asset watchers,
+test suites, or any other long-running project command whose output you want to
+keep beside your coding sessions.
+
+- **Compact task launcher** — A play button appears in each project header. In
+  worktree headers it appears between the hide and new-session buttons when you
+  hover, and stays visible while a task is running.
+- **Live, retained logs** — Selecting a task opens its terminal in the main
+  pane. Output is retained when you switch to another session or task, and the
+  selected task view is restored after a renderer reload.
+- **Independent lifecycle** — Tasks run separately from Claude and Codex
+  sessions. Stop or restart them from the terminal header without altering an
+  agent transcript.
+- **Project and worktree scope** — Commands run with the selected project or
+  worktree as `${workspaceFolder}`. A worktree inherits its parent project's
+  tasks when it has no `.vscode/tasks.json` of its own; a worktree-local file
+  overrides the inherited one.
+- **Compound stacks** — `dependsOn` tasks can start several services in
+  parallel, making one-click API + worker + frontend stacks possible. Stopping
+  the compound stops its child tasks.
+
+For example:
+
+```jsonc
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "API server",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": ["-m", "uvicorn", "app.main:app", "--reload"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true
+    },
+    {
+      "label": "Frontend",
+      "type": "npm",
+      "script": "dev",
+      "isBackground": true
+    },
+    {
+      "label": "Full stack",
+      "dependsOn": ["API server", "Frontend"],
+      "dependsOrder": "parallel"
+    }
+  ]
+}
+```
+
+Switchboard reads JSON with comments and trailing commas and currently supports
+`shell`, `process`, and `npm` tasks, `dependsOn`/`dependsOrder`, task working
+directories and environment variables, platform overrides, and an optional
+`options.envFile`. Common workspace, home, path-separator, and `${env:NAME}`
+variables are expanded. Debug adapters, breakpoints, VS Code command/input
+variables, and problem-matcher diagnostics are outside the current scope; the
+feature is intentionally focused on running commands and seeing their logs.
 
 ## Session Grid Overview
 

@@ -124,10 +124,12 @@ function createTaskManager(options) {
 
   function spawnSpec(task, projectPath) {
     if (!fs.existsSync(task.cwd)) throw new Error(`Task working directory does not exist: ${task.cwd}`);
-    if (!task.useShell) {
-      return { executable: task.executable, args: task.args, cwd: task.cwd };
-    }
 
+    // Always launch tasks through the selected login shell. Packaged desktop
+    // apps inherit a minimal environment from LaunchServices, while the login
+    // shell restores the user's PATH (Homebrew, nvm, pyenv, and similar).
+    // Process-task executables and arguments remain individually quoted below,
+    // so they do not gain shell-expression semantics.
     const profile = options.getShellProfile(projectPath);
     const shell = profile.path;
     const extraArgs = [...(profile.args || [])];
@@ -155,6 +157,10 @@ function createTaskManager(options) {
   }
 
   function finishRun(run, exitCode, signal) {
+    const exitDescription = run.stopRequested
+      ? 'Task stopped'
+      : `Task exited${exitCode == null ? '' : ` with code ${exitCode}`}${signal ? ` (signal ${signal})` : ''}`;
+    appendOutput(run, `\r\n[${exitDescription}]\r\n`);
     run.endedAt = Date.now();
     run.exitCode = exitCode;
     run.signal = signal;
@@ -285,6 +291,18 @@ function createTaskManager(options) {
     return startTask(projectPath, label);
   }
 
+  function stopAllTasks(projectPath) {
+    const activeRuns = [...runs.values()]
+      .filter(run => run.projectPath === projectPath && run.state === 'running')
+      .sort((a, b) => Number(b.virtual) - Number(a.virtual));
+    for (const run of activeRuns) {
+      // Stopping a compound marks its children too, so do not kill the same
+      // process a second time when those child runs are visited below.
+      if (!run.stopRequested && run.state === 'running') stopTask(projectPath, run.label);
+    }
+    return { ok: true, stopped: activeRuns.length };
+  }
+
   function sendInput(projectPath, label, data) {
     const run = runs.get(taskKey(projectPath, label));
     const targets = run?.virtual ? [...run.children].map(key => runs.get(key)) : [run];
@@ -356,6 +374,7 @@ function createTaskManager(options) {
 
   function listTasks(projectPath) {
     ensureWatch(projectPath);
+    const taskSource = taskFileForWorkspace(projectPath);
     try {
       const tasks = loadTasks(projectPath);
       return {
@@ -365,9 +384,10 @@ function createTaskManager(options) {
           run: serializeRun(runs.get(taskKey(projectPath, task.label))),
         })),
         error: null,
+        hasTaskFile: !!taskSource,
       };
     } catch (error) {
-      return { tasks: [], error: error.message };
+      return { tasks: [], error: error.message, hasTaskFile: !!taskSource };
     }
   }
 
@@ -396,6 +416,7 @@ function createTaskManager(options) {
     sendInput,
     shutdown,
     startTask,
+    stopAllTasks,
     stopTask,
   };
 }

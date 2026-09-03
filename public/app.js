@@ -110,8 +110,24 @@ let searchMatchProjectPaths = null; // Set<string> of project paths matched by n
 // OSC 0 idle signal is the authoritative source for marking sessions as idle.
 //
 const attentionSessions = new Set(); // sessions needing user action (OSC 9)
-const responseReadySessions = new Set(); // Claude finished, user hasn't looked (terminal state)
+const responseReadySessions = new Set(); // CLI finished, user hasn't looked (terminal state)
 const sessionBusyState = new Map(); // sessionId → boolean (currently active)
+
+// Some CLIs (notably Codex) start under a temporary ID and are re-keyed once
+// their transcript appears. Activity often begins before that detection, so it
+// must move with the rest of the session or the eventual idle event will have
+// no matching busy state to transition from.
+function rekeySessionActivity(oldId, newId) {
+  if (oldId === newId) return;
+
+  if (attentionSessions.delete(oldId)) attentionSessions.add(newId);
+  if (responseReadySessions.delete(oldId)) responseReadySessions.add(newId);
+  if (sessionBusyState.has(oldId)) {
+    sessionBusyState.set(newId, sessionBusyState.get(oldId));
+    sessionBusyState.delete(oldId);
+  }
+  if (activePtyIds.delete(oldId)) activePtyIds.add(newId);
+}
 
 // Central activity dispatcher
 function setActivity(sessionId, active) {
@@ -222,6 +238,7 @@ window.api.onSessionDetected((tempId, realId) => {
 
   entry.session.sessionId = realId;
   if (activeSessionId === tempId) setActiveSession(realId);
+  rekeySessionActivity(tempId, realId);
 
   // Re-key in openSessions
   openSessions.delete(tempId);
@@ -261,6 +278,7 @@ window.api.onSessionForked((oldId, newId) => {
 
   entry.session.sessionId = newId;
   if (activeSessionId === oldId) setActiveSession(newId);
+  rekeySessionActivity(oldId, newId);
 
   openSessions.delete(oldId);
   openSessions.set(newId, entry);
@@ -365,8 +383,11 @@ window.api.onTerminalNotification((sessionId, message, kind) => {
     const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
     if (item) item.classList.add('needs-attention');
   } else if (kind === 'idle') {
-    // The turn finished — mark the session as having a response to read.
-    setActivity(sessionId, false);
+    // A completion notification is authoritative even if a quick turn never
+    // produced a busy frame, or its busy state arrived under a temporary ID.
+    // Active sessions are already being viewed, so they only need to go idle.
+    if (sessionId === activeSessionId) setActivity(sessionId, false);
+    else markUnread(sessionId);
   }
 
   // Show in header if active

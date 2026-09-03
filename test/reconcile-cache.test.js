@@ -15,6 +15,15 @@ function writeSession(folderPath, cwd) {
   fs.writeFileSync(path.join(folderPath, 'session.jsonl'), line + '\n', 'utf8');
 }
 
+function writeNamedSession(folderPath, cwd, sessionId, timestamp) {
+  fs.mkdirSync(folderPath, { recursive: true });
+  const line = JSON.stringify({
+    type: 'user', cwd, timestamp,
+    message: { role: 'user', content: 'hello' },
+  });
+  fs.writeFileSync(path.join(folderPath, sessionId + '.jsonl'), line + '\n', 'utf8');
+}
+
 // In-memory fake of the db layer that init() expects, recording which folders
 // actually got (re)indexed (i.e. had refreshFolder do work and upsert sessions).
 function makeFakeDb(metaMap, globalSettings = {}) {
@@ -38,6 +47,11 @@ function makeFakeDb(metaMap, globalSettings = {}) {
       getAllMeta() { return new Map(); },
       getAllCached() { return cachedRows; },
       getSetting(key) { return key === 'global' ? globalSettings : {}; },
+      setSetting(key, value) {
+        if (key !== 'global' || value === globalSettings) return;
+        for (const existingKey of Object.keys(globalSettings)) delete globalSettings[existingKey];
+        Object.assign(globalSettings, value);
+      },
       getMeta() { return null; },
       setName() {},
       updateCachedAiTitle(sessionId, aiTitle, runtime) {
@@ -83,6 +97,84 @@ test('reconcileCacheFromFilesystem indexes new and stale folders but skips up-to
   } finally {
     fs.rmSync(projectsDir, { recursive: true, force: true });
   }
+});
+
+test('a new session restores a hidden project', () => {
+  const projectsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-restore-hidden-'));
+  const projectPath = '/tmp/hidden-worktree';
+  const folder = 'hidden-worktree';
+  const hiddenAt = Date.now();
+  const settings = {
+    hiddenProjects: [projectPath],
+    hiddenProjectTimestamps: { [projectPath]: hiddenAt },
+  };
+
+  try {
+    writeNamedSession(
+      path.join(projectsDir, folder), projectPath, 'new-session',
+      new Date(hiddenAt + 1000).toISOString(),
+    );
+    const fake = makeFakeDb(new Map(), settings);
+    sessionCache.init({
+      PROJECTS_DIR: projectsDir, activeSessions: new Map(),
+      getMainWindow: () => null, log: console, db: fake.db,
+    });
+
+    sessionCache.refreshFolder(folder);
+
+    assert.deepEqual(settings.hiddenProjects, []);
+    assert.equal(settings.hiddenProjectTimestamps[projectPath], undefined);
+  } finally {
+    fs.rmSync(projectsDir, { recursive: true, force: true });
+  }
+});
+
+test('activity in an old session does not restore a hidden project', () => {
+  const projectsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-keep-hidden-'));
+  const projectPath = '/tmp/hidden-worktree';
+  const folder = 'hidden-worktree';
+
+  try {
+    const oldCreatedAt = Date.now() - 1000;
+    writeNamedSession(
+      path.join(projectsDir, folder), projectPath, 'old-session',
+      new Date(oldCreatedAt).toISOString(),
+    );
+    const sessionFile = path.join(projectsDir, folder, 'old-session.jsonl');
+    const hiddenAt = Math.max(Date.now(), fs.statSync(sessionFile).birthtimeMs + 1);
+    const settings = {
+      hiddenProjects: [projectPath],
+      hiddenProjectTimestamps: { [projectPath]: hiddenAt },
+    };
+    fs.appendFileSync(sessionFile, JSON.stringify({
+      type: 'assistant', timestamp: new Date(hiddenAt + 1000).toISOString(),
+      message: { role: 'assistant', content: 'new activity' },
+    }) + '\n');
+    const fake = makeFakeDb(new Map(), settings);
+    sessionCache.init({
+      PROJECTS_DIR: projectsDir, activeSessions: new Map(),
+      getMainWindow: () => null, log: console, db: fake.db,
+    });
+
+    sessionCache.refreshFolder(folder);
+
+    assert.deepEqual(settings.hiddenProjects, [projectPath]);
+  } finally {
+    fs.rmSync(projectsDir, { recursive: true, force: true });
+  }
+});
+
+test('hidden projects from older settings receive a baseline timestamp', () => {
+  const settings = { hiddenProjects: ['/tmp/legacy-hidden'] };
+  const fake = makeFakeDb(new Map(), settings);
+  sessionCache.init({
+    PROJECTS_DIR: os.tmpdir(), activeSessions: new Map(),
+    getMainWindow: () => null, log: console, db: fake.db,
+  });
+
+  sessionCache.initializeHiddenProjectTimestamps(12345);
+
+  assert.equal(settings.hiddenProjectTimestamps['/tmp/legacy-hidden'], 12345);
 });
 
 // --- codex folders ---
@@ -131,6 +223,35 @@ test('reconcile indexes codex date folders even though they have no folder proje
     });
     sessionCache.reconcileCacheFromFilesystem();
     assert.equal(second.indexedFolders.size, 0, 'up-to-date codex folder should be skipped');
+  } finally {
+    if (prevHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prevHome;
+    fs.rmSync(projectsDir, { recursive: true, force: true });
+    fs.rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test('a new Codex session also restores its hidden project', () => {
+  const projectsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-claude-'));
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-codex-'));
+  const prevHome = process.env.CODEX_HOME;
+  const projectPath = '/tmp/hidden-codex-project';
+  const hiddenAt = Date.parse('2026-08-25T00:00:00Z');
+  const settings = {
+    hiddenProjects: [projectPath],
+    hiddenProjectTimestamps: { [projectPath]: hiddenAt },
+  };
+  try {
+    process.env.CODEX_HOME = codexHome;
+    writeRollout(path.join(codexHome, 'sessions', '2026', '08', '26'), projectPath);
+    const fake = makeFakeDb(new Map(), settings);
+    sessionCache.init({
+      PROJECTS_DIR: projectsDir, activeSessions: new Map(),
+      getMainWindow: () => null, log: console, db: fake.db,
+    });
+
+    sessionCache.refreshFolder('codex/2026/08/26');
+
+    assert.deepEqual(settings.hiddenProjects, []);
   } finally {
     if (prevHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prevHome;
     fs.rmSync(projectsDir, { recursive: true, force: true });

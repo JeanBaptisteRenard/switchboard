@@ -54,7 +54,9 @@ function expandString(value, context) {
   return value.replace(/\$\{([^}]+)\}/g, (match, name) => {
     if (Object.prototype.hasOwnProperty.call(variables, name)) return variables[name];
     if (name.startsWith('env:')) return context.env?.[name.slice(4)] ?? '';
-    throw new Error(`Unsupported task variable ${match}`);
+    const error = new Error(`Unsupported task variable ${match}`);
+    error.unsupportedVariable = true;
+    throw error;
   });
 }
 
@@ -195,6 +197,29 @@ function normalizeTask(rawTask, root, context, key) {
   return normalized;
 }
 
+// Editor-context variables (${file}, ${relativeFile}, ${lineNumber}, ...) have no
+// value outside a focused editor, so a headless run can never resolve them. Keep
+// that task visible but unrunnable instead of failing the whole file with it.
+function unsupportedTask(rawTask, label, cwd, message) {
+  const detail = typeof rawTask?.detail === 'string' && !rawTask.detail.includes('${')
+    ? rawTask.detail
+    : '';
+  return {
+    label,
+    type: 'shell',
+    detail,
+    dependsOn: [],
+    dependsOrder: 'parallel',
+    isBackground: false,
+    cwd,
+    env: {},
+    presentation: rawTask?.presentation || {},
+    problemMatcher: undefined,
+    supported: false,
+    error: message,
+  };
+}
+
 function loadTasksFromText(text, options) {
   const workspaceFolder = path.resolve(options.workspaceFolder);
   const filePath = options.filePath || path.join(workspaceFolder, TASKS_RELATIVE_PATH);
@@ -212,7 +237,16 @@ function loadTasksFromText(text, options) {
     fallbackWorkspaceFolder: options.fallbackWorkspaceFolder,
   };
   const key = platformKey(options.platform);
-  const tasks = root.tasks.map(rawTask => normalizeTask(rawTask, root, context, key));
+  const tasks = root.tasks.map(rawTask => {
+    try {
+      return normalizeTask(rawTask, root, context, key);
+    } catch (error) {
+      const label = rawTask?.label || rawTask?.taskName;
+      // Without a label there is no row to degrade into, so let it fail the file.
+      if (!error?.unsupportedVariable || !label || typeof label !== 'string') throw error;
+      return unsupportedTask(rawTask, label, workspaceFolder, error.message);
+    }
+  });
   const duplicate = tasks.find((task, index) => tasks.findIndex(other => other.label === task.label) !== index);
   if (duplicate) throw new Error(`${filePath}: duplicate task label "${duplicate.label}"`);
   return tasks;

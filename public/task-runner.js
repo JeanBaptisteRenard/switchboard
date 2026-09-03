@@ -25,9 +25,10 @@ async function hydrateProjectTasks(projectLists) {
   let results;
   try { results = await window.api.listTasksForProjects(paths); } catch { return; }
   for (const project of projects) {
-    const result = results[project.projectPath] || { tasks: [], error: null };
+    const result = results[project.projectPath] || { tasks: [], error: null, hasTaskFile: false };
     project.tasks = result.tasks || [];
     project.taskError = result.error || null;
+    project.hasTaskFile = !!result.hasTaskFile;
   }
 }
 
@@ -36,7 +37,6 @@ function runningTaskCount(project) {
 }
 
 function createProjectTaskButton(project, worktree = false) {
-  if (!project.taskError && !(project.tasks || []).length) return null;
   const button = document.createElement('button');
   button.className = `project-task-btn${worktree ? ' worktree-task-btn' : ''}`;
   button.dataset.projectPath = project.projectPath;
@@ -59,7 +59,9 @@ function updateTaskButton(button, project) {
   }
   button.title = project?.taskError
     ? project.taskError
-    : (count ? `${count} task${count === 1 ? '' : 's'} running` : 'Run project task');
+    : (count
+      ? `${count} task${count === 1 ? '' : 's'} running`
+      : (project?.hasTaskFile ? 'Run project task' : 'Set up project tasks'));
 }
 
 function updateProjectTaskButtons(projectPath) {
@@ -87,7 +89,22 @@ function renderTaskPopover(project, popover) {
   popover.replaceChildren();
   const header = document.createElement('div');
   header.className = 'task-popover-header';
-  header.textContent = project.taskError ? 'Task configuration error' : 'Project tasks';
+  const headerLabel = document.createElement('span');
+  headerLabel.textContent = project.taskError ? 'Task configuration error' : 'Project tasks';
+  header.appendChild(headerLabel);
+  const runningCount = runningTaskCount(project);
+  if (!project.taskError && runningCount > 0) {
+    const stopAllButton = document.createElement('button');
+    stopAllButton.className = 'task-popover-stop-all';
+    stopAllButton.title = `Stop all ${runningCount} running task${runningCount === 1 ? '' : 's'}`;
+    stopAllButton.innerHTML = '<svg width="9" height="9" viewBox="0 0 12 12" fill="currentColor"><rect x="2" y="2" width="8" height="8" rx="1"/></svg><span>Stop all</span>';
+    stopAllButton.addEventListener('click', async event => {
+      event.stopPropagation();
+      stopAllButton.disabled = true;
+      await window.api.stopAllTasks(project.projectPath);
+    });
+    header.appendChild(stopAllButton);
+  }
   popover.appendChild(header);
 
   if (project.taskError) {
@@ -98,6 +115,16 @@ function renderTaskPopover(project, popover) {
     return;
   }
 
+  if (!(project.tasks || []).length) {
+    const empty = document.createElement('div');
+    empty.className = 'task-popover-empty';
+    empty.textContent = project.hasTaskFile
+      ? 'No tasks are configured in .vscode/tasks.json.'
+      : 'Create a .vscode/tasks.json to get started.';
+    popover.appendChild(empty);
+    return;
+  }
+
   for (const task of project.tasks || []) {
     const row = document.createElement('div');
     row.className = 'task-popover-row';
@@ -105,12 +132,6 @@ function renderTaskPopover(project, popover) {
     row.setAttribute('role', 'button');
     row.tabIndex = task.supported === false ? -1 : 0;
     row.dataset.taskLabel = task.label;
-
-    const icon = document.createElement('span');
-    icon.className = `task-row-icon${task.run?.running ? ' running' : ''}`;
-    icon.innerHTML = task.run?.running
-      ? '<span class="task-running-pulse"></span>'
-      : '<svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><path d="M4 2.8a1 1 0 0 1 1.52-.85l8 5.2a1 1 0 0 1 0 1.7l-8 5.2A1 1 0 0 1 4 13.2V2.8Z"/></svg>';
 
     const copy = document.createElement('span');
     copy.className = 'task-row-copy';
@@ -144,7 +165,7 @@ function renderTaskPopover(project, popover) {
         closeTaskPopover();
       }
     });
-    row.append(icon, copy, state, action);
+    row.append(copy, state, action);
 
     row.addEventListener('click', async () => {
       if (task.supported === false) return;
@@ -219,7 +240,10 @@ function createTaskLogView(projectPath, label) {
 
   terminal.onData(data => window.api.sendTaskInput(projectPath, label, data));
   terminal.onResize(({ cols, rows }) => window.api.resizeTask(projectPath, label, cols, rows));
-  const entry = { key, projectPath, label, terminal, fitAddon, element: container, loaded: false, queued: [] };
+  const entry = {
+    key, projectPath, label, terminal, fitAddon, element: container,
+    loading: false, outputMirror: '', queued: [],
+  };
   taskLogViews.set(key, entry);
   return entry;
 }
@@ -266,14 +290,29 @@ async function showTaskLog(projectPath, label) {
   entry.terminal.focus();
   fitTaskLog(entry);
 
-  const run = await window.api.getTaskRun(projectPath, label);
-  if (run && !entry.loaded) {
-    const queued = entry.queued.join('');
-    entry.terminal.write(run.output || '');
-    if (queued && !(run.output || '').endsWith(queued)) entry.terminal.write(queued);
-    entry.queued = [];
-    entry.loaded = true;
+  entry.loading = true;
+  entry.queued = [];
+  let run = null;
+  try {
+    run = await window.api.getTaskRun(projectPath, label);
+  } catch (error) {
+    run = {
+      projectPath, label, state: 'failed', running: false,
+      output: `\r\n[Could not load retained task output: ${error.message}]\r\n`,
+    };
   }
+  if (run) {
+    const queued = entry.queued.join('');
+    let retainedOutput = run.output || '';
+    if (queued && !retainedOutput.endsWith(queued)) retainedOutput += queued;
+    if (entry.outputMirror !== retainedOutput) {
+      entry.terminal.reset();
+      entry.terminal.write(retainedOutput);
+      entry.outputMirror = retainedOutput;
+    }
+  }
+  entry.queued = [];
+  entry.loading = false;
   updateTaskHeader(run || { projectPath, label, state: 'idle', running: false });
 }
 
@@ -297,8 +336,9 @@ async function runProjectTask(projectPath, label) {
 async function restartProjectTask(projectPath, label) {
   const entry = taskLogViews.get(taskViewKey(projectPath, label));
   if (entry) {
-    entry.terminal.clear();
-    entry.loaded = true;
+    entry.terminal.reset();
+    entry.outputMirror = '';
+    entry.loading = false;
     entry.queued = [];
   }
   await window.api.restartTask(projectPath, label);
@@ -334,8 +374,11 @@ async function restoreActiveTaskView() {
 window.api.onTaskOutput((projectPath, label, data) => {
   const entry = taskLogViews.get(taskViewKey(projectPath, label));
   if (!entry) return;
-  if (!entry.loaded) entry.queued.push(data);
-  else entry.terminal.write(data);
+  if (entry.loading) entry.queued.push(data);
+  else {
+    entry.outputMirror += data;
+    entry.terminal.write(data);
+  }
 });
 
 window.api.onTaskStateChanged(run => applyTaskRun(run));
@@ -348,6 +391,7 @@ window.api.onProjectTasksChanged(async projectPath => {
     if (!project) continue;
     project.tasks = result.tasks || [];
     project.taskError = result.error || null;
+    project.hasTaskFile = !!result.hasTaskFile;
   }
   closeTaskPopover();
   refreshSidebar();

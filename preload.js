@@ -40,6 +40,7 @@ contextBridge.exposeInMainWorld('api', {
   getTaskRun: (projectPath, label) => ipcRenderer.invoke('get-task-run', projectPath, label),
   startTask: (projectPath, label) => ipcRenderer.invoke('start-task', projectPath, label),
   stopTask: (projectPath, label) => ipcRenderer.invoke('stop-task', projectPath, label),
+  stopAllTasks: (projectPath) => ipcRenderer.invoke('stop-all-tasks', projectPath),
   restartTask: (projectPath, label) => ipcRenderer.invoke('restart-task', projectPath, label),
 
   browseFolder: () => ipcRenderer.invoke('browse-folder'),
