@@ -52,14 +52,14 @@ function drainViewerWatches() {
 })()
 
 function renderJsonlText(text) {
-  if (window.marked) {
+  if (window.marked && window.DOMPurify) {
     // Escape XML/HTML-like tags so they render as visible text,
     // but preserve markdown code blocks (which may contain HTML examples).
     const escaped = text.replace(/<(\/?[a-zA-Z][a-zA-Z0-9_-]*(?:\s[^>]*)?\/?)\>/g, '&lt;$1&gt;');
-    let html = window.marked.parse(escaped);
-    return html;
+    const html = window.marked.parse(escaped);
+    // see .ai/contexts/viewer-panel.md
+    return window.DOMPurify.sanitize(html);
   }
-  // Fallback if marked isn't loaded
   let html = escapeHtml(text);
   html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="jsonl-code-block"><code>$2</code></pre>');
   html = html.replace(/`([^`]+)`/g, '<code class="jsonl-inline-code">$1</code>');
