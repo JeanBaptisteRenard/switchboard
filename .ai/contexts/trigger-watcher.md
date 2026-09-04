@@ -6,7 +6,7 @@
 
 | File | LOC | Role |
 |---|---|---|
-| `trigger-watcher.js` | ~800 | The entire module: directory setup, `fs.watch` listener, idle-wait logic, single + chained trigger processing, submit-with-verify busy-rise/fall polling, input validation, PTY write, result file. |
+| `trigger-watcher.js` | ~1050 | The entire module: directory setup, `fs.watch` listener, idle-wait logic, single + chained trigger processing, submit-with-verify busy-rise/fall polling, input validation, PTY write, result file. |
 | `trigger-context.js` | ~35 | `createTriggerContext({ activeSessions, log })` — builds the whole `ctx` object out of `main.js`'s session map. |
 | `terminal-input.js` | ~20 | `handleTerminalInput(activeSessions, sessionId, data, now)` — the body of the `terminal-input` IPC handler; feeds `session.composerState`. |
 | `main.js` (wiring) | 3 | `require('./trigger-watcher').start(createTriggerContext({ activeSessions, log }))` in the `app.whenReady` block, right after `startScheduler`, plus the one-line `terminal-input` registration. |
@@ -169,16 +169,33 @@ jq -r 'select(.cat=="pty.input") | "\(.wall)\t\(.len)\t\(.at // "-")\t\(.cp // "
 jq -r 'select(.cat=="pty.input" and .cp) | .cp' $TRACE | sort | uniq -c | sort -rn
 ```
 
-**Take four control shots, not two.** The two measurements taken so far were
-n=1 per condition and varied the pointer while the CLI's own activity varied
-with it, so they could not tell the two apart — and the fix they motivated
-addressed the wrong factor. Run the full grid: {CLI idle, CLI busy — a task
-spawning subagents} × {pointer resting over the terminal, pointer moved off the
-window}. In each cell: empty the composer with Ctrl+U, touch nothing, drop a
-trigger, and record both the result (`waited_ms`, refusal or not) and the
-`pty.input` lines in that window. The culprit is whichever factor moves the
-chunk rate, and the chunks to look for push the quiet clock while leaving
-`pending` at 0 — which excludes X10 and history recall by construction.
+**Corrected — the pointer was never the axis to vary.** The paragraph above
+already rules it out on its own terms: Claude Code never turns on motion
+tracking and xterm.js de-duplicates identical motion, so a resting pointer
+cannot put anything on `pty.input` to begin with. A grid that varies pointer
+position measures nothing the CLI's own querying doesn't already explain — the
+2026-09-02 measurement that seemed to implicate the pointer (§ above, PR #160)
+most likely compared two runs where the CLI's own background querying happened
+to differ, not two pointer positions; that confound is exactly why n=1 per
+condition couldn't tell the two apart.
+
+**What actually resolved it: arm the trace on a session with nobody at the
+keyboard.** The absence of a human, not the pointer, is the control — everything
+`pty.input` records in that window is machine-originated by construction. A
+340 s trace of two idle sessions this way (2026-09-04) put a number on the
+suspects this section used to call unproven: of 2,422 chunks, 1,427 (59%) were
+CPR / DECXCPR (`CSI [?] row;col[;page] R`) — the terminal answering a
+cursor-position query the CLI issues on its own roughly every 240 ms — against
+495 (20%) SGR mouse reports, which PR #160 already excluded correctly and which
+were not the cause. `reportLength()` did not recognise CPR, so every one of
+those chunks kept resetting the quiet clock, and any session left open on
+screen could keep the 3000 ms window from ever opening. See PR #170 (open at
+the time of writing) for the fix and the full breakdown.
+
+One reading pitfall worth flagging for whoever re-runs this: `pty.input`'s `cp`
+field is capped at 10 code points (see `docs/activity-trace.md`), so a longer
+escape sequence can show up in the trace without its final byte. Classify a
+shape from the full chunk or its length, not from a truncated `cp` alone.
 
 The SGR-and-focus exemption above (PR #160) is correct and worth keeping, but it
 **cannot** be the cause of this symptom: exempting mouse reports cannot quiet a
