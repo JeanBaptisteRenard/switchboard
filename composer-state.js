@@ -152,11 +152,14 @@ function matchEscape(buf, i) {
 }
 
 // ── Terminal reports ─────────────────────────────────────────────────────────
-// Mouse and focus reports ride the same channel as keystrokes but are not user
-// input: neither text nor activity. Recognition is deliberately strict — see
-// .ai/contexts/trigger-watcher.md.
+// Mouse, focus and cursor-position reports ride the same channel as
+// keystrokes but are not user input: neither text nor activity. Recognition
+// is deliberately strict — see .ai/contexts/trigger-watcher.md.
 
 const SGR_MOUSE_PARAMS_RE = /^<\d{1,10};\d{1,10};\d{1,10}$/;
+
+// CPR / DECXCPR: `CSI [?] row ; col [; page] R` — see .ai/contexts/trigger-watcher.md.
+const CPR_PARAMS_RE = /^\??\d{1,4};\d{1,4}(?:;\d{1,4})?$/;
 
 /**
  * How many bytes of terminal report start at the sequence `seq` just matched.
@@ -169,6 +172,8 @@ function reportLength(seq) {
   if ((final === 'M' || final === 'm') && SGR_MOUSE_PARAMS_RE.test(params)) return seq.len;
   // Focus in / focus out (CSI ?1004h).
   if ((final === 'I' || final === 'O') && params === '') return seq.len;
+  // Cursor position report.
+  if (final === 'R' && CPR_PARAMS_RE.test(params)) return seq.len;
   return 0;
 }
 
