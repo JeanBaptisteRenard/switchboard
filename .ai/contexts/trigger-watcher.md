@@ -100,6 +100,17 @@ serialization" tests, for same-session ordering and cross-session
 independence, both proved by write-order assertions rather than by inspecting
 the lock directly.
 
+**Interaction with the target guard.** The lock is acquired before the target
+guard ever runs (both sit inside the same outer `try`), so a guard refusal —
+single command or a chain refused at step 0 — is itself a lock holder for the
+brief moment it takes to write its result and `return`. That `return` runs the
+same `finally` as every other exit path, so the lock is released exactly like
+a success would release it; the only visible cost is a rejected trigger
+briefly occupying the front of the queue. Proved by two tests under "Target
+guard" that queue a legitimate trigger for the same session right behind a
+refused one and require it to still produce a result — and by mutating the
+release call itself to confirm those tests go red when it stops firing.
+
 **Liveness is probed after the waits, never before them.** `isPtyAlive` runs
 once as a pre-flight, then again *after* `waitForComposerFree` on the
 single-`command` path and on every chain step. A probe taken before a wait that
@@ -696,7 +707,11 @@ does not credit it with more than it does.
 through it before `!==`. It folds: separator style (`path.normalize`,
 platform-aware), a trailing separator (except a bare root), the `\\?\` and
 `\\?\UNC\` long-path prefixes, and — on Windows only — case (NTFS/ReFS are
-case-insensitive; POSIX is left case-sensitive, matching ext4). It does
+case-insensitive; POSIX is left case-sensitive, matching ext4). The bare-root
+exemption checks `n !== path.sep` rather than a length threshold: a length
+guard degrades silently the moment `path.sep` is a single character, which it
+always is on every platform this runs on, so a POSIX/UNC-style root would
+otherwise be one edit away from being stripped down to `""`. It does
 **not** fold: 8.3 short names (`JEAN-B~1`) against their long form, a
 substituted drive (`subst`) against its real target, or a junction/symlink
 against the real folder it points at — two spellings of the same real
@@ -737,7 +752,7 @@ Malformed `expectedCwd` (present, not a non-empty string) is refused earlier
 still, in shape validation (3c), before the session lookup — the same
 ordering `wait` and `timeout_ms` already use.
 
-**Rétrocompatible sans condition.** No `expectedCwd` in the trigger means the
+**Unconditionally backward-compatible.** No `expectedCwd` in the trigger means the
 guard block is never entered; behaviour is byte-for-byte what it was before
 this field existed. A `ctx.getPtyForSession` that still returns bare
 `{ ptyProcess }` (an older or a test-only `ctx`) reads as `cwd: undefined`,

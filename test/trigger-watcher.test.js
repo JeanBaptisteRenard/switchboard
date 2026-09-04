@@ -3973,6 +3973,18 @@ test('normalizeCwd: a trailing separator is stripped and a genuinely different p
     'a genuinely different path must not be folded together');
 });
 
+// The Windows drive root ("C:\") is exempted twice over (the regex below AND
+// the length guard), but a bare POSIX/UNC-style root -- exactly path.sep,
+// one character long on POSIX -- was, before this test existed, protected
+// ONLY by `n.length > 1`. That guard alone must not be trusted: it stops
+// working the instant path.sep is a single character, which it always is.
+test('normalizeCwd: a bare root (exactly path.sep) is never collapsed to an empty string', () => {
+  const { normalizeCwd } = require('../trigger-watcher');
+
+  assert.equal(normalizeCwd(path.sep), path.sep,
+    'the root must round-trip unchanged, not be stripped down to ""');
+});
+
 test('normalizeCwd: malformed input always returns null, regardless of platform', () => {
   const { normalizeCwd } = require('../trigger-watcher');
 
@@ -4153,9 +4165,11 @@ test('target guard: a malformed expectedCwd (empty string) is refused before any
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
 
     const { start } = require('../trigger-watcher');
-    // No session registered at all -- if this reaches session lookup it fails
-    // with "session not found" instead, so reaching the expectedCwd shape
-    // error at all proves the ordering.
+    // makeCtx registers a session under this id (with no cwd) despite its
+    // name -- so without the shape check below, this would reach the target
+    // guard and be refused there instead, as "cwd indeterminate"
+    // (targetCwdUnknown), never "session not found". Reaching the
+    // expectedCwd shape error specifically is what proves the ordering.
     const ctx = makeCtx('nonexistent-session', () => false);
     watcher = start(ctx);
 
@@ -4213,6 +4227,108 @@ test('target guard: a mismatched expectedCwd on a chain refuses the whole chain 
     assert.equal(result.steps, undefined, 'a refused chain must not report any steps at all, not even zero');
     assert.equal(result.partial, undefined, 'a refusal before the chain starts is not a partial chain');
     assert.deepEqual(ctx._written, [], 'no chain step may write anything once the guard refuses');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// ── Target guard refusal vs. the per-session lock ────────────────────────────
+// see .ai/contexts/trigger-watcher.md, "Session serialization" ("Interaction
+// with the target guard")
+
+test('target guard: a refusal (single command) releases the session lock -- a legitimate trigger right behind it still runs', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-guard-lock-single-' + Date.now();
+    const realCwd    = path.join(os.tmpdir(), 'sw-guard-lock-test', 'real');
+    const ctx = makeCtx(SESSION_ID, () => false, { cwd: realCwd });
+    watcher = start(ctx);
+
+    const uuidA = 'guard-lock-single-a-' + Date.now();
+    const uuidB = 'guard-lock-single-b-' + Date.now();
+    // A: refused by the target guard (wrong expectedCwd). Waited out to
+    // completion BEFORE B is even written, so there is no race: whatever A
+    // did to the lock (hold it, release it, leak it) is already done by the
+    // time B asks for it.
+    writeTrigger(tmp, uuidA, {
+      sessionId: SESSION_ID, wait: 'none', command: 'AAAA',
+      expectedCwd: path.join(os.tmpdir(), 'sw-guard-lock-test', 'wrong-agent'),
+    });
+    const resultPathA = path.join(tmp, 'processed', uuidA + '.result.json');
+    await waitForFile(resultPathA, 2000);
+
+    // B: an ordinary, unguarded trigger on the SAME session. If A's refusal
+    // ever left the lock held, B waits forever and its result file never
+    // appears -- waitForFile below times out.
+    writeTrigger(tmp, uuidB, { sessionId: SESSION_ID, wait: 'none', command: 'BBBB' });
+    const resultPathB = path.join(tmp, 'processed', uuidB + '.result.json');
+    await waitForFile(resultPathB, 2000);
+
+    const resultA = readResult(path.join(tmp, 'processed'), uuidA);
+    const resultB = readResult(path.join(tmp, 'processed'), uuidB);
+    assert.equal(resultA.ok, false);
+    assert.equal(resultA.targetMismatch, true);
+    assert.equal(resultB.ok, true,
+      'a legitimate trigger for the same session must still go through after a preceding refusal');
+    assert.ok(ctx._written.includes('BBBB'),
+      'the second trigger must have actually reached the PTY, not just resolved a stale write');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('target guard: a chain refused at step 0 releases the session lock -- a legitimate trigger right behind it still runs', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-guard-lock-chain-' + Date.now();
+    const realCwd    = path.join(os.tmpdir(), 'sw-guard-lock-test', 'real');
+    const ctx = makeCtx(SESSION_ID, () => false, { cwd: realCwd });
+    watcher = start(ctx);
+
+    const uuidA = 'guard-lock-chain-a-' + Date.now();
+    const uuidB = 'guard-lock-chain-b-' + Date.now();
+    // A: a chain refused before step 0 ever runs (wrong expectedCwd). Waited
+    // out to completion before B is written -- see the single-command
+    // variant above for why this removes the race.
+    writeTrigger(tmp, uuidA, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      expectedCwd: path.join(os.tmpdir(), 'sw-guard-lock-test', 'wrong-agent'),
+      chain: [{ command: 'AAAA' }],
+    });
+    const resultPathA = path.join(tmp, 'processed', uuidA + '.result.json');
+    await waitForFile(resultPathA, 2000);
+
+    writeTrigger(tmp, uuidB, { sessionId: SESSION_ID, wait: 'none', command: 'BBBB' });
+    const resultPathB = path.join(tmp, 'processed', uuidB + '.result.json');
+    await waitForFile(resultPathB, 2000);
+
+    const resultA = readResult(path.join(tmp, 'processed'), uuidA);
+    const resultB = readResult(path.join(tmp, 'processed'), uuidB);
+    assert.equal(resultA.ok, false);
+    assert.equal(resultA.targetMismatch, true);
+    assert.equal(resultB.ok, true,
+      'a legitimate trigger for the same session must still go through after a chain refused at step 0');
+    assert.ok(ctx._written.includes('BBBB'),
+      'the second trigger must have actually reached the PTY, not just resolved a stale write');
 
   } finally {
     if (watcher) watcher.close();

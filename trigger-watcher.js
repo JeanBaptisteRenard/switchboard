@@ -147,7 +147,9 @@ function normalizeCwd(p) {
     n = n.toLowerCase();
   }
   // Strip one trailing separator, but never collapse a bare root ("C:\", "/").
-  if (n.length > 1 && n.endsWith(path.sep) &&
+  // see .ai/contexts/trigger-watcher.md, "Target guard" for why this is an
+  // explicit n !== path.sep check rather than a length threshold.
+  if (n.endsWith(path.sep) && n !== path.sep &&
       !(process.platform === 'win32' && /^[a-z]:\\$/.test(n))) {
     n = n.slice(0, -1);
   }
