@@ -1125,6 +1125,7 @@ document.querySelectorAll('.sidebar-tab').forEach(tab => {
 // Grid view → grid-view.js
 // Initialize grid observers now that DOM refs are ready
 initGridObservers();
+initGridGroupToggle();
 
 // JSONL viewer (renderJsonlText, formatDuration, makeCollapsible, renderJsonlEntry, showJsonlViewer) → jsonl-viewer.js
 

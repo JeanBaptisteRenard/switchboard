@@ -186,6 +186,7 @@ const rendererCrossFileGlobals = {
   focusGridCard: 'readonly',
   wrapInGridCard: 'readonly',
   initGridObservers: 'readonly',
+  initGridGroupToggle: 'readonly',
   initFilePanel: 'readonly',
   openFileInPanel: 'readonly',
   rekeyFilePanelState: 'readonly',
