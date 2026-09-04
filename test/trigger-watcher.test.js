@@ -4141,6 +4141,77 @@ test('submitted: busy observed between a step\'s text write and its own Enter mu
   }
 });
 
+// The test above (and its chain twin) both assert busy synchronously AT the
+// text write -- t=0 of the text->Enter window. A single sample taken at t=0
+// catches that, which is why neither test can see this gap: `midBusy` used to
+// sample once, at t=0, and the suite runs with SWITCHBOARD_SUBMIT_ENTER_DELAY_MS
+// forced to 1ms (top of file) for speed, leaving no window in between for a
+// mid-window sample to differ from a t=0 sample anyway. This test overrides
+// the delay to DEFAULT_SUBMIT_ENTER_DELAY_MS's own real value (50ms) and
+// asserts busy strictly AFTER the text write and while it is still true when
+// the Enter is written -- proving `midBusy` must poll the window, not sample
+// its edges.
+test('submitted: busy asserted mid-window (not at the text write itself) between text and Enter must still gate confirmed', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+    // Realistic delay -- not the suite's 1ms -- so a mid-window sample has
+    // somewhere to land that a t=0 (or t=delay) sample would also land on;
+    // see the busy schedule below for why only continuous polling catches it.
+    process.env.SWITCHBOARD_SUBMIT_ENTER_DELAY_MS = '50';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-midbusy-window-' + Date.now();
+    const COMMAND = 'resume the task';
+    let scheduleStart = null;
+    let busy = false;
+    const ctx = makeCtx(SESSION_ID, () => busy);
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      if (data === COMMAND) {
+        // Text write at t=0. Busy stays FALSE here -- unlike the t=0 test
+        // above -- so a sample taken only at the start of the delay misses
+        // it, exactly like a sample taken only at t=0 would in production.
+        scheduleStart = Date.now();
+      }
+    };
+    // Busy rises at t=20ms (inside the 50ms text->Enter delay, well after its
+    // start) and is still true at t=50ms when the Enter is written, and
+    // beyond -- so it is there for submitWithVerify's own post-Enter poll too
+    // (sawBusy on the very first tick), isolating midBusy as the only gate
+    // that can still stop this from reading "confirmed".
+    ctx.isSessionBusy = (id) => {
+      if (id !== SESSION_ID || scheduleStart === null) return false;
+      return (Date.now() - scheduleStart) >= 20;
+    };
+    watcher = start(ctx);
+
+    const uuid = 'midbusy-window-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, wait: 'none', command: COMMAND });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submit_retries, 0,
+      'precondition: busy was already true by the time the post-Enter poll started');
+    assert.notEqual(result.submitted, 'confirmed',
+      'busy rising mid-delay, well before this command\'s own Enter was sent, must still gate confirmed -- ' +
+      'a sample taken only at the start (or only at the end) of the window must not be trusted alone');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    process.env.SWITCHBOARD_SUBMIT_ENTER_DELAY_MS = '1';
+    cleanup(tmp);
+  }
+});
+
 // ── Session serialization ────────────────────────────────────────────────────
 
 test('session serialization: two triggers on the same session run one after another, never in parallel', async () => {

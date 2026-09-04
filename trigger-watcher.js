@@ -102,23 +102,49 @@ function defaultIsPtyAlive(ptyProcess) {
   }
 }
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// Poll interval (ms) for `delayWithBusyPoll` below. Deliberately finer than
+// IDLE_POLL_INTERVAL (100ms): the text->Enter delay this polls across is only
+// DEFAULT_SUBMIT_ENTER_DELAY_MS (50ms) long in production, so a 100ms poll
+// interval would sample it once at best -- no better than the single sample
+// this replaces.
+const MID_BUSY_POLL_INTERVAL_MS = 5; // ms
+
+// Poll `ctx.isSessionBusy` at MID_BUSY_POLL_INTERVAL_MS granularity for the
+// full `ms` duration, returning true if busy was observed at ANY point in the
+// window -- not just at the start or the end of it. Total elapsed time is
+// bounded to exactly `ms`, same as a plain `delay(ms)`; this only changes
+// what happens during the wait, not how long it lasts.
+function delayWithBusyPoll(ms, sessionId, ctx) {
+  const deadline = Date.now() + ms;
+  return new Promise((resolve) => {
+    let sawBusy = false;
+    function tick() {
+      if (ctx.isSessionBusy(sessionId)) sawBusy = true;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return resolve(sawBusy);
+      setTimeout(tick, Math.min(MID_BUSY_POLL_INTERVAL_MS, remaining)).unref();
+    }
+    tick();
+  });
 }
 
 // Submit a command to a PTY the way a human terminal does: write the text,
 // then send Enter as a SEPARATE write so it is read as a discrete "submit"
 // keypress rather than a trailing newline. See DEFAULT_SUBMIT_ENTER_DELAY_MS.
 //
-// Returns `midBusy`: busy sampled AFTER the text write but BEFORE the Enter
-// write. Busy observed here cannot be attributed to an Enter that has not
-// been sent yet -- see .ai/contexts/trigger-watcher.md ("submitted") and the
-// "composerConfirmed" gate in submitWithVerify, which this narrows.
+// Returns `midBusy`: busy polled continuously between the text write and the
+// Enter write, true if observed at any point in that window. A single sample
+// -- at the start, or at the end -- can miss a busy that rises and falls
+// entirely inside the window, which is a real, reproduced case (see
+// .ai/contexts/trigger-watcher.md, "submitted"), not a hypothetical one:
+// busy observed anywhere here cannot be attributed to an Enter that had not
+// been sent yet. See the "composerConfirmed" gate in submitWithVerify, which
+// this narrows.
 async function submitToPty(ptyProcess, command, sessionId, ctx) {
   ptyProcess.write(command);
-  const midBusy = ctx.isSessionBusy(sessionId);
   const envMs = envNumber('SWITCHBOARD_SUBMIT_ENTER_DELAY_MS');
-  await delay(envMs !== undefined ? envMs : DEFAULT_SUBMIT_ENTER_DELAY_MS);
+  const delayMs = envMs !== undefined ? envMs : DEFAULT_SUBMIT_ENTER_DELAY_MS;
+  const midBusy = await delayWithBusyPoll(delayMs, sessionId, ctx);
   ptyProcess.write('\r');
   return midBusy;
 }

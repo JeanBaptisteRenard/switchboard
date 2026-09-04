@@ -407,27 +407,50 @@ each closing a concrete gap:
    step composer readback is inconclusive" for the case where a fully-observed
    chain step still cannot reach `confirmed` because the composer reading
    was not clean.
-3. **Busy must not have been observed between the text write and the Enter
-   write either** (`midBusy`, `submitToPty`/`submitWithVerify`, added
-   2026-09-04). Gate 1 samples once, before `submitToPty` is even called;
-   there is a second gap it does not cover — between the text landing and the
-   discrete Enter that follows it `DEFAULT_SUBMIT_ENTER_DELAY_MS` later. Busy
-   observed in that gap cannot be caused by an Enter that has not been written
-   yet. Same shape as gate 1: a gate, not a proof: it can only withhold a
-   `confirmed` it cannot back up, never manufacture one. Proven in
-   `test/trigger-watcher.test.js`, "submitted: busy observed between a step's
-   text write and its own Enter must not confirm it (midBusy gate)". **This
-   gate is not shown to be the mechanism behind any real incident** — it is a
-   distinct, mutation-proven gap, constructed independently of the settle-
-   window finding below, and kept because it closes a real hole, not because
-   it explains the field data. **Scope: both the single-`command` path and the
-   chain path**, not chain-only — `submitToPty`/`submitWithVerify` are the same
-   function called from both (`trigger-watcher.js:869` and `:1024`); a bare,
-   non-chain trigger runs the identical race. Proven in
-   `test/trigger-watcher.test.js`, "submitted: busy observed between a step's
-   text write and its own Enter must not confirm it, on a bare command (no
-   chain)". This is unlike the settle-window gate below, which is chain-only
-   by construction (single-command triggers never call `waitForBusyFall`).
+3. **Busy must not have been observed anywhere between the text write and the
+   Enter write either** (`midBusy`, `delayWithBusyPoll`/`submitToPty`/
+   `submitWithVerify`, added 2026-09-04, corrected same day). Gate 1 samples
+   once, before `submitToPty` is even called; there is a second gap it does
+   not cover — between the text landing and the discrete Enter that follows
+   it `DEFAULT_SUBMIT_ENTER_DELAY_MS` (50ms production default) later. Busy
+   observed anywhere in that gap cannot be caused by an Enter that has not
+   been written yet.
+
+   **First version of this gate sampled once, at the start of that gap** (t=0,
+   right after the text write) instead of across it — found the same day, by
+   review, to miss a busy that rises and falls entirely inside the window: 25ms
+   after the text, 25ms before the Enter, satisfies the exact causal violation
+   this gate exists to catch and still read `confirmed`. Invisible to every
+   test in the suite for a structural reason, not bad luck: `SWITCHBOARD_SUBMIT_
+   ENTER_DELAY_MS` is forced to 1ms at the top of `test/trigger-watcher.test.js`
+   for speed, so the window this gate polls is ~1ms wide in every test that
+   predates the fix — no room for "start" and "middle" to differ. Fixed by
+   polling continuously (`delayWithBusyPoll`, `MID_BUSY_POLL_INTERVAL_MS` =
+   5ms) for the whole delay rather than sampling once, true if busy was seen at
+   ANY point in the window — chosen over sampling once at the *end* of the
+   delay instead, because a busy that rises and falls before the Enter is
+   still a real, causally-disqualifying case, and sampling only the end would
+   miss exactly that one. Cost: negligible — the total wait is still bounded to
+   exactly the configured delay, polling only changes what happens during it,
+   not how long it lasts. Proven in `test/trigger-watcher.test.js`, "submitted:
+   busy asserted mid-window (not at the text write itself) between text and
+   Enter must still gate confirmed" — deliberately run at a realistic delay
+   (50ms, overridden per-test), not the suite's 1ms default, since 1ms cannot
+   exhibit the gap either version of this gate closes or misses.
+
+   Same shape as gate 1 either way: a gate, not a proof: it can only withhold a
+   `confirmed` it cannot back up, never manufacture one. **This gate is not
+   shown to be the mechanism behind any real incident** — it is a distinct,
+   mutation-proven gap, constructed independently of the settle-window finding
+   below, and kept because it closes a real hole, not because it explains the
+   field data. **Scope: both the single-`command` path and the chain path**,
+   not chain-only — `submitToPty`/`submitWithVerify` are the same function
+   called from both (`trigger-watcher.js:869` and `:1024`); a bare, non-chain
+   trigger runs the identical race. Proven in `test/trigger-watcher.test.js`,
+   "submitted: busy observed between a step's text write and its own Enter
+   must not confirm it, on a bare command (no chain)". This is unlike the
+   settle-window gate below, which is chain-only by construction
+   (single-command triggers never call `waitForBusyFall`).
 
 **`waitForBusyFall`'s settle window** (`SWITCHBOARD_BUSY_FALL_SETTLE_MS`,
 300 ms default, added 2026-09-04) closes a related but distinct gap, one step
