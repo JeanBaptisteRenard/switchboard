@@ -3306,3 +3306,126 @@ test('submitted: the strength order is total, and "confirmed" sits strictly abov
     }
   }
 });
+
+// ── submitted: the chain fold must weigh each step's own observation ──────────
+// see .ai/contexts/trigger-watcher.md ("submitted"). A prior version of this
+// suite never asserted result.submitted on a multi-step chain where a step is
+// legitimately submitted but never observed as busy -- the exact shape of the
+// 2026-09-03 incident (a "/compact" step that IS observed, followed by a
+// resume prompt that sits unsubmitted and is never seen going busy).
+
+test('chain "activity" fold: a step that never observes busy pulls the whole chain down to "assumed"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-fold-assumed-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    let busy = false;
+    ctx.isSessionBusy = (id) => (id === SESSION_ID ? busy : false);
+
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      writeCount++;
+      // Step 0 ('/compact'): busy window wider than the 100ms poll interval so
+      // the poll reliably catches it (see CHAIN-8 above) -- this step is
+      // genuinely observed ("activity").
+      if (writeCount === 2) {
+        setTimeout(() => { busy = true; }, 50);
+        setTimeout(() => { busy = false; }, 350);
+      }
+      // Step 1 ('resume the task'): busy is never seen, neither on the first
+      // Enter nor on the retry -- "assumed", same as a lone unobserved command.
+    };
+
+    watcher = start(ctx);
+
+    const uuid = 'chain-fold-assumed-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [
+        { command: '/compact' },
+        { command: 'resume the task' },
+      ],
+      timeout_ms: 3000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 2);
+    assert.equal(result.steps[0].submit_retries, 0,
+      'precondition: step 0 was observed on its first poll, no retry needed');
+    assert.equal(result.steps[1].submit_retries, 1,
+      'precondition: step 1 never observed busy, so the retry fired');
+    assert.equal(result.submitted, 'assumed',
+      'a step never observed as busy must pull the whole chain down to "assumed", never "activity"');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('chain "activity" fold: a step observed only through its retry still counts as "activity"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-fold-retry-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    let busy = false;
+    ctx.isSessionBusy = (id) => (id === SESSION_ID ? busy : false);
+
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      writeCount++;
+      // Writes: 1 = command text, 2 = the first discrete Enter (absorbed, no
+      // turn), 3 = the bare recovery Enter -- the one that actually wakes the
+      // session, on the retry's own verify poll.
+      if (writeCount === 3) busy = true;
+    };
+
+    watcher = start(ctx);
+
+    const uuid = 'chain-fold-retry-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: 'resume the task' }],
+      timeout_ms: 3000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 1);
+    assert.equal(result.steps[0].submit_retries, 1,
+      'precondition: the first Enter alone was not observed, the retry fired');
+    assert.equal(result.submitted, 'activity',
+      'busy observed only after the retry Enter must still register as activity, not assumed');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
