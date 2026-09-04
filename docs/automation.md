@@ -257,8 +257,11 @@ The two reserved values are easy to confuse and mean opposite things, so:
 anticipated validation refusals above — still ends in a result file and a
 deletion. A trigger body that parses as valid JSON but isn't a usable shape
 (the bare value `null`, a `chain` step that isn't an object) is caught and
-reported as `{ "ok": false, "error": "internal error: <message>" }`, rather
-than left on disk with no result at all.
+reported as `{ "ok": false, "error": "internal error: <message>", "internal":
+true }`, rather than left on disk with no result at all. `internal: true` is
+set on this path only — a validation refusal never carries it — so a reader
+can tell "our code broke" apart from "the trigger was refused" without
+parsing `error`, which stays reserved for the strict-equality checks above.
 
 **When the deletion itself fails** (permissions, a locked file, an entry that is
 not a regular file), the trigger stays on disk. The result file is still

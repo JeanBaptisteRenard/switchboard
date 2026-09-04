@@ -133,6 +133,26 @@ function describeBusyComposer(state, quietMs, now) {
 }
 
 /**
+ * Runs `check(resolve, scheduleNext)`, re-invoking it on every recursive
+ * `scheduleNext()`; any throw from `check`, on any tick, becomes this
+ * promise's rejection. See .ai/contexts/trigger-watcher.md, "Poll loops must
+ * reject, not throw".
+ */
+function pollLoop(check) {
+  return new Promise((resolve, reject) => {
+    function tick() {
+      try {
+        // .unref(): an in-flight poll must not keep the process alive alone.
+        check(resolve, () => setTimeout(tick, IDLE_POLL_INTERVAL).unref());
+      } catch (err) {
+        reject(err);
+      }
+    }
+    tick();
+  });
+}
+
+/**
  * Poll until the target composer is free — empty AND quiet — bounded by the
  * absolute `deadlineMs`.
  *
@@ -142,31 +162,27 @@ function describeBusyComposer(state, quietMs, now) {
  * Returns { free, waited_ms, reason }.
  */
 function waitForComposerFree(sessionId, ctx, deadlineMs) {
-  return new Promise((resolve) => {
-    const start   = Date.now();
-    const quietMs = getQuietMs();
-    const limit   = (deadlineMs !== undefined) ? deadlineMs : Infinity;
+  const start   = Date.now();
+  const quietMs = getQuietMs();
+  const limit   = (deadlineMs !== undefined) ? deadlineMs : Infinity;
 
-    function check() {
-      const now = Date.now();
-      const state = (typeof ctx.getComposerState === 'function')
-        ? ctx.getComposerState(sessionId)
-        : null;
+  return pollLoop((resolve, scheduleNext) => {
+    const now = Date.now();
+    const state = (typeof ctx.getComposerState === 'function')
+      ? ctx.getComposerState(sessionId)
+      : null;
 
-      if (state && state.pending === 0 && (now - (state.lastInputAt || 0)) >= quietMs) {
-        return resolve({ free: true, waited_ms: now - start, reason: null });
-      }
-      if (now >= limit) {
-        return resolve({
-          free: false,
-          waited_ms: now - start,
-          reason: describeBusyComposer(state, quietMs, now),
-        });
-      }
-      setTimeout(check, IDLE_POLL_INTERVAL).unref();
+    if (state && state.pending === 0 && (now - (state.lastInputAt || 0)) >= quietMs) {
+      return resolve({ free: true, waited_ms: now - start, reason: null });
     }
-
-    check();
+    if (now >= limit) {
+      return resolve({
+        free: false,
+        waited_ms: now - start,
+        reason: describeBusyComposer(state, quietMs, now),
+      });
+    }
+    scheduleNext();
   });
 }
 
@@ -188,33 +204,26 @@ function getSubmitVerifyMs() {
  *   - sessionExited: PTY vanished during the poll
  */
 function pollForBusyRise(sessionId, ctx, windowMs, deadlineMs) {
-  return new Promise((resolve) => {
-    const start = Date.now();
-    const windowEnd = start + windowMs;
+  const start = Date.now();
+  const windowEnd = start + windowMs;
 
-    function check() {
-      const now = Date.now();
+  return pollLoop((resolve, scheduleNext) => {
+    const now = Date.now();
 
-      if (now >= deadlineMs) {
-        return resolve({ rose: false, timedOut: true, sessionExited: false, waited_ms: now - start });
-      }
-      if (!ctx.getPtyForSession(sessionId)) {
-        return resolve({ rose: false, timedOut: false, sessionExited: true, waited_ms: now - start });
-      }
-      if (ctx.isSessionBusy(sessionId)) {
-        return resolve({ rose: true, timedOut: false, sessionExited: false, waited_ms: now - start });
-      }
-      if (now >= windowEnd) {
-        // Verify window elapsed without a rise — caller decides what to do.
-        return resolve({ rose: false, timedOut: false, sessionExited: false, waited_ms: now - start });
-      }
-      // .unref() so an in-flight poll never keeps the process alive on its own.
-      // In the app, other handles keep the loop running; in tests this lets the
-      // runner exit cleanly instead of hanging until DEFAULT_IDLE_TIMEOUT (5 min).
-      setTimeout(check, IDLE_POLL_INTERVAL).unref();
+    if (now >= deadlineMs) {
+      return resolve({ rose: false, timedOut: true, sessionExited: false, waited_ms: now - start });
     }
-
-    check();
+    if (!ctx.getPtyForSession(sessionId)) {
+      return resolve({ rose: false, timedOut: false, sessionExited: true, waited_ms: now - start });
+    }
+    if (ctx.isSessionBusy(sessionId)) {
+      return resolve({ rose: true, timedOut: false, sessionExited: false, waited_ms: now - start });
+    }
+    if (now >= windowEnd) {
+      // Verify window elapsed without a rise — caller decides what to do.
+      return resolve({ rose: false, timedOut: false, sessionExited: false, waited_ms: now - start });
+    }
+    scheduleNext();
   });
 }
 
@@ -306,27 +315,20 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
  * Returns { timedOut, sessionExited, waited_ms }.
  */
 function waitForBusyFall(sessionId, ctx, deadlineMs) {
-  return new Promise((resolve) => {
-    const start = Date.now();
+  const start = Date.now();
 
-    function check() {
-      const now = Date.now();
-      if (now >= deadlineMs) {
-        return resolve({ timedOut: true, sessionExited: false, waited_ms: now - start });
-      }
-      if (!ctx.getPtyForSession(sessionId)) {
-        return resolve({ timedOut: false, sessionExited: true, waited_ms: now - start });
-      }
-      if (!ctx.isSessionBusy(sessionId)) {
-        return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
-      }
-      // .unref() so an in-flight poll never keeps the process alive on its own.
-      // In the app, other handles keep the loop running; in tests this lets the
-      // runner exit cleanly instead of hanging until DEFAULT_IDLE_TIMEOUT (5 min).
-      setTimeout(check, IDLE_POLL_INTERVAL).unref();
+  return pollLoop((resolve, scheduleNext) => {
+    const now = Date.now();
+    if (now >= deadlineMs) {
+      return resolve({ timedOut: true, sessionExited: false, waited_ms: now - start });
     }
-
-    check();
+    if (!ctx.getPtyForSession(sessionId)) {
+      return resolve({ timedOut: false, sessionExited: true, waited_ms: now - start });
+    }
+    if (!ctx.isSessionBusy(sessionId)) {
+      return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
+    }
+    scheduleNext();
   });
 }
 
@@ -354,31 +356,24 @@ function getIdleTimeout() {
  * Returns { timedOut: boolean, sessionExited: boolean, waited_ms: number }.
  */
 function waitForIdle(sessionId, ctx, timeoutMs) {
-  return new Promise((resolve) => {
-    const timeout  = (timeoutMs !== undefined) ? timeoutMs : getIdleTimeout();
-    const start    = Date.now();
+  const timeout  = (timeoutMs !== undefined) ? timeoutMs : getIdleTimeout();
+  const start    = Date.now();
 
-    function check() {
-      const waited_ms = Date.now() - start;
+  return pollLoop((resolve, scheduleNext) => {
+    const waited_ms = Date.now() - start;
 
-      // W5: detect PTY closure during wait
-      if (!ctx.getPtyForSession(sessionId)) {
-        return resolve({ timedOut: false, sessionExited: true, waited_ms });
-      }
-
-      if (!ctx.isSessionBusy(sessionId)) {
-        return resolve({ timedOut: false, sessionExited: false, waited_ms });
-      }
-      if (waited_ms >= timeout) {
-        return resolve({ timedOut: true, sessionExited: false, waited_ms });
-      }
-      // .unref() so an in-flight poll never keeps the process alive on its own.
-      // In the app, other handles keep the loop running; in tests this lets the
-      // runner exit cleanly instead of hanging until DEFAULT_IDLE_TIMEOUT (5 min).
-      setTimeout(check, IDLE_POLL_INTERVAL).unref();
+    // W5: detect PTY closure during wait
+    if (!ctx.getPtyForSession(sessionId)) {
+      return resolve({ timedOut: false, sessionExited: true, waited_ms });
     }
 
-    check();
+    if (!ctx.isSessionBusy(sessionId)) {
+      return resolve({ timedOut: false, sessionExited: false, waited_ms });
+    }
+    if (waited_ms >= timeout) {
+      return resolve({ timedOut: true, sessionExited: false, waited_ms });
+    }
+    scheduleNext();
   });
 }
 
@@ -406,6 +401,14 @@ function validateTimeoutMs(value) {
   return null;
 }
 
+// A logger call that cannot throw. See .ai/contexts/trigger-watcher.md,
+// "Removing the entry".
+function safeLogError(ctx, ...args) {
+  try {
+    ctx.log.error(...args);
+  } catch (_) { /* swallow */ }
+}
+
 /**
  * Process a single trigger file (by basename, e.g. "abc-123.json").
  * Never throws — all errors land in the result file.
@@ -429,15 +432,17 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
       fs.writeFileSync(resultTmp, JSON.stringify(result) + '\n', 'utf8');
       fs.renameSync(resultTmp, resultPath);
     } catch (err) {
-      ctx.log.error('[trigger-watcher] Failed to write result file:', err.message);
+      safeLogError(ctx, '[trigger-watcher] Failed to write result file:', err.message);
     }
     try {
       fs.unlinkSync(triggerPath);
     } catch (err) {
       if (err.code !== 'ENOENT') {
-        ctx.log.error('[trigger-watcher] Trigger file survived processing, will not be run again:',
-          name, err.message);
+        // onEntryRetained() first: the guarantee it records must not depend
+        // on whether the log call after it succeeds.
         if (onEntryRetained) onEntryRetained();
+        safeLogError(ctx, '[trigger-watcher] Trigger file survived processing, will not be run again:',
+          name, err.message);
       }
     }
   }
@@ -931,7 +936,9 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     // see .ai/contexts/trigger-watcher.md, "Removing the entry"
     ctx.log.error('[trigger-watcher] Trigger processing threw, writing a generic failure result:',
       name, err && err.message);
-    await writeResult({ ok: false, error: 'internal error: ' + (err && err.message) });
+    // `internal: true` marks this as our bug, not a validation refusal — see
+    // .ai/contexts/trigger-watcher.md, "Removing the entry".
+    await writeResult({ ok: false, error: 'internal error: ' + (err && err.message), internal: true });
   }
 }
 

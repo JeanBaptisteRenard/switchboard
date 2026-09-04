@@ -268,13 +268,39 @@ in `processTriggerFile()` that produces a result goes through it. The body of
 `processTriggerFile()` (everything past the `*.json` filename check) also runs
 inside one `try`/`catch`: any exception raised anywhere in it — shape
 validation, session lookup, the PTY write, a step in a `chain` — is caught and
-turned into `writeResult({ ok: false, error: 'internal error: ' + err.message })`
-before the function returns. Between the two, there is no "processed but left
-behind" path — the trigger directory lists exactly what is still pending.
+turned into `writeResult({ ok: false, error: 'internal error: ' + err.message,
+internal: true })` before the function returns. `internal: true` is set on
+this path only, so a caller can tell "our code broke" apart from a validation
+refusal without parsing `error` text (see `docs/automation.md`, "Reading a
+result"). Between the two, there is no "processed but left behind" path — the
+trigger directory lists exactly what is still pending.
 Two review findings on the previous version of this file (a `null` trigger
 body, and a `chain` step that is not an object) both threw *before* any
 `writeResult()` call was reached; the wrapping `try`/`catch` is what closes
 that gap, rather than validating every field defensively before use.
+
+That outer `try`/`catch`, however, only catches a throw from the *synchronous*
+call into `processTriggerFile()`'s body. `waitForComposerFree`,
+`pollForBusyRise`, `waitForBusyFall` and `waitForIdle` all poll on a
+recursive `setTimeout` — every tick after the first runs from inside a timer
+callback, a stack frame the outer `try`/`catch` never sees. All four share one
+`pollLoop(check)` helper whose `tick()` wraps every call to `check` (first and
+all later ones) in its own `try`/`catch` and routes a throw to that promise's
+`reject` — which the `await` sites inside `processTriggerFile()` then hand to
+the outer `try`/`catch` like any other exception. Before this, a throw from
+one of these ctx hooks on the second tick or later had nothing to catch it:
+not the original `Promise` executor (already returned), not
+`processTriggerFile()`'s `try`/`catch`, not `dispatch()`'s `.catch()` — it
+surfaced as an `uncaughtException` on the whole process. See
+`pollLoop` in `trigger-watcher.js`.
+
+`writeResult()` itself is written to never throw, full stop — including when
+`ctx.log.error` (supplied by the caller, out of this module's control) itself
+throws. Both of its `try`/`catch` blocks route their own logging through
+`safeLogError()`, which swallows whatever the logger throws, and the unlink
+branch calls `onEntryRetained()` *before* attempting to log — a guarantee this
+module makes must not depend on whether the log call that merely describes it
+succeeds.
 
 Two consequences worth knowing:
 
@@ -317,6 +343,8 @@ and nothing prunes them.
 ## Invariants
 
 - **Never throws out of the watcher callback** — `processTriggerFile()`'s body runs inside one `try`/`catch`; any exception, anticipated or not, lands in the result file via `writeResult()` before the function returns. `dispatch()`'s own `.catch()` is a backstop for the case that should no longer occur.
+- **Poll loops must reject, not throw** — `waitForComposerFree`, `pollForBusyRise`, `waitForBusyFall` and `waitForIdle` all share `pollLoop()`, which converts a throw from *any* tick (including the ones run from inside `setTimeout`, not just the first synchronous one) into that promise's rejection. Without this, a throw on a deferred tick has no `try`/`catch` above it — see "Removing the entry".
+- **`writeResult()` never throws** — both of its internal `try`/`catch` blocks route their own logging through `safeLogError()`, which cannot itself throw, and the unlink branch records `onEntryRetained()` before logging. A broken `ctx.log` cannot skip either guarantee.
 - **Deduplication via `inFlight` Set** — noisy `rename` events for the same file (common on Linux inotify) are coalesced; a file is processed at most once per appearance.
 - **A processed trigger never runs twice** — normally because it was deleted; when the deletion fails, because its name is in `retained`. A trigger that threw internally is not exempt from this: it still gets a result and a deletion, so it is not "retained" on that account.
 - **`accessSync` guard** — the `rename` event fires both on file creation and deletion; the existence check prevents processing a deletion event.

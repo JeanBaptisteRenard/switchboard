@@ -2755,3 +2755,334 @@ test('lstat fails with a non-ENOENT error: result written and trigger deleted, n
     cleanup(tmp);
   }
 });
+
+// ── Defects found in the third adversarial review of PR #166 ──────────────────
+// All four poll loops call ctx back on a deferred `setTimeout` tick, not just
+// their first, synchronous call. A throw from that deferred tick used to have
+// nothing to catch it — not the Promise executor (already returned), not
+// processTriggerFile's try/catch, not dispatch()'s .catch(). See
+// .ai/contexts/trigger-watcher.md, "Poll loops must reject, not throw".
+
+test('a hook that throws starting from the SECOND tick of the composer-free poll does not escape as an uncaughtException', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  const uncaughtErrors = [];
+  const onUncaught = (err) => uncaughtErrors.push(err);
+  process.on('uncaughtException', onUncaught);
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-composer-deferred-throw-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    ctx.log          = recordingLog();
+    let calls = 0;
+    ctx.getComposerState = (id) => {
+      calls++;
+      if (calls === 1) {
+        // Not free -> forces the setTimeout-based recheck, never resolved
+        // from inside the Promise executor's synchronous frame again.
+        return { pending: 5, lastInputAt: Date.now() };
+      }
+      throw new Error('composer state unavailable (deferred)');
+    };
+    watcher = start(ctx);
+
+    const uuid         = 'composer-deferred-throw-' + Date.now();
+    const triggerPath  = writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+    const processedDir = path.join(tmp, 'processed');
+    const resultPath   = path.join(processedDir, uuid + '.result.json');
+
+    await waitForFile(resultPath, 2000);
+
+    assert.ok(calls >= 2,
+      'precondition: the throw happened on a deferred tick, not the first synchronous call');
+    assert.deepEqual(uncaughtErrors, [],
+      'a throw on a deferred poll tick must not become an uncaughtException');
+
+    const result = readResult(processedDir, uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /composer state unavailable \(deferred\)/);
+    assert.equal(fs.existsSync(triggerPath), false,
+      'trigger file must be deleted even though the throw happened on a deferred tick');
+
+  } finally {
+    process.removeListener('uncaughtException', onUncaught);
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('a hook that throws starting from the SECOND tick of the idle-wait poll does not escape as an uncaughtException', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  const uncaughtErrors = [];
+  const onUncaught = (err) => uncaughtErrors.push(err);
+  process.on('uncaughtException', onUncaught);
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-idle-deferred-throw-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    ctx.log          = recordingLog();
+    let calls = 0;
+    ctx.isSessionBusy = (id) => {
+      calls++;
+      if (calls === 1) return true; // busy -> forces the setTimeout-based recheck
+      throw new Error('busy check unavailable (deferred)');
+    };
+    watcher = start(ctx);
+
+    const uuid         = 'idle-deferred-throw-' + Date.now();
+    const triggerPath  = writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact', wait: 'idle' });
+    const processedDir = path.join(tmp, 'processed');
+    const resultPath   = path.join(processedDir, uuid + '.result.json');
+
+    await waitForFile(resultPath, 2000);
+
+    assert.ok(calls >= 2,
+      'precondition: the throw happened on a deferred tick, not the first synchronous call');
+    assert.deepEqual(uncaughtErrors, [],
+      'a throw on a deferred idle-wait tick must not become an uncaughtException');
+
+    const result = readResult(processedDir, uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /busy check unavailable \(deferred\)/);
+    assert.equal(fs.existsSync(triggerPath), false,
+      'trigger file must be deleted even though the throw happened on a deferred tick');
+
+  } finally {
+    process.removeListener('uncaughtException', onUncaught);
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('writeResult never throws even when ctx.log.error itself throws (no uncaughtException, no unhandledRejection)', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  const uncaughtErrors = [];
+  const rejections     = [];
+  const onUncaught  = (err) => uncaughtErrors.push(err);
+  const onRejection = (err) => rejections.push(err);
+  process.on('uncaughtException', onUncaught);
+  process.on('unhandledRejection', onRejection);
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-log-throws-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    let logCalls = 0;
+    ctx.log = {
+      info: () => {}, warn: () => {}, debug: () => {},
+      error: (...a) => { logCalls++; throw new Error('logger is broken'); },
+    };
+    watcher = start(ctx);
+
+    // A directory named <uuid>.json: lstat succeeds, isFile() is false ->
+    // writeResult({ok:false}) runs; unlink() on a directory then fails
+    // (non-ENOENT), reaching the retained path whose own log call throws.
+    const uuid  = 'log-throws-' + Date.now();
+    const entry = path.join(tmp, uuid + '.json');
+    fs.mkdirSync(entry);
+
+    const processedDir = path.join(tmp, 'processed');
+    const resultPath   = path.join(processedDir, uuid + '.result.json');
+
+    await waitForFile(resultPath, 2000);
+
+    assert.ok(logCalls > 0, 'precondition: the throwing logger was reached');
+    assert.deepEqual(uncaughtErrors, [], 'a broken logger must not surface as an uncaughtException');
+    assert.deepEqual(rejections, [], 'a broken logger must not surface as an unhandledRejection');
+
+    const result = readResult(processedDir, uuid);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /regular file/);
+    assert.equal(fs.existsSync(entry), true,
+      'the entry could not be unlinked and must stay on disk (retained)');
+
+  } finally {
+    process.removeListener('uncaughtException', onUncaught);
+    process.removeListener('unhandledRejection', onRejection);
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('benign ENOENT race on unlink does not retain the name: a later reuse of the same uuid is processed', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  const realUnlinkSync = fs.unlinkSync;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-enoent-race-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    ctx.log          = recordingLog();
+    watcher = start(ctx);
+
+    const uuid         = 'enoent-race-' + Date.now();
+    const triggerPath  = path.join(tmp, uuid + '.json');
+    const processedDir = path.join(tmp, 'processed');
+    const resultPath   = path.join(processedDir, uuid + '.result.json');
+
+    // Fake an external actor deleting the trigger file behind our back, just
+    // before our own unlinkSync call — the documented "benign ENOENT" race
+    // between two events on the same file (see .ai/contexts/trigger-watcher.md,
+    // "Removing the entry").
+    let sawUnlinkAttempt = false;
+    fs.unlinkSync = (p, ...rest) => {
+      if (p === triggerPath && !sawUnlinkAttempt) {
+        sawUnlinkAttempt = true;
+        try { realUnlinkSync.call(fs, p); } catch {}
+        const err = new Error('ENOENT: no such file or directory, unlink ' + p);
+        err.code = 'ENOENT';
+        throw err;
+      }
+      return realUnlinkSync.call(fs, p, ...rest);
+    };
+
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+    await waitForFile(resultPath, 2000);
+    assert.equal(readResult(processedDir, uuid).ok, true, 'first pass processed normally');
+
+    fs.unlinkSync = realUnlinkSync;
+    assert.ok(
+      !ctx.log._errors.some(m => /survived processing/.test(m)),
+      'ENOENT on unlink must stay silent, not be logged as a survived entry; got: ' +
+        JSON.stringify(ctx.log._errors),
+    );
+
+    // A brand-new, legitimate trigger reuses the same uuid (e.g. a retried
+    // harness call). It must be picked up like any fresh trigger, not ignored
+    // as if the name had been retained.
+    fs.rmSync(resultPath);
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact-second' });
+
+    await waitForFile(resultPath, 2000);
+    assert.equal(readResult(processedDir, uuid).ok, true,
+      'a name freed by a benign ENOENT race must not stay retained');
+    assert.ok(ctx._written.includes('/compact-second'),
+      'the reused trigger must reach the PTY, not be silently ignored');
+
+  } finally {
+    fs.unlinkSync = realUnlinkSync;
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('writeResult never throws when the result write itself fails AND ctx.log.error throws (both branches guarded)', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  const uncaughtErrors = [];
+  const rejections     = [];
+  const onUncaught  = (err) => uncaughtErrors.push(err);
+  const onRejection = (err) => rejections.push(err);
+  process.on('uncaughtException', onUncaught);
+  process.on('unhandledRejection', onRejection);
+  const realWriteFileSync = fs.writeFileSync;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-write-fails-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    let logCalls = 0;
+    ctx.log = {
+      info: () => {}, warn: () => {}, debug: () => {},
+      error: (...a) => { logCalls++; throw new Error('logger is broken'); },
+    };
+    watcher = start(ctx);
+
+    const uuid         = 'write-fails-' + Date.now();
+    const triggerPath  = writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+    const processedDir = path.join(tmp, 'processed');
+    const resultTmpPath = path.join(processedDir, uuid + '.result.json.tmp');
+
+    // Force the .tmp write inside writeResult() to fail, so its own catch's
+    // (now-guarded) log call is exercised — the branch the previous mutation
+    // probe found untested.
+    fs.writeFileSync = (p, ...rest) => {
+      if (p === resultTmpPath) throw new Error('disk full (simulated)');
+      return realWriteFileSync.call(fs, p, ...rest);
+    };
+
+    // Poll for the trigger file being gone rather than for a result file —
+    // the result write is the thing we are forcing to fail.
+    const deadline = Date.now() + 2000;
+    while (fs.existsSync(triggerPath) && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 20));
+    }
+
+    assert.ok(logCalls > 0, 'precondition: the throwing logger was reached');
+    assert.deepEqual(uncaughtErrors, [], 'a broken logger must not surface as an uncaughtException');
+    assert.deepEqual(rejections, [], 'a broken logger must not surface as an unhandledRejection');
+    assert.equal(fs.existsSync(triggerPath), false,
+      'the unlink must still run even though the result write failed first');
+
+  } finally {
+    fs.writeFileSync = realWriteFileSync;
+    process.removeListener('uncaughtException', onUncaught);
+    process.removeListener('unhandledRejection', onRejection);
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('internal field: the generic catch marks internal:true; a validation refusal does not', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const ctx = makeCtx('any-session');
+    watcher = start(ctx);
+
+    // A trigger body that parses as JSON but destructures wrong -> caught by
+    // the generic catch at the end of processTriggerFile.
+    const uuidInternal        = 'internal-flag-' + Date.now();
+    const triggerPathInternal = path.join(tmp, uuidInternal + '.json');
+    fs.writeFileSync(triggerPathInternal, 'null', 'utf8');
+    const resultPathInternal  = path.join(tmp, 'processed', uuidInternal + '.result.json');
+    await waitForFile(resultPathInternal, 2000);
+    const internalResult = readResult(path.join(tmp, 'processed'), uuidInternal);
+    assert.equal(internalResult.internal, true,
+      'a generic caught exception must be marked internal:true, distinguishable from a refusal');
+
+    // A plain validation refusal must NOT carry internal:true.
+    const uuidRefusal = 'refusal-flag-' + Date.now();
+    writeTrigger(tmp, uuidRefusal, { sessionId: '' }); // missing required field: sessionId
+    const resultPathRefusal = path.join(tmp, 'processed', uuidRefusal + '.result.json');
+    await waitForFile(resultPathRefusal, 2000);
+    const refusalResult = readResult(path.join(tmp, 'processed'), uuidRefusal);
+    assert.equal(refusalResult.internal, undefined,
+      'a validation refusal must not be indistinguishable from an internal bug');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
