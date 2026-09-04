@@ -16,6 +16,25 @@ const path = require('path');
  * to fall back to `path.resolve(filePath)` themselves in that case, the same
  * way they did before this primitive existed.
  *
+ * That fallback is a known, accepted gap, not a fixed one: a symlink whose
+ * target does not exist yet resolves to `null` here, so a guard built on top
+ * of this function falls back to validating the literal (unresolved) string
+ * — the same string a symlink could still point outside the allowed root
+ * from once something is created at the far end. It is safe in this
+ * codebase's current callers only because they separately require the
+ * target to already exist (`fs.existsSync`) before reading or writing it,
+ * which fails the same way for a dangling link. A future caller that skips
+ * that existence check, or that races a concurrent process creating the
+ * target between the two calls, would reopen it.
+ *
+ * Whether or not that fallback fires, the caller MUST perform its eventual
+ * read/write on the value a guard built on this function *returns* (its
+ * resolved path), never on a path the caller re-derives with its own
+ * `path.resolve(filePath)` afterwards. Two independent resolutions of the
+ * same literal string are two independent chances for an in-between symlink
+ * swap to point them at different places — the classic TOCTOU shape. A
+ * single resolution, reused, cannot diverge from itself.
+ *
  * @param {string} filePath
  * @returns {string|null}
  */

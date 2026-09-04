@@ -13,7 +13,7 @@ const os     = require('os');
 const path   = require('path');
 const fs     = require('fs');
 
-const { isSensitivePath, isAllowedMemoryPath, isKnownProjectRoot } = require('../ipc-path-validator');
+const { isSensitivePath, isAllowedMemoryPath, resolveAllowedMemoryPath, isKnownProjectRoot } = require('../ipc-path-validator');
 
 const HOME       = os.homedir();
 const CLAUDE_DIR = path.join(HOME, '.claude');
@@ -206,6 +206,107 @@ test('isAllowedMemoryPath: a symlinked directory inside the allowed root cannot 
       false,
       'a symlinked directory must not let a file outside the allowed root pass the allowlist',
     );
+  } finally {
+    r.cleanup();
+  }
+});
+
+test('resolveAllowedMemoryPath: returns the resolved real path, not the literal one, when a symlinked directory is allowed', (t) => {
+  // save-memory/read-memory must operate on this returned value — never on
+  // their own path.resolve(filePath) again — or the disk resolution below
+  // is discarded before it protects anything. See ipc-path-validator.js and
+  // resolve-path-on-disk.js.
+  const r = symlinkRig();
+  try {
+    const realDir = path.join(r.allowedRoot, 'real-storage');
+    fs.mkdirSync(realDir);
+    fs.writeFileSync(path.join(realDir, 'secret.md'), 'in bounds');
+    if (!linkDir(realDir, path.join(r.allowedRoot, 'cache'))) {
+      return t.skip('cannot create a symlink or junction on this machine — see .ai/shared-guidelines.md');
+    }
+    const literal = path.join(r.allowedRoot, 'cache', 'secret.md');
+    const resolved = resolveAllowedMemoryPath(literal, [r.allowedRoot]);
+    assert.equal(resolved, fs.realpathSync(literal));
+    assert.notEqual(resolved, literal, 'sanity: the symlink actually changes the path');
+  } finally {
+    r.cleanup();
+  }
+});
+
+test('resolveAllowedMemoryPath: a symlink to a target that does not exist yet is a known, documented gap — not a silent one', (t) => {
+  // resolveOnDisk() can only resolve what is already on disk. A symlink
+  // pointing outside the allowed root, to a target that has not been
+  // created yet, falls back to validating the literal string — which is
+  // still inside the allowed root — so this returns non-null even though
+  // the eventual target is outside. This is the "known gap" documented in
+  // resolve-path-on-disk.js: current callers (read-memory, save-memory)
+  // are safe only because they separately require the target to already
+  // exist before reading or writing it, which fails the same way for a
+  // dangling link. This test exists so that gap is asserted, not silent.
+  const r = symlinkRig();
+  try {
+    const missingTarget = path.join(r.outside, 'does-not-exist-yet', 'secret.md');
+    if (!linkDir(path.dirname(missingTarget), path.join(r.allowedRoot, 'cache'))) {
+      return t.skip('cannot create a symlink or junction on this machine — see .ai/shared-guidelines.md');
+    }
+    const literal = path.join(r.allowedRoot, 'cache', 'secret.md');
+    assert.equal(fs.existsSync(literal), false, 'sanity: the target really does not exist yet');
+    assert.notEqual(
+      resolveAllowedMemoryPath(literal, [r.allowedRoot]),
+      null,
+      'documented gap: a dangling symlink out of the allowed root is not rejected by this function alone',
+    );
+  } finally {
+    r.cleanup();
+  }
+});
+
+test('save-memory shape: reusing the resolved path survives a symlink swap after validation; reusing the literal path does not (TOCTOU)', (t) => {
+  // Reproduces the exact sequence from the PR description: check → swap →
+  // act, with two synchronous fs calls standing in for save-memory's
+  // existsSync + writeFileSync. Proves both halves — the bug in the literal-
+  // path pattern, and that the resolved-path pattern is unaffected by it —
+  // in one deterministic (non-racy) sequence.
+  const r = symlinkRig();
+  try {
+    const realStorage = path.join(r.allowedRoot, 'real-storage');
+    fs.mkdirSync(realStorage);
+    fs.writeFileSync(path.join(realStorage, 'secret.md'), 'original in-bounds content');
+    fs.writeFileSync(path.join(r.outside, 'secret.md'), 'pre-existing outside content');
+    const cacheLink = path.join(r.allowedRoot, 'cache');
+    if (!linkDir(realStorage, cacheLink)) {
+      return t.skip('cannot create a symlink or junction on this machine — see .ai/shared-guidelines.md');
+    }
+    const literal = path.join(cacheLink, 'secret.md');
+
+    // 1. Validate once, as save-memory does.
+    const resolved = resolveAllowedMemoryPath(literal, [r.allowedRoot]);
+    assert.notEqual(resolved, null, 'sanity: the file is in bounds through the link at validation time');
+
+    // 2. Hostile process wins the race: swap cache -> outside, which already
+    //    has a file at the same name, so the following syscalls succeed
+    //    against it instead of failing on a missing file.
+    fs.rmSync(cacheLink, { recursive: true, force: true });
+    if (!linkDir(r.outside, cacheLink)) {
+      return t.skip('cannot recreate a symlink or junction on this machine');
+    }
+    assert.equal(fs.readFileSync(literal, 'utf8'), 'pre-existing outside content', 'sanity: the swap is real');
+
+    // 3a. The fixed pattern: existsSync + writeFileSync on `resolved` (the
+    //     guard's own resolved value) never touch `cache` again, so the
+    //     swap has no effect on them.
+    assert.equal(fs.existsSync(resolved), true);
+    fs.writeFileSync(resolved, 'written by the fixed pattern', 'utf8');
+    assert.equal(fs.readFileSync(path.join(realStorage, 'secret.md'), 'utf8'), 'written by the fixed pattern');
+    assert.equal(fs.readFileSync(path.join(r.outside, 'secret.md'), 'utf8'), 'pre-existing outside content',
+      'the fixed pattern must not have touched the file outside the allowed root');
+
+    // 3b. The pattern this replaces: existsSync + writeFileSync on `literal`
+    //     re-traverse the (now swapped) symlink and land outside the root.
+    assert.equal(fs.existsSync(literal), true);
+    fs.writeFileSync(literal, 'written by the vulnerable pattern', 'utf8');
+    assert.equal(fs.readFileSync(path.join(r.outside, 'secret.md'), 'utf8'), 'written by the vulnerable pattern',
+      'demonstrates the class of bug: re-deriving the literal path after validation writes outside the allowed root');
   } finally {
     r.cleanup();
   }

@@ -73,7 +73,7 @@ function spawnPty(file, args, opts) {
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgvForShell } = require('./shell-profiles');
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
-const { isSensitivePath, isAllowedMemoryPath: _isAllowedMemoryPath, isKnownProjectRoot: _isKnownProjectRoot } = require('./ipc-path-validator');
+const { isSensitivePath, isAllowedMemoryPath: _isAllowedMemoryPath, resolveAllowedMemoryPath: _resolveAllowedMemoryPath, isKnownProjectRoot: _isKnownProjectRoot } = require('./ipc-path-validator');
 const { validatePreLaunchCmd } = require('./pre-launch-cmd-guard');
 const { normalizePtySize } = require('./pty-size');
 const { setPtyOpLogger, resizePty, killPty } = require('./pty-ops');
@@ -226,6 +226,14 @@ function getKnownProjectPaths() {
 // memory file for a project without an open session would be rejected.
 function isAllowedMemoryPath(filePath) {
   return _isAllowedMemoryPath(filePath, [...getKnownProjectPaths()]);
+}
+
+// Same allowlist, but returns the resolved path to read/write instead of a
+// boolean — callers with a filesystem operation to perform must use this and
+// operate on the returned value, not on their own path.resolve(filePath).
+// See ipc-path-validator.js and resolve-path-on-disk.js.
+function resolveAllowedMemoryPath(filePath) {
+  return _resolveAllowedMemoryPath(filePath, [...getKnownProjectPaths()]);
 }
 
 // Subagent live-tail watchers (watchId → { filePath, parentSessionId, agentId, teardown })
@@ -1171,9 +1179,12 @@ ipcMain.handle('get-memories', () => {
 // --- IPC: read-memory ---
 ipcMain.handle('read-memory', (_event, filePath) => {
   try {
-    const resolved = path.resolve(filePath);
-    if (!resolved.endsWith('.md')) return '';
-    if (!isAllowedMemoryPath(resolved)) return '';
+    const literal = path.resolve(filePath);
+    if (!literal.endsWith('.md')) return '';
+    // Read on the guard's own resolved path, not on `literal` again — see
+    // resolveAllowedMemoryPath's contract.
+    const resolved = resolveAllowedMemoryPath(literal);
+    if (!resolved) return '';
     return fs.readFileSync(resolved, 'utf8');
   } catch (err) {
     console.error('Error reading memory file:', err);
@@ -1184,9 +1195,12 @@ ipcMain.handle('read-memory', (_event, filePath) => {
 // --- IPC: save-memory ---
 ipcMain.handle('save-memory', (_event, filePath, content) => {
   try {
-    const resolved = path.resolve(filePath);
-    if (!resolved.endsWith('.md')) return { ok: false, error: 'not a .md file' };
-    if (!isAllowedMemoryPath(resolved)) return { ok: false, error: 'path not allowed' };
+    const literal = path.resolve(filePath);
+    if (!literal.endsWith('.md')) return { ok: false, error: 'not a .md file' };
+    // Same requirement as read-memory: existsSync/writeFileSync below must
+    // target the guard's resolved path, not `literal` again.
+    const resolved = resolveAllowedMemoryPath(literal);
+    if (!resolved) return { ok: false, error: 'path not allowed' };
     if (!fs.existsSync(resolved)) return { ok: false, error: 'file does not exist' };
     fs.writeFileSync(resolved, content, 'utf8');
     // Invalidate the FTS signature so the next get-memories call reindexes

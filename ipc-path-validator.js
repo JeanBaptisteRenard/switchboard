@@ -7,9 +7,13 @@
 //      hyperlinks from terminal output). Blocking a static denylist is lighter
 //      than allowlisting because the legitimate surface is unbounded.
 //
-//   2. isAllowedMemoryPath — strict allowlist for memory handlers
+//   2. resolveAllowedMemoryPath — strict allowlist for memory handlers
 //      (read-memory, save-memory) that should only touch ~/.claude/ or active
-//      project directories.
+//      project directories. Returns the resolved path (or null), not a
+//      boolean: the caller's read/write MUST run against that returned
+//      value, never against a path it re-derives itself, or the disk
+//      resolution this function did is moot. isAllowedMemoryPath is the
+//      boolean form, for callers that only need the yes/no answer.
 //
 //   3. isKnownProjectRoot — exact-match check used by the worktree handlers
 //      (delete-worktree, worktree-status), whose regex only validates the
@@ -63,32 +67,54 @@ function isSensitivePath(filePath) {
 }
 
 /**
- * Returns true when `filePath` is allowed for memory read-write operations.
+ * Returns the resolved, allowed path when `filePath` is allowed for memory
+ * read-write operations, or `null` when it is not.
  *
  * Allowed roots:
  *   - ~/.claude/  (and ~/.claude itself)
  *   - any path in `activeProjectPaths`
  *
+ * The caller MUST perform its filesystem operation on the returned string,
+ * not on its own `path.resolve(filePath)` — see the "candidate" comment
+ * below and resolve-path-on-disk.js for why re-deriving the path after this
+ * check runs reopens the race it closes.
+ *
  * @param {string}   filePath           - Absolute or relative path from the renderer.
  * @param {string[]} activeProjectPaths - Array of active project root paths.
- * @returns {boolean}
+ * @returns {string|null}
  */
-function isAllowedMemoryPath(filePath, activeProjectPaths) {
+function resolveAllowedMemoryPath(filePath, activeProjectPaths) {
   const resolved = path.resolve(filePath);
   // Prefer the on-disk real path when the target exists: this is what a
   // symlinked directory inside an allowed root (allowed/cache -> /etc) would
   // otherwise hide. Nothing on disk yet (about to be created, or already
   // deleted) means there is no symlink target to defeat the check with, so
-  // fall back to the plain resolved string as before.
+  // fall back to the plain resolved string as before — see the "known gap"
+  // note in resolve-path-on-disk.js.
   const candidate = resolveOnDisk(resolved) || resolved;
 
-  if (isWithinRoot(candidate, CLAUDE_DIR)) return true;
+  if (isWithinRoot(candidate, CLAUDE_DIR)) return candidate;
 
   for (const projectPath of activeProjectPaths) {
-    if (projectPath && isWithinRoot(candidate, projectPath)) return true;
+    if (projectPath && isWithinRoot(candidate, projectPath)) return candidate;
   }
 
-  return false;
+  return null;
+}
+
+/**
+ * Boolean form of `resolveAllowedMemoryPath`, for callers that only need a
+ * yes/no answer (e.g. `run-schedule-now`'s `isPathAllowed` predicate, which
+ * already re-resolves on disk itself before calling in). Callers that go on
+ * to read or write the file must use `resolveAllowedMemoryPath` instead and
+ * operate on the path it returns.
+ *
+ * @param {string}   filePath
+ * @param {string[]} activeProjectPaths
+ * @returns {boolean}
+ */
+function isAllowedMemoryPath(filePath, activeProjectPaths) {
+  return resolveAllowedMemoryPath(filePath, activeProjectPaths) !== null;
 }
 
 /**
@@ -124,4 +150,4 @@ function isKnownProjectRoot(candidatePath, knownProjectPaths) {
   return false;
 }
 
-module.exports = { isSensitivePath, isAllowedMemoryPath, isKnownProjectRoot };
+module.exports = { isSensitivePath, isAllowedMemoryPath, resolveAllowedMemoryPath, isKnownProjectRoot };
