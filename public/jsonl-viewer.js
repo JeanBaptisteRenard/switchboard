@@ -57,13 +57,9 @@ function renderJsonlText(text) {
     // but preserve markdown code blocks (which may contain HTML examples).
     const escaped = text.replace(/<(\/?[a-zA-Z][a-zA-Z0-9_-]*(?:\s[^>]*)?\/?)\>/g, '&lt;$1&gt;');
     const html = window.marked.parse(escaped);
-    // marked's own markdown->HTML output isn't filtered by the regex above
-    // (e.g. a `javascript:` URL in link/image syntax) — sanitize like the
-    // other two markdown sinks. See .ai/contexts/viewer-panel.md
+    // see .ai/contexts/viewer-panel.md
     return window.DOMPurify.sanitize(html);
   }
-  // Fallback if marked or DOMPurify isn't loaded — never hand marked's raw
-  // output to innerHTML without DOMPurify in front of it.
   let html = escapeHtml(text);
   html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="jsonl-code-block"><code>$2</code></pre>');
   html = html.replace(/`([^`]+)`/g, '<code class="jsonl-inline-code">$1</code>');
