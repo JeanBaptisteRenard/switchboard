@@ -2168,7 +2168,7 @@ test('politeness: the bare recovery Enter is withheld when the user types during
   }
 });
 
-test('submitted: activity seen after our write yields "activity", never "confirmed"', async () => {
+test('submitted: activity seen after our write yields "activity", never "confirmed", when the composer readback is inconclusive', async () => {
   const tmp = mkTmp();
   let watcher;
   try {
@@ -2178,6 +2178,15 @@ test('submitted: activity seen after our write yields "activity", never "confirm
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-submitted-confirmed-' + Date.now();
     const ctx       = makeChainCtx(SESSION_ID); // auto-turn: busy 50ms after '\r'
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      // Something the model cannot attribute lands in the composer right after
+      // our own Enter -- a turn still starts (auto-turn, below), but the
+      // readback cannot rule out that our own submission is what is sitting
+      // there unconsumed. Doubt must resolve to "activity", never "confirmed".
+      if (ctx._written.length === 2) ctx._composer.pending = 3;
+    };
     watcher = start(ctx);
 
     const uuid = 'submitted-confirmed-' + Date.now();
@@ -2190,8 +2199,94 @@ test('submitted: activity seen after our write yields "activity", never "confirm
     assert.equal(result.ok, true);
     assert.equal(result.submitted, 'activity');
     assert.notEqual(result.submitted, 'confirmed',
-      'seeing the session go busy does not prove the CLI ran what we wrote');
+      'seeing the session go busy does not prove the CLI ran what we wrote, and the ' +
+      'composer readback here is inconclusive, not empty');
     assert.deepEqual(ctx._written, ['/compact', '\r'], 'an observed turn needs no recovery Enter');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('submitted: an ordinary clean write — idle beforehand, activity observed, composer read back empty — is "confirmed"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-submitted-genuine-confirmed-' + Date.now();
+    const ctx       = makeChainCtx(SESSION_ID); // auto-turn: busy 50ms after '\r'; composer untouched
+    watcher = start(ctx);
+
+    const uuid = 'submitted-genuine-confirmed-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submit_retries, 0);
+    assert.equal(result.submitted, 'confirmed',
+      'not busy beforehand, a turn observed, and the composer read back empty: ' +
+      'the ordinary success path must still reach "confirmed"');
+    assert.deepEqual(ctx._written, ['/compact', '\r'], 'no recovery Enter on the ordinary path');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('submitted: the composer stays non-empty after our own Enter (it did not take) — never "confirmed", and a retry fires', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-submitted-stuck-' + Date.now();
+    // No auto-turn: busy never rises on its own, mirroring the field incident
+    // where the injected Enter did not register as a submit at all.
+    const ctx       = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      // Right after our own Enter, the composer still shows content -- exactly
+      // "le composer reste non vide" from the field measurement. It clears a
+      // little later (well inside the verify window), the way it would once a
+      // human's own Enter, arriving separately, finally resolves it.
+      if (ctx._written.length === 2) {
+        ctx._composer.pending = 5;
+        setTimeout(() => {
+          ctx._composer.pending     = 0;
+          ctx._composer.lastInputAt = 0;
+        }, 100);
+      }
+    };
+    watcher = start(ctx);
+
+    const uuid = 'submitted-stuck-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.notEqual(result.submitted, 'confirmed',
+      'the composer read back non-empty right after our own Enter: never confirmed');
+    assert.equal(result.submitted, 'assumed', 'busy is never observed in this scenario');
+    assert.equal(result.submit_retries, 1, 'a retry must fire when the Enter did not take');
+    assert.deepEqual(ctx._written, ['/compact', '\r', '\r'], 'the bare recovery Enter was actually sent');
 
   } finally {
     if (watcher) watcher.close();
@@ -3421,6 +3516,142 @@ test('chain "activity" fold: a step observed only through its retry still counts
       'precondition: the first Enter alone was not observed, the retry fired');
     assert.equal(result.submitted, 'activity',
       'busy observed only after the retry Enter must still register as activity, not assumed');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('chain "confirmed" fold: every step idle beforehand, observed, and read back clean -> the whole chain is "confirmed"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-fold-confirmed-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID); // auto-turn on every '\r'; composer untouched throughout
+    watcher = start(ctx);
+
+    const uuid = 'chain-fold-confirmed-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume the task' }],
+      timeout_ms: 3000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 2);
+    assert.equal(result.steps[0].submit_retries, 0);
+    assert.equal(result.steps[1].submit_retries, 0);
+    assert.equal(result.submitted, 'confirmed',
+      'neither step was ever busy beforehand, both were observed, and the composer never showed anything unaccounted for');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('chain "confirmed" fold: one step composer readback is inconclusive -> pulls a fully-observed chain down to "activity"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-fold-weak-confirm-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID); // auto-turn on every '\r'
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      writeCount++;
+      // Writes: 1/2 = step 0 text/Enter (clean, confirmable), 3/4 = step 1
+      // text/Enter. Something lands in the composer right after step 1's own
+      // Enter -- that step's readback is inconclusive even though its own
+      // turn is genuinely observed a moment later.
+      if (writeCount === 4) ctx._composer.pending = 2;
+    };
+    watcher = start(ctx);
+
+    const uuid = 'chain-fold-weak-confirm-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume the task' }],
+      timeout_ms: 3000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 2);
+    assert.equal(result.steps[0].submit_retries, 0, 'precondition: step 0 was clean and observed');
+    assert.equal(result.steps[1].submit_retries, 0, 'precondition: step 1 was observed too, just not confirmable');
+    assert.equal(result.submitted, 'activity',
+      'one step being merely "activity" must drag a chain down from "confirmed", never the other way round');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('total_waited_ms: equals the sum of steps[*].waited_ms, including each step\'s own politeness wait', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-total-waited-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    // The composer is not free when the single step is first attempted -- it
+    // frees itself 150ms later, so this step's own politeness wait is not
+    // instantaneous and must show up in its own waited_ms.
+    ctx._composer.pending     = 3;
+    ctx._composer.lastInputAt = 0;
+    setTimeout(() => { ctx._composer.pending = 0; }, 150);
+
+    watcher = start(ctx);
+
+    const uuid = 'total-waited-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: 'resume the task' }],
+      timeout_ms: 3000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 1);
+    assert.ok(result.steps[0].waited_ms >= 150,
+      'the step\'s own politeness wait must show up in its own waited_ms, not only in the chain total');
+    const sumSteps = result.steps.reduce((acc, s) => acc + s.waited_ms, 0);
+    assert.equal(result.total_waited_ms, sumSteps,
+      'with no initial wait:idle and every step reaching a write, total_waited_ms must equal the sum of steps[*].waited_ms exactly');
 
   } finally {
     if (watcher) watcher.close();

@@ -63,8 +63,8 @@ const FORBIDDEN_COMMAND_RE = /[\r\n\0\x1b]/;
 // Politeness guard — see docs/automation.md and .ai/contexts/trigger-watcher.md.
 const DEFAULT_QUIET_MS = 3000;
 
-// see .ai/contexts/trigger-watcher.md ("submitted") — `confirmed` is reserved
-// for an effect readback and is never emitted by this transport.
+// see .ai/contexts/trigger-watcher.md ("submitted") for what each value
+// promises and what it does not.
 const SUBMITTED_NO        = 'no';
 const SUBMITTED_ASSUMED   = 'assumed';
 const SUBMITTED_ACTIVITY  = 'activity';
@@ -239,20 +239,28 @@ function pollForBusyObserved(sessionId, ctx, windowMs, deadlineMs) {
 }
 
 /**
- * Submit a command, then look for activity on the session.
+ * Submit a command, then verify it.
  *
  * 1. submitToPty(text + discrete Enter)
- * 2. Poll for busy=true within SWITCHBOARD_SUBMIT_VERIFY_MS.
- * 3. Busy observed → done (submit_retries: 0).
- * 4. Nothing observed → write a SINGLE bare '\r' (a no-op on an empty composer, so it is
+ * 2. Read the composer back — unconditionally, never skipped by an activity
+ *    sample. See .ai/contexts/trigger-watcher.md ("submitted") for why this
+ *    reading alone still cannot be trusted on a session that was already
+ *    mid-turn when we wrote.
+ * 3. Poll for busy=true within SWITCHBOARD_SUBMIT_VERIFY_MS.
+ * 4. Busy observed → done (submit_retries: 0). `composerConfirmed` is set only
+ *    when the composer read back empty AND the session was not already busy
+ *    the instant we wrote — the shape of the incident this module exists to
+ *    stop reporting as a confirmed submission.
+ * 5. Nothing observed → write a SINGLE bare '\r' (a no-op on an empty composer, so it is
  *    harmless if the first submit actually worked; if the text is still sitting
  *    in the composer because the first Enter was absorbed, this submits it) and
- *    poll the same window again (submit_retries: 1).
+ *    poll the same window again (submit_retries: 1). A retry never yields
+ *    `composerConfirmed` — the first attempt already needed rescuing.
  *
  * The observation IS the equivalent of waitForTurnComplete's Phase 1; callers
  * MUST NOT then wait for busy again — they proceed straight to busy-fall.
  *
- * Returns { submit_retries, sawBusy, sessionExited, timedOut, waited_ms }.
+ * Returns { submit_retries, sawBusy, composerConfirmed, sessionExited, timedOut, waited_ms }.
  *   - waited_ms is the total time spent polling (both windows + retry).
  *
  * If sessionExited/timedOut fire, the caller short-circuits with the usual
@@ -261,7 +269,16 @@ function pollForBusyObserved(sessionId, ctx, windowMs, deadlineMs) {
  * that the verification could not confirm a turn started.
  */
 async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs) {
+  // Sampled before the write — see .ai/contexts/trigger-watcher.md ("submitted").
+  const preBusy = ctx.isSessionBusy(sessionId);
+
   await submitToPty(ptyProcess, command);
+
+  // Composer read-back: unconditional, immediate, never gated on activity.
+  const postWriteState = (typeof ctx.getComposerState === 'function')
+    ? ctx.getComposerState(sessionId)
+    : null;
+  const composerEmptyAfterWrite = !!postWriteState && postWriteState.pending === 0;
 
   const windowMs = getSubmitVerifyMs();
   // No explicit (global) deadline → the verify window alone governs; the retry
@@ -273,6 +290,7 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
     return {
       submit_retries: 0,
       sawBusy: first.sawBusy,
+      composerConfirmed: first.sawBusy && preBusy === false && composerEmptyAfterWrite,
       sessionExited: first.sessionExited,
       timedOut: first.timedOut,
       waited_ms: first.waited_ms,
@@ -287,6 +305,7 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
     return {
       submit_retries: 0,
       sawBusy: false,
+      composerConfirmed: false,
       sessionExited: false,
       timedOut: false,
       recoverySkipped: true,
@@ -302,6 +321,7 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
     return {
       submit_retries: 1,
       sawBusy: false,
+      composerConfirmed: false,
       sessionExited: false,
       timedOut: false,
       writeError: err,
@@ -313,6 +333,7 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
   return {
     submit_retries: 1,
     sawBusy: second.sawBusy,
+    composerConfirmed: false,
     sessionExited: second.sessionExited,
     timedOut: second.timedOut,
     waited_ms: first.waited_ms + second.waited_ms,
@@ -716,14 +737,16 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     // composer, Enter absorbed" incident).
     let submitRetries = 0;
     let sawBusy = false;
+    let composerConfirmed = false;
     let recoverySkipped = false;
     let recoveryReason = null;
     try {
       const v = await submitWithVerify(ptyProcess, sessionId, command, ctx);
-      submitRetries   = v.submit_retries;
-      sawBusy         = v.sawBusy;
-      recoverySkipped = !!v.recoverySkipped;
-      recoveryReason  = v.recoveryReason || null;
+      submitRetries     = v.submit_retries;
+      sawBusy           = v.sawBusy;
+      composerConfirmed = !!v.composerConfirmed;
+      recoverySkipped   = !!v.recoverySkipped;
+      recoveryReason    = v.recoveryReason || null;
       if (v.writeError) throw v.writeError;
     } catch (err) {
       ctx.log.error('[trigger-watcher] PTY write failed:', err.message);
@@ -739,7 +762,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
 
     await writeResult({
       ok:             true,
-      submitted:      sawBusy ? SUBMITTED_ACTIVITY : SUBMITTED_ASSUMED,
+      submitted:      composerConfirmed ? SUBMITTED_CONFIRMED : (sawBusy ? SUBMITTED_ACTIVITY : SUBMITTED_ASSUMED),
       sessionId,
       command,
       sent_at:        new Date().toISOString(),
@@ -758,8 +781,10 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
   const steps = [];
   let totalWaitedMs = 0;
   let step0SentAt = null;
-  // A chain reports the weakest thing any of its steps achieved.
-  let chainSubmitted = SUBMITTED_ACTIVITY;
+  // A chain reports the weakest thing any of its steps achieved. Starts at the
+  // top of the order so a chain whose every step is genuinely confirmed can
+  // report "confirmed" — one weak step still drags the whole chain down.
+  let chainSubmitted = SUBMITTED_CONFIRMED;
 
   // Step 0: initial wait (respects `wait` field)
   if (wait === 'idle') {
@@ -862,7 +887,10 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     // The verify window is bounded by this step's deadline; if nothing arrives
     // we retry the bare Enter once (harmless no-op if already submitted).
     let submitRetries = 0;
-    let stepWaitedMs = 0;
+    // Includes this step's own politeness wait (see "total_waited_ms" in
+    // docs/automation.md) so steps[i].waited_ms accounts for everything this
+    // step spent, not just the submit-verify portion.
+    let stepWaitedMs = polite.waited_ms;
     let verify;
     try {
       verify = await submitWithVerify(entry.ptyProcess, sessionId, step.command, ctx, stepDeadline);
@@ -881,7 +909,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     totalWaitedMs += verify.waited_ms;
     chainSubmitted = weakestSubmitted(
       chainSubmitted,
-      verify.sawBusy ? SUBMITTED_ACTIVITY : SUBMITTED_ASSUMED,
+      verify.composerConfirmed ? SUBMITTED_CONFIRMED : (verify.sawBusy ? SUBMITTED_ACTIVITY : SUBMITTED_ASSUMED),
     );
 
     if (verify.recoverySkipped) {

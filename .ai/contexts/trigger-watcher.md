@@ -297,52 +297,95 @@ occurrences, and the fix is a `matchEscape` change (recognising and
 discarding a whole DCS sequence), not a `reportLength` addition — a
 different, larger piece of work than this PR's scope.
 
-**`submitted`.** Every result carries it, compared by strict equality:
-`confirmed` (the effect asked for was read back — **reserved, never emitted
-here**), `activity` (the session was seen busy after our write), `assumed`
-(written, no failure seen, nothing observed after), `no` (nothing written, or
-written and not submitted).  A chain reports the **weakest** of its steps
-(`weakestSubmitted`), because the field exists to stop a transport overstating
-what it saw.
+**`submitted`.** Every result carries it, compared by strict equality, in this
+order (`no` < `assumed` < `activity` < `confirmed`):
 
-### Why the top value is `activity`, not `confirmed`
+- `no` — nothing was written, or it was written and never submitted.
+- `assumed` — written, no failure seen, nothing observed afterward.
+- `activity` — the session was seen busy after our write, but the readback
+  below could not rule out interference, or the session was already mid-turn
+  the instant we wrote.
+- `confirmed` — the composer was read back empty right after our own Enter,
+  the session was **not** already busy when we wrote, and a turn was
+  independently observed in the same verify window. All three, checked on the
+  first attempt only — a retry never yields `confirmed`.
 
-Until this change the busy observation was emitted as `confirmed`, and the field
-overstated exactly what it existed to prevent.  Three separate gaps sit between
-"we saw busy" and "the command ran":
+A chain reports the **weakest** of its steps (`weakestSubmitted`), because the
+field exists to stop a transport overstating what it saw.
 
-1. **The observation is a level, not an edge.**  `pollForBusyObserved` samples
-   `ctx.isSessionBusy` and answers on the first tick that reads true.  A session
-   already mid-turn when the trigger fires satisfies it in milliseconds, with a
-   turn the write did not cause.  `test/trigger-watcher.test.js` has carried a
-   case of this shape since the verify path landed — a `wait:"none"` trigger into
-   a permanently busy session — and it used to assert `confirmed`.
-2. **Sampling a baseline first would not close it.**  The window between reading
-   the state and the keystroke stays open, and that window is where the race
-   lives.  A pre-write busy check buys a narrower race, not a guarantee, so this
-   module does not pretend to one.
-3. **A turn is not an interpretation.**  The CLI submits a slash command *as a
-   command* only through its completion menu.  Text written straight into an
-   empty composer with an Enter `DEFAULT_SUBMIT_ENTER_DELAY_MS` behind it can
-   land before that menu opens, in which case Enter submits an ordinary message
-   whose text merely begins with `/`.  The CLI answers it, the session goes
-   busy, and the observation is indistinguishable from a real command.
+### Why the top value used to be `activity`, and no longer is
 
-   Waiting for that menu to actually open, instead of the blind
-   `DEFAULT_SUBMIT_ENTER_DELAY_MS`, would mean reading the rendered screen — which
-   lives in the renderer's xterm buffer, not in this main-process module.  Not
-   attempted here.
+Between the incident below and this section, `confirmed` was emitted whenever
+busy was observed after a write (see history), then removed entirely once that
+was shown to lie (`pollForBusyObserved` is a level probe: a session already
+mid-turn when the trigger fires satisfies it in milliseconds, with a turn the
+write did not cause — see `test/trigger-watcher.test.js`, "a session already
+busy before our write never reports confirmed"). Removing it outright broke a
+downstream contract: `harness/cmd/harness/compact.go`'s guard releases on
+`DeliveryConfirmed` in seconds and otherwise falls back to a 2-hour ceiling, so
+with `confirmed` gone every chain fell back to that ceiling. `confirmed` is
+therefore back, on a stricter footing.
 
-An honest transport therefore cannot claim submission from activity alone, and a
-caller that debounces on `confirmed` is blinded by it: it believes it acted, and
-does not retry.
+### What `confirmed` checks, and why composer-emptiness alone is not enough
 
-### Why no discriminator was wired in
+`submitWithVerify` (`trigger-watcher.js`) reads the composer back
+unconditionally after every write — never skipped because activity was seen,
+which is exactly the inversion this module used to make. But an empty reading
+by itself proves less than it looks like it does: `composer-state.js` is fed
+**only** from bytes the renderer sends (see "Politeness" above) — this
+module's own writes go straight to the PTY and are invisible to that model. So
+"the composer reads empty after our write" only rules out a *human's*
+unsubmitted sentence being visible at that instant; it says nothing about
+whether the CLI actually consumed what we ourselves just wrote, since the
+model never knew that text existed in the first place. Proven by
+`test/trigger-watcher.test.js`, the "chain confirmed fold" pair: a step whose
+composer is genuinely undisturbed reads exactly the same as a step nobody
+observes at all — the reading is vacuous unless something independent anchors
+it.
+
+`confirmed` therefore requires **two more things**, both cheap to state and
+each closing a concrete gap:
+
+1. **The session must not already have been busy when we wrote.** A session
+   mid-turn can swallow or queue injected text with the composer model none
+   the wiser — it never saw the text land, so it cannot show it stuck. This is
+   the exact shape of the field incident: a chain step written 9.2 s into a
+   still-running prior turn read back "confirmed" and the CLI never actually
+   submitted it; a human had to press Enter four minutes later. Sampling
+   `ctx.isSessionBusy` **before** the write and disqualifying `confirmed`
+   outright when it is `true` closes this — not by claiming proof, but by
+   refusing to claim one where none exists. (This is a *gate*, not the
+   discredited pattern above: it can only prevent a false `confirmed`, never
+   produce one.)
+2. **A turn must still be independently observed** (the existing busy-rise
+   poll). Composer-emptiness on its own cannot distinguish "genuinely
+   unwritten" from "written, but nothing downstream ever reacts to it" — a
+   turn starting is what anchors the reading to something the CLI actually
+   did. See `test/trigger-watcher.test.js`, "chain 'confirmed' fold: one
+   step composer readback is inconclusive" for the case where a fully-observed
+   chain step still cannot reach `confirmed` because the composer reading
+   was not clean.
+
+A retry is never eligible for `confirmed` either: needing one already means
+the first Enter did not visibly register, so the strongest claim left is
+whatever the retry's own busy observation supports (`activity` or `assumed`).
+
+### What `confirmed` still does not claim
+
+Composer-emptiness plus a not-already-busy write plus an observed turn is the
+strongest signal this module can produce without reading the CLI's own effect
+— it is **not** proof that the CLI ran the text as a *command* rather than an
+ordinary message beginning with the same characters (see "Why no discriminator
+was wired in" below, unchanged). A caller that must not act twice on the same
+intent still has to read the effect itself; `confirmed` only says the
+transport-level handoff went through cleanly.
+
+### Why no discriminator for command-vs-message was wired in
 
 We looked for a signal separating "the CLI ran a slash command" from "the CLI
-answered a message starting with `/`", observable **when the result is written**.
-There is none, measured on 13 real `/compact` occurrences across four session
-transcripts:
+answered a message starting with `/`", observable **when the result is
+written**. There is none, measured on 13 real `/compact` occurrences across
+four session transcripts:
 
 - At Enter + a few seconds both cases write the *same* line —
   `{"type":"user","message":{"content":"/compact"}}`, no `<command-name>`, no
@@ -359,19 +402,18 @@ transcripts:
 
 So the effect *is* readable, minutes later, by a reader that keeps the injected
 `promptId` and watches the session file.  That is a caller's job, not the
-watcher's: the watcher returns in seconds by construction.  `confirmed` is kept
-in `SUBMITTED_RANK`, strictly above `activity`, so that a transport which does
-read an effect back has a value to report — and so that the order stays total.
+watcher's: the watcher returns in seconds by construction.
 
 ### Compatibility
 
-`confirmed` disappears from emitted results.  A reader testing
-`submitted === 'confirmed'` stops matching and falls through to its retry or
-escalation path, which is the safe direction: the value it trusted was never a
-guarantee.  Readers testing `submitted === 'no'` or `submitted !== 'no'` are
-unaffected.  The wire format is shared with other implementations of this
-contract, so the same reasoning applies to any transport that writes a
-`result.json` with this field.
+`confirmed` is emitted again, on the stricter footing above, and remains
+strictly above `activity` in `SUBMITTED_RANK`. A reader that debounces on
+`submitted === 'confirmed'` alone is trusting the transport-level handoff, not
+the CLI's interpretation of the text — see "What `confirmed` still does not
+claim". Readers testing `submitted === 'no'` or `submitted !== 'no'` are
+unaffected by any of this. The wire format is shared with other
+implementations of this contract, so the same reasoning applies to any
+transport that writes a `result.json` with this field.
 
 **`not sent` vs `chain timeout`.** `error` is compared by strict equality, so the
 detail goes in `reason` and never into `error` — `not sent: input pending` is not
@@ -439,6 +481,12 @@ Result written to `SWITCHBOARD_TRIGGERS_DIR/processed/<uuid>.result.json`:
 { "ok": true,  "submitted": "activity", "sessionId": "...", "command": "...", "sent_at": "...", "waited_ms": 320 }
 { "ok": false, "submitted": "no", "error": "not sent", "reason": "timeout waiting for idle; nothing was written", "sessionId": "..." }
 ```
+
+A `chain` result also carries `steps` and `total_waited_ms` — see
+`docs/automation.md` ("Triggers") for `total_waited_ms`'s exact definition
+and the one evident gap found and fixed while writing it down (2026-09-04:
+each step's own politeness wait now counts toward that step's own
+`waited_ms`, not only toward the chain total).
 
 Trigger file is **deleted** after processing (success or failure).
 
