@@ -92,6 +92,29 @@ test('resolveRunNowTarget: refuses a schedule-*.md file that is not inside .clau
   } finally { r.cleanup(); }
 });
 
+// The two checks above (parent dir named "commands", grandparent named
+// ".claude") are joined with ||, not &&: either name being wrong is enough
+// to refuse. The two existing tests above don't distinguish || from && —
+// in both, either both names are already right (accepted either way) or
+// both are already wrong (refused either way). This test puts exactly one
+// name right and the other wrong, which || refuses and && would wrongly
+// accept (a De Morgan mutation that left every prior test green).
+test('resolveRunNowTarget: refuses a directory literally named "commands" when it is not the direct child of .claude (exactly one of the two name checks fails)', () => {
+  const r = rig();
+  try {
+    // <project>/foo/commands/schedule-x.md: basename(commandsDir) === 'commands'
+    // (that check passes) but basename(dirname(commandsDir)) === 'foo', not
+    // '.claude' (that check fails) — exactly one true, one false.
+    const foreignCommandsDir = path.join(r.projectPath, 'foo', 'commands');
+    fs.mkdirSync(foreignCommandsDir, { recursive: true });
+    const filePath = path.join(foreignCommandsDir, 'schedule-x.md');
+    fs.writeFileSync(filePath, 'x');
+    const out = resolveRunNowTarget(filePath, allowAll);
+    assert.equal(out.ok, false);
+    assert.equal(out.error, 'not inside a project .claude/commands directory');
+  } finally { r.cleanup(); }
+});
+
 test('resolveRunNowTarget: a symlinked commands directory escaping the project is caught by disk resolution', (t) => {
   const r = rig();
   try {
