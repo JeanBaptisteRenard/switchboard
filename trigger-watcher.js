@@ -102,18 +102,51 @@ function defaultIsPtyAlive(ptyProcess) {
   }
 }
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// Poll interval (ms) for `delayWithBusyPoll` below. Deliberately finer than
+// IDLE_POLL_INTERVAL (100ms): the text->Enter delay this polls across is only
+// DEFAULT_SUBMIT_ENTER_DELAY_MS (50ms) long in production, so a 100ms poll
+// interval would sample it once at best -- no better than the single sample
+// this replaces.
+const MID_BUSY_POLL_INTERVAL_MS = 5; // ms
+
+// Poll `ctx.isSessionBusy` at MID_BUSY_POLL_INTERVAL_MS granularity for the
+// full `ms` duration, returning true if busy was observed at ANY point in the
+// window -- not just at the start or the end of it. Total elapsed time is
+// bounded to exactly `ms`, same as a plain `delay(ms)`; this only changes
+// what happens during the wait, not how long it lasts.
+function delayWithBusyPoll(ms, sessionId, ctx) {
+  const deadline = Date.now() + ms;
+  return new Promise((resolve) => {
+    let sawBusy = false;
+    function tick() {
+      if (ctx.isSessionBusy(sessionId)) sawBusy = true;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return resolve(sawBusy);
+      setTimeout(tick, Math.min(MID_BUSY_POLL_INTERVAL_MS, remaining)).unref();
+    }
+    tick();
+  });
 }
 
 // Submit a command to a PTY the way a human terminal does: write the text,
 // then send Enter as a SEPARATE write so it is read as a discrete "submit"
 // keypress rather than a trailing newline. See DEFAULT_SUBMIT_ENTER_DELAY_MS.
-async function submitToPty(ptyProcess, command) {
+//
+// Returns `midBusy`: busy polled continuously between the text write and the
+// Enter write, true if observed at any point in that window. A single sample
+// -- at the start, or at the end -- can miss a busy that rises and falls
+// entirely inside the window, which is a real, reproduced case (see
+// .ai/contexts/trigger-watcher.md, "submitted"), not a hypothetical one:
+// busy observed anywhere here cannot be attributed to an Enter that had not
+// been sent yet. See the "composerConfirmed" gate in submitWithVerify, which
+// this narrows.
+async function submitToPty(ptyProcess, command, sessionId, ctx) {
   ptyProcess.write(command);
   const envMs = envNumber('SWITCHBOARD_SUBMIT_ENTER_DELAY_MS');
-  await delay(envMs !== undefined ? envMs : DEFAULT_SUBMIT_ENTER_DELAY_MS);
+  const delayMs = envMs !== undefined ? envMs : DEFAULT_SUBMIT_ENTER_DELAY_MS;
+  const midBusy = await delayWithBusyPoll(delayMs, sessionId, ctx);
   ptyProcess.write('\r');
+  return midBusy;
 }
 
 // A variable set to the empty string is a launcher artefact, not a value:
@@ -233,6 +266,23 @@ function getSubmitVerifyMs() {
   return v !== undefined ? v : BUSY_OBSERVE_TIMEOUT_MS;
 }
 
+// How long busy must read false, CONTINUOUSLY, before waitForBusyFall treats a
+// turn as finished. A single false sample is not enough: a command's own tail
+// activity (e.g. /compact still writing its summary after the visible turn
+// ends) can produce a brief busy->false->true flicker. Exiting on the first
+// false sample lets the very next chain step get written while that flicker
+// is still running, and the re-assertion of busy then lands inside THAT
+// step's submit-verify window — read as proof the next step's own Enter
+// started a turn, when it did not (root cause of the 2026-09-04 "Enter
+// inserted a newline instead of submitting" incident: submitted:"confirmed",
+// waited_ms:0, on the step written right after a /compact busy-fall).
+// Override via SWITCHBOARD_BUSY_FALL_SETTLE_MS.
+const DEFAULT_BUSY_FALL_SETTLE_MS = 300; // ms
+function getBusyFallSettleMs() {
+  const v = envNumber('SWITCHBOARD_BUSY_FALL_SETTLE_MS');
+  return v !== undefined ? v : DEFAULT_BUSY_FALL_SETTLE_MS;
+}
+
 /**
  * Poll ctx.isSessionBusy(sessionId) for busy=true up to `windowMs`, bounded
  * by the absolute `deadlineMs`. Stops early if the PTY disappears.
@@ -281,8 +331,12 @@ function pollForBusyObserved(sessionId, ctx, windowMs, deadlineMs) {
  * 3. Poll for busy=true within SWITCHBOARD_SUBMIT_VERIFY_MS.
  * 4. Busy observed → done (submit_retries: 0). `composerConfirmed` is set only
  *    when the composer read back empty AND the session was not already busy
- *    the instant we wrote — the shape of the incident this module exists to
- *    stop reporting as a confirmed submission.
+ *    the instant we wrote, AND not busy in the gap between the text write and
+ *    the Enter write (`midBusy`) — busy observed there cannot be attributed to
+ *    an Enter that had not been sent yet. Neither gate proves our Enter caused
+ *    the busy the poll later sees; both only rule out cases where it provably
+ *    could not have. See .ai/contexts/trigger-watcher.md ("submitted"),
+ *    "What confirmed still does not claim" for the causality gap that remains.
  * 5. Nothing observed → write a SINGLE bare '\r' (a no-op on an empty composer, so it is
  *    harmless if the first submit actually worked; if the text is still sitting
  *    in the composer because the first Enter was absorbed, this submits it) and
@@ -304,7 +358,7 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
   // Sampled before the write — see .ai/contexts/trigger-watcher.md ("submitted").
   const preBusy = ctx.isSessionBusy(sessionId);
 
-  await submitToPty(ptyProcess, command);
+  const midBusy = await submitToPty(ptyProcess, command, sessionId, ctx);
 
   // Composer read-back: unconditional, immediate, never gated on activity.
   const postWriteState = (typeof ctx.getComposerState === 'function')
@@ -322,7 +376,7 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
     return {
       submit_retries: 0,
       sawBusy: first.sawBusy,
-      composerConfirmed: first.sawBusy && preBusy === false && composerEmptyAfterWrite,
+      composerConfirmed: first.sawBusy && preBusy === false && midBusy === false && composerEmptyAfterWrite,
       sessionExited: first.sessionExited,
       timedOut: first.timedOut,
       waited_ms: first.waited_ms,
@@ -376,10 +430,25 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
  * Wait only for the busy FALLING edge (busy → false), i.e. the turn finishing.
  * Used after submitWithVerify has already observed (or assumed) the turn.
  *
+ * The deadline check runs BEFORE the settle check, deliberately: a settle
+ * window in progress when `deadlineMs` arrives resolves as `timedOut`, never
+ * as success, even if the turn it was waiting on had genuinely already
+ * finished. A turn ending with less than `settleMs` of margin before its own
+ * `timeout_ms` now fails where the old single-sample check would have
+ * succeeded. Documented trade-off (2026-09-04), not a bug: making the settle
+ * window additive to the deadline would silently change what `timeout_ms`
+ * means for every caller, including ones already calibrated against the old
+ * behavior; see .ai/contexts/trigger-watcher.md ("submitted") for the caller
+ * this was weighed against. Proven in `test/trigger-watcher.test.js`, "a turn
+ * finishing with too little margin before its own deadline now times out".
+ *
  * Returns { timedOut, sessionExited, waited_ms }.
  */
 function waitForBusyFall(sessionId, ctx, deadlineMs) {
   const start = Date.now();
+  const settleMs = getBusyFallSettleMs();
+  // Set the instant busy first reads false; reset to null on every re-assertion.
+  let idleSince = null;
 
   return pollLoop((resolve, scheduleNext) => {
     const now = Date.now();
@@ -390,7 +459,12 @@ function waitForBusyFall(sessionId, ctx, deadlineMs) {
       return resolve({ timedOut: false, sessionExited: true, waited_ms: now - start });
     }
     if (!ctx.isSessionBusy(sessionId)) {
-      return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
+      if (idleSince === null) idleSince = now;
+      if (now - idleSince >= settleMs) {
+        return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
+      }
+    } else {
+      idleSince = null;
     }
     scheduleNext();
   });
@@ -1027,9 +1101,11 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
 
     // For non-final steps, wait for the turn to FINISH (busy falling edge).
     // submitWithVerify already consumed the observation. If busy was never
-    // observed (instant-reply / unconfirmed submit), busy is already false and
-    // this returns immediately — preserving the legacy instant-reply behaviour
-    // while submit_retries records that verification could not confirm a turn.
+    // observed (instant-reply / unconfirmed submit), busy is already false,
+    // but this now still costs the settle window below (SWITCHBOARD_BUSY_FALL_
+    // SETTLE_MS, 300ms default) rather than returning immediately as before
+    // that gate existed — submit_retries still records that verification
+    // could not confirm a turn.
     if (i < chain.length - 1) {
       // Same per-step deadline as the verify above — bounds the busy-fall wait.
       const result = await waitForBusyFall(sessionId, ctx, stepDeadline);

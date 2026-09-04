@@ -407,6 +407,205 @@ each closing a concrete gap:
    step composer readback is inconclusive" for the case where a fully-observed
    chain step still cannot reach `confirmed` because the composer reading
    was not clean.
+3. **Busy must not have been observed anywhere between the text write and the
+   Enter write either** (`midBusy`, `delayWithBusyPoll`/`submitToPty`/
+   `submitWithVerify`, added 2026-09-04, corrected same day). Gate 1 samples
+   once, before `submitToPty` is even called; there is a second gap it does
+   not cover — between the text landing and the discrete Enter that follows
+   it `DEFAULT_SUBMIT_ENTER_DELAY_MS` (50ms production default) later. Busy
+   observed anywhere in that gap cannot be caused by an Enter that has not
+   been written yet.
+
+   **First version of this gate sampled once, at the start of that gap** (t=0,
+   right after the text write) instead of across it — found the same day, by
+   review, to miss a busy that rises and falls entirely inside the window: 25ms
+   after the text, 25ms before the Enter, satisfies the exact causal violation
+   this gate exists to catch and still read `confirmed`. Invisible to every
+   test in the suite for a structural reason, not bad luck: `SWITCHBOARD_SUBMIT_
+   ENTER_DELAY_MS` is forced to 1ms at the top of `test/trigger-watcher.test.js`
+   for speed, so the window this gate polls is ~1ms wide in every test that
+   predates the fix — no room for "start" and "middle" to differ. Fixed by
+   polling continuously (`delayWithBusyPoll`, `MID_BUSY_POLL_INTERVAL_MS` =
+   5ms) for the whole delay rather than sampling once, true if busy was seen at
+   ANY point in the window — chosen over sampling once at the *end* of the
+   delay instead, because a busy that rises and falls before the Enter is
+   still a real, causally-disqualifying case, and sampling only the end would
+   miss exactly that one. Cost: negligible — the total wait is still bounded to
+   exactly the configured delay, polling only changes what happens during it,
+   not how long it lasts. Proven in `test/trigger-watcher.test.js`, "submitted:
+   busy asserted mid-window (not at the text write itself) between text and
+   Enter must still gate confirmed" — deliberately run at a realistic delay
+   (50ms, overridden per-test), not the suite's 1ms default, since 1ms cannot
+   exhibit the gap either version of this gate closes or misses.
+
+   Same shape as gate 1 either way: a gate, not a proof: it can only withhold a
+   `confirmed` it cannot back up, never manufacture one. **This gate is not
+   shown to be the mechanism behind any real incident** — it is a distinct,
+   mutation-proven gap, constructed independently of the settle-window finding
+   below, and kept because it closes a real hole, not because it explains the
+   field data. **Scope: both the single-`command` path and the chain path**,
+   not chain-only — `submitToPty`/`submitWithVerify` are the same function
+   called from both (`trigger-watcher.js:869` and `:1024`); a bare, non-chain
+   trigger runs the identical race. Proven in `test/trigger-watcher.test.js`,
+   "submitted: busy observed between a step's text write and its own Enter
+   must not confirm it, on a bare command (no chain)". This is unlike the
+   settle-window gate below, which is chain-only by construction
+   (single-command triggers never call `waitForBusyFall`).
+
+**`waitForBusyFall`'s settle window** (`SWITCHBOARD_BUSY_FALL_SETTLE_MS`,
+300 ms default, added 2026-09-04) closes a related but distinct gap, one step
+earlier in a chain, and **is the one tied to real incidents by measurement**.
+Before this, a single `busy=false` sample was enough for `waitForBusyFall` to
+declare the previous step's turn over and write the next step. A command's own
+tail activity — `/compact` still rendering its summary after the turn
+nominally ends — can produce a brief `busy` `false`-then-`true` flicker;
+exiting on the first `false` let the next step get written inside that
+flicker, and the re-assertion of `busy` then landed inside *that* step's own
+verify window, read as its own confirmation.
+
+A competing hypothesis was raised alongside this one: that `isSessionBusy`
+never reads true during compaction at all, and the write goes through because
+the (unrelated) composer-emptiness check sees a box that looks the same
+whether idle or compacting. Measurement rules this out: across the 5 real
+`/compact`→resume results on disk that carry this shape
+(`triggers/processed/{a9a051cd,9151d9f2,45666e69,88f23bd1,b82f5f80}*.result.json`),
+every one of them shows `submit_retries: 0` on the resume step. Had busy never
+been observed at all in that step's own verify window, `submitWithVerify`
+would have taken the retry branch (`submit_retries: 1`) — see `pollForBusyObserved`'s
+"nothing observed" path above. It did not, on any of the five: busy was seen,
+with a `waited_ms` of 0 (4 of 5, busy already true at the first poll tick) or 109 ms
+(1 of 5, `b82f5f80`, caught one poll tick later) after that step's own Enter.
+Busy is not absent during compaction; it reasserts fast enough after the
+previous step's fall that every measured occurrence lands inside a single
+`IDLE_POLL_INTERVAL` (100 ms) of the next step's own write — well inside the
+300 ms settle window. Requiring `busy` to read `false` continuously for that
+window before `waitForBusyFall` resolves closes every measured occurrence.
+Cost: every non-final chain step now waits at least the settle window before
+the next step is written, including the previously-instant "busy never rose"
+case — single-command triggers never call `waitForBusyFall` and are
+unaffected. Proven in `test/trigger-watcher.test.js`, `chain "confirmed" false
+positive: a busy blip right after step 0's turn must not be attributed to step 1`.
+Its own invariant — idle must be *continuous* for the settle window, not just
+"some false sample happened a while ago, regardless of what busy did since" —
+is a separate line (`idleSince = null` on every re-assertion) with its own
+test, `waitForBusyFall settle window: busy that keeps reasserting must never
+let a step be written mid-activity`; deleting that one line leaves 98/98 other
+tests green, so it needed a schedule built specifically to exercise it
+(continuous 200ms-on/200ms-off oscillation, never a 300ms-continuous idle
+window).
+
+**A second cost, not just latency: the settle window can turn an existing
+success into a `chain timeout`.** `waitForBusyFall`'s deadline check runs
+before its settle check (trigger-watcher.js:417-419), so a settle window that
+starts but has not finished continuously when a step's own `timeout_ms`
+arrives resolves as `timedOut`, never as the success it would have been
+pre-settle-window. A turn ending with less than `settleMs` (300ms default) of
+margin before its own deadline now fails where it used to succeed. Chosen
+trade-off: **document this, do not make the settle window additive to the
+deadline.** The one real caller measured — the harness's auto-compaction guard
+— chains steps in the hundreds of *seconds*; a few hundred ms of margin is not
+its regime, and making the window additive would silently change what
+`timeout_ms` means for every caller, including ones already calibrated against
+the old, single-sample behavior. Revisit if a caller with a genuinely tight
+per-step margin turns up. Proven in `test/trigger-watcher.test.js`,
+`waitForBusyFall settle window: a turn finishing with too little margin before
+its own deadline now times out (documented trade-off, not a bug)`.
+
+**Scope, corrected**: the settle window applies to `waitForBusyFall` alone,
+reached only from the chain path's non-final-step branch — single-`command`
+triggers are unaffected. This does **not** hold for the `midBusy` gate above
+(point 3): `submitToPty`/`submitWithVerify` are shared by both the
+single-command call site and the chain call site, so `midBusy` narrows
+`confirmed` on both, not chain-only.
+
+Not established at the byte level, and not to be read as more certain than it
+is: that the busy reassertion in the real incidents specifically *is*
+`/compact`'s own tail activity rather than some other cause with the same
+timing signature. Debug/activity-trace was off for all five captures; nothing
+recorded what the CLI actually wrote to the terminal in that window. The
+`submit_retries: 0` argument above rules out "busy absent throughout", not
+"busy present but for an entirely different, coincidentally-timed reason".
+
+**Direct on-screen confirmation, from one of the field incidents**: the target
+session's own composer held the unsubmitted resume text, visibly, for
+35 minutes, until a human pressed Enter. This confirms the text *was* written
+— `submitToPty` never fails silently to write — and settles nothing about
+`isSessionBusy`'s behavior; it is independent evidence, not a replacement for
+the `submit_retries: 0` argument above. It does retire a DIFFERENT, weaker
+argument that was floated and should not be reused: "the resume text never
+appears in the target's transcript, therefore it was never written." An
+unsubmitted composer is invisible to a transcript by construction — "never
+typed" and "typed, not submitted" produce the identical transcript (nothing),
+so transcript absence cannot distinguish them and was never a valid basis for
+either hypothesis.
+
+### Why `composerEmptyAfterWrite` cannot be made to prove submission, even by feeding it our own writes
+
+A proposal, considered and rejected 2026-09-04: since `submitToPty` writes
+straight to the PTY, invisible to `composer-state.js`'s model (see above),
+route the module's own writes through `noteUserInput` too, the way
+`handleTerminalInput` does for the renderer's keystrokes — then, the
+reasoning goes, `composerEmptyAfterWrite` would finally mean something: empty
+after our own Enter proves the CLI consumed it.
+
+It would not. `noteUserInput` treats **any** `\r` or `\n` byte as an
+unconditional `clearAll` (`composer-state.js`, the `c === '\r' || c === '\n'`
+branch) — proven by execution, not read off the source: `node -e` against
+`createComposerState`/`noteUserInput` directly, and the pre-existing test
+`test/composer-state.test.js:26` ("Enter clears the counter"), both show
+`pending` drop to 0 on `\r` alone, with no signal anywhere in the model for
+whether a real terminal application actually acted on it. The model has no
+feedback channel from the PTY's output back into itself; it encodes an
+assumption about what pressing Enter in a composer normally does, not an
+observation of what this specific CLI, this specific time, actually did.
+Feeding `submitToPty`'s own `command + '\r'` into it would make
+`composerEmptyAfterWrite` read `true` after **every** write, unconditionally
+and by construction — exactly as vacuous a signal as it is today, just
+vacuous for a different reason (today: our writes are invisible to the model;
+under the proposal: the model would see them, but its own `\r` handling
+already assumes success regardless of outcome).
+
+It would also reintroduce a fixed defect from the other end. `noteUserInput`
+stamps `lastInputAt`, and `waitForComposerFree` requires `pending === 0 AND
+(now - lastInputAt) >= quietMs` (3000ms default, `trigger-watcher.js:222`) —
+so routing our own writes through the same clock would make every trigger
+self-block the *next* trigger on that session for a full `quietMs` after
+itself, the identical "a non-human signal holds the quiet clock open" shape
+already fixed twice for terminal reports (mouse: PR #160; cursor-position:
+PR #170). **Conclusion: not pursued.** `composerEmptyAfterWrite` stays a
+human-unsubmitted-input check, useful for what `waitForComposerFree`
+actually needs (never write over a person's half-typed sentence), and not
+repurposed into a self-submission proof it structurally cannot provide. This
+is a written limit, not a gap awaiting a fix.
+
+### An unmeasured hypothesis: does a failed step poison the next chain's own wait?
+
+Raised 2026-09-04, explicitly as unmeasured: the transport never writes into a
+composer holding unsubmitted input (politeness), but that check is the same
+blind `composerEmptyAfterWrite`/`waitForComposerFree` model above — blind to
+the module's OWN prior writes. If an earlier chain's last step left text
+sitting unsubmitted in the real composer (as the 35-minute observation above
+shows happens), a later chain's step 0 write lands on top of that residue,
+producing something Claude Code may not parse as the intended slash command --
+processed as an ordinary message instead, which can genuinely run long. Under
+this hypothesis, the multi-second-to-two-minute waits recorded on step 0
+across the five incidents (32s, 44s, 66s, 102s, 120s) would not be measuring
+`/compact`'s own duration at all, but an artifact of a *previous*, unwitnessed
+failure. **The result schema cannot currently tell these two apart**: both
+produce `{command:"/compact", submit_retries:0, waited_ms:N}` for a large `N`,
+whether `N` is genuine compaction time or the CLI answering a
+residue-contaminated prompt. Distinguishing them needs the target's own
+transcript (`compact_boundary` / `isCompactSummary`, see "Why no discriminator"
+below) — a caller's job today, as already documented, not something
+`trigger-watcher.js` observes. No fix attempted here: the previous section
+already establishes that making the module's own writes visible to the
+composer model is not clean. Flagged as an open question for whoever picks
+this up next, not resolved.
+
+Neither of the two 2026-09-04 gates closes the other's gap — each is proven by
+a test that goes red when the *other* fix is reverted but its own is intact.
+Neither closes the general causality gap below: an external actor's busy,
+landing anywhere in the verify window, still reads identically to our own.
 
 A retry is never eligible for `confirmed` either: needing one already means
 the first Enter did not visibly register, so the strongest claim left is

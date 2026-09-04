@@ -14,6 +14,15 @@ process.env.SWITCHBOARD_SUBMIT_ENTER_DELAY_MS = '1';
 // fast and deterministic when no rise ever arrives (retry path).
 process.env.SWITCHBOARD_SUBMIT_VERIFY_MS = '400';
 
+// waitForBusyFall's settle window (added 2026-09-04): tiny by default so the
+// many chain tests below -- each non-final step pays this once -- stay fast.
+// Still exercises the invariant (busy must read false on more than one poll
+// tick before the wait resolves), just without paying the 300ms production
+// default per step boundary. Tests whose own busy schedule is calibrated
+// against a specific settle value override it locally (see "confirmed" false
+// positive fold and "waitForBusyFall settle window" below).
+process.env.SWITCHBOARD_BUSY_FALL_SETTLE_MS = '50';
+
 const test   = require('node:test');
 const assert = require('node:assert/strict');
 const fs     = require('fs');
@@ -3631,6 +3640,322 @@ test('chain "confirmed" fold: one step composer readback is inconclusive -> pull
   }
 });
 
+// Regression test for the 2026-09-04 field incident: a chain step written
+// right after waitForBusyFall declares the PREVIOUS step's turn finished can
+// be falsely reported as "confirmed" (or "activity") when busy briefly reads
+// false then re-asserts on its own -- the CLI's tail activity after /compact
+// (still writing its summary), not anything the next step's own Enter did.
+// waitForBusyFall must NOT trust a single false sample; it must see busy stay
+// false for a settle window (SWITCHBOARD_BUSY_FALL_SETTLE_MS) before treating
+// the previous turn as over. See .ai/contexts/trigger-watcher.md ("submitted").
+test('chain "confirmed" false positive: a busy blip right after step 0\'s turn must not be attributed to step 1', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '8000';
+    // This test's own BUSY_WINDOWS schedule below is calibrated against a
+    // 300ms settle window specifically (see its comment) -- override the
+    // suite-wide fast default so that relationship holds regardless of it.
+    process.env.SWITCHBOARD_BUSY_FALL_SETTLE_MS     = '300';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-busyfall-flicker-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+
+    // Busy schedule anchored to step 0's own write (not to ctx creation --
+    // fs.watch dispatch latency is not deterministic), simulating /compact:
+    // a real turn, a misleadingly brief drop to idle, then unrelated tail
+    // activity that has nothing to do with step 1's own Enter, then truly
+    // idle for good. The blip (200ms) is shorter than the default settle
+    // (300ms); the tail activity (400ms) is longer, so it must not be missed.
+    let scheduleStart = null;
+    const BUSY_WINDOWS = [
+      [130, 430],   // step 0's genuine turn
+      [630, 1030],  // unrelated tail activity, after a 200ms false blip
+    ];
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      writeCount++;
+      if (writeCount === 1) scheduleStart = Date.now();
+    };
+    ctx.isSessionBusy = (id) => {
+      if (id !== SESSION_ID || scheduleStart === null) return false;
+      const t = Date.now() - scheduleStart;
+      return BUSY_WINDOWS.some(([lo, hi]) => t >= lo && t < hi);
+    };
+
+    watcher = start(ctx);
+
+    const uuid = 'chain-busyfall-flicker-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume the task' }],
+      timeout_ms: 6000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 7000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 2);
+    // Step 1's own write never touches busy in this schedule -- any "busy"
+    // seen around it is provably step 0's tail activity, not step 1's Enter.
+    assert.equal(result.steps[1].submit_retries, 1,
+      'step 1 must retry its Enter: nothing it wrote ever caused a busy transition');
+    assert.notEqual(result.submitted, 'confirmed',
+      'a busy blip that is provably unrelated to step 1\'s own write must never fold the chain up to "confirmed"');
+    assert.notEqual(result.submitted, 'activity',
+      'step 1 must not even read as "activity" -- it never observed a busy rise it could plausibly claim');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    // Restore the suite-wide fast default (see top of file) rather than
+    // deleting it -- deleting would fall through to trigger-watcher.js's own
+    // 300ms production default for every chain test that runs afterwards.
+    process.env.SWITCHBOARD_BUSY_FALL_SETTLE_MS = '50';
+    cleanup(tmp);
+  }
+});
+
+// Guards the settle window's own invariant: idle must be CONTINUOUS, not just
+// "some false sample happened a while ago". `waitForBusyFall`'s `else {
+// idleSince = null; }` (trigger-watcher.js:428-430) is what enforces that --
+// remove it and `idleSince` stops resetting on every re-assertion of busy, so
+// the window measures "time since the first false sample" instead of "time
+// since busy last went false and stayed there". Neither the happy-path chain
+// tests nor the false-positive-fold test above catch this: both use schedules
+// where busy either never returns after falling, or returns once and then
+// stays -- neither exercises a busy that keeps coming back.
+test('waitForBusyFall settle window: busy that keeps reasserting must never let a step be written mid-activity', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+    process.env.SWITCHBOARD_BUSY_FALL_SETTLE_MS     = '300';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-busyfall-oscillate-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+
+    // Busy oscillates 200ms-on/200ms-off, forever, from the moment step 0 is
+    // written: [0,200) busy, [200,400) idle, [400,600) busy, [600,800) idle...
+    // No idle window is ever 300ms long, so a correct waitForBusyFall can only
+    // time out -- it must never see "idle" as the reason it stopped waiting.
+    let scheduleStart = null;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      if (scheduleStart === null) scheduleStart = Date.now();
+    };
+    ctx.isSessionBusy = (id) => {
+      if (id !== SESSION_ID || scheduleStart === null) return false;
+      const t = Date.now() - scheduleStart;
+      return Math.floor(t / 200) % 2 === 0;
+    };
+
+    watcher = start(ctx);
+
+    const uuid = 'busyfall-oscillate-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume the task' }],
+      timeout_ms: 1800,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3500);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false,
+      'busy that never settles for a full 300ms window must never resolve as "the turn ended"');
+    assert.equal(result.error, 'chain timeout');
+    assert.equal(result.steps_completed, 0,
+      'step 1 must never be written while step 0\'s session is provably still oscillating busy');
+    assert.ok(!ctx._written.includes('resume the task'),
+      'the PTY must never receive step 1\'s text while busy keeps reasserting');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    // Restore the suite-wide fast default (see top of file) rather than
+    // deleting it -- deleting would fall through to trigger-watcher.js's own
+    // 300ms production default for every chain test that runs afterwards.
+    process.env.SWITCHBOARD_BUSY_FALL_SETTLE_MS = '50';
+    cleanup(tmp);
+  }
+});
+
+// Specification, not a bug report: locks in a deliberate choice, made and
+// documented 2026-09-04 (see .ai/contexts/trigger-watcher.md, "submitted"),
+// about how the settle window interacts with a step's own deadline.
+// `waitForBusyFall`'s deadline check (trigger-watcher.js:417-419) runs BEFORE
+// the settle check, so a settle window that starts but does not finish
+// continuously before the deadline resolves as `timedOut`, never as success --
+// even when the turn it was waiting on had already, genuinely, finished. A
+// turn ending with less margin than SWITCHBOARD_BUSY_FALL_SETTLE_MS (300ms
+// default) before its step's own timeout_ms now fails where it used to
+// succeed. Chosen over making the settle window additive to the deadline,
+// because the one real caller measured (the harness's auto-compaction guard)
+// times its chain in the hundreds of SECONDS -- a few hundred ms of margin is
+// not its regime -- and an additive budget would silently change what
+// `timeout_ms` means for every caller, including ones that already calibrated
+// against the old, single-sample behavior. If a caller with a genuinely tight
+// per-step `timeout_ms` margin turns up, this trade-off is revisited.
+test('waitForBusyFall settle window: a turn finishing with too little margin before its own deadline now times out (documented trade-off, not a bug)', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+    process.env.SWITCHBOARD_BUSY_FALL_SETTLE_MS     = '300';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-busyfall-tight-deadline-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+
+    // The turn genuinely, permanently ends at 900ms after step 0 is written --
+    // 100ms before the chain's own 1000ms timeout_ms. Pre-settle-window code
+    // would have resolved on that single false sample and succeeded with
+    // ~100ms to spare. The settle window needs 300ms of continuous idle past
+    // that point (until 1200ms) to say the same thing, and the 1000ms
+    // deadline fires first.
+    let scheduleStart = null;
+    let busy = false;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      if (scheduleStart === null) {
+        scheduleStart = Date.now();
+        busy = true;
+        setTimeout(() => { busy = false; }, 900);
+      }
+    };
+    ctx.isSessionBusy = (id) => (id === SESSION_ID ? busy : false);
+
+    watcher = start(ctx);
+
+    const uuid = 'busyfall-tight-deadline-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume the task' }],
+      timeout_ms: 1000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false,
+      'documented trade-off: a settle window in progress when the deadline fires resolves as timeout, not as the success it would have been pre-settle-window');
+    assert.equal(result.error, 'chain timeout');
+    assert.equal(result.steps_completed, 0);
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    process.env.SWITCHBOARD_BUSY_FALL_SETTLE_MS = '50';
+    cleanup(tmp);
+  }
+});
+
+// Companion gap to the busy-blip fold above, closed by a DIFFERENT line:
+// `midBusy` in `submitToPty`/`submitWithVerify`. There, a step's own Enter was
+// never the cause of what `waitForBusyFall` (mis)read as "the previous turn
+// ended". Here, a step's own Enter has not even been WRITTEN yet: busy turns
+// true synchronously the instant this step's TEXT lands, strictly before its
+// discrete Enter write (`DEFAULT_SUBMIT_ENTER_DELAY_MS` later). That busy
+// cannot be attributed to an Enter that does not exist yet at the moment it is
+// observed. The settle-window fix above does not touch this: step 0's own
+// turn here is clean, genuinely observed, and falls for good before step 1 is
+// ever written -- the false confirmation happens entirely within step 1's own
+// submitWithVerify call, on a session that is otherwise perfectly quiet.
+test('submitted: busy observed between a step\'s text write and its own Enter must not confirm it (midBusy gate)', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-midbusy-gate-' + Date.now();
+    const STEP1_TEXT = 'resume the task';
+    let busy = false;
+    let sawStep0Enter = false;
+
+    const ptyProcess = {
+      pid: process.pid,
+      write(data) {
+        if (data === '\r' && !sawStep0Enter) {
+          // Step 0's real Enter: a genuine, cleanly-observed turn that falls
+          // for good well before step 1 is ever written.
+          sawStep0Enter = true;
+          busy = true;
+          setTimeout(() => { busy = false; }, 60);
+          return;
+        }
+        if (data === STEP1_TEXT) {
+          // Step 1's TEXT lands. Its own Enter has NOT been written yet
+          // (submitToPty writes text, waits DELAY_MS, then writes '\r').
+          // Busy flips true HERE, synchronously -- structurally not caused by
+          // an Enter that does not exist yet.
+          busy = true;
+          return;
+        }
+        // Step 1's own Enter ('\r' the second time): absorbed, no-op. Busy
+        // was already true before it, and stays true.
+      },
+    };
+
+    const ctx = {
+      log: silentLog,
+      getPtyForSession: (id) => (id === SESSION_ID ? { ptyProcess } : null),
+      isSessionBusy: (id) => (id === SESSION_ID ? busy : false),
+      isPtyAlive: () => true,
+      getComposerState: (id) => (id === SESSION_ID ? { pending: 0, lastInputAt: 0 } : null),
+    };
+    watcher = start(ctx);
+
+    const uuid = 'midbusy-gate-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: STEP1_TEXT }],
+      timeout_ms: 3000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 2);
+    assert.equal(result.steps[1].submit_retries, 0,
+      'precondition: step 1 read busy on its very first poll tick (waited_ms 0), the exact shape reported 2026-09-04');
+    assert.equal(result.steps[1].waited_ms, 0,
+      'precondition: busy was already true before step 1\'s own first poll ever ran');
+    assert.notEqual(result.submitted, 'confirmed',
+      'busy present before this step\'s own Enter was sent must never confirm that Enter');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
 test('total_waited_ms: equals the sum of steps[*].waited_ms, including each step\'s own politeness wait', async () => {
   const tmp = mkTmp();
   let watcher;
@@ -3759,6 +4084,130 @@ test('submitted: preBusy must be sampled before the write, not after -- a sessio
     if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// The midBusy gate lives in `submitToPty`/`submitWithVerify`, shared by BOTH
+// call sites (trigger-watcher.js:869 single-command, :1024 chain step) -- a
+// bare, non-chain trigger runs the identical race the chain-only "midBusy
+// gate" test above exercises. This is unlike the settle-window fix, which is
+// reached only from the chain path (`waitForBusyFall`'s only caller is the
+// chain loop's non-final-step branch).
+test('submitted: busy observed between a step\'s text write and its own Enter must not confirm it, on a bare command (no chain)', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-midbusy-bare-' + Date.now();
+    const COMMAND = '/compact';
+    let busy = false;
+    const ctx = makeCtx(SESSION_ID, () => busy);
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      if (data === COMMAND) {
+        // Busy flips true HERE, synchronously, right after the text lands --
+        // strictly before the discrete Enter that follows it. Same shape as
+        // the chain version above, on the single-command path instead.
+        busy = true;
+      }
+      // The Enter write ('\r'): absorbed, no-op. Busy was already true before
+      // it and stays true.
+    };
+    watcher = start(ctx);
+
+    const uuid = 'midbusy-bare-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, wait: 'none', command: COMMAND });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submit_retries, 0,
+      'precondition: busy was observed on the very first poll tick');
+    assert.notEqual(result.submitted, 'confirmed',
+      'busy present before this command\'s own Enter was sent must never confirm it, chain or not');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// The test above (and its chain twin) both assert busy synchronously AT the
+// text write -- t=0 of the text->Enter window. A single sample taken at t=0
+// catches that, which is why neither test can see this gap: `midBusy` used to
+// sample once, at t=0, and the suite runs with SWITCHBOARD_SUBMIT_ENTER_DELAY_MS
+// forced to 1ms (top of file) for speed, leaving no window in between for a
+// mid-window sample to differ from a t=0 sample anyway. This test overrides
+// the delay to DEFAULT_SUBMIT_ENTER_DELAY_MS's own real value (50ms) and
+// asserts busy strictly AFTER the text write and while it is still true when
+// the Enter is written -- proving `midBusy` must poll the window, not sample
+// its edges.
+test('submitted: busy asserted mid-window (not at the text write itself) between text and Enter must still gate confirmed', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+    // Realistic delay -- not the suite's 1ms -- so a mid-window sample has
+    // somewhere to land that a t=0 (or t=delay) sample would also land on;
+    // see the busy schedule below for why only continuous polling catches it.
+    process.env.SWITCHBOARD_SUBMIT_ENTER_DELAY_MS = '50';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-midbusy-window-' + Date.now();
+    const COMMAND = 'resume the task';
+    let scheduleStart = null;
+    let busy = false;
+    const ctx = makeCtx(SESSION_ID, () => busy);
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      if (data === COMMAND) {
+        // Text write at t=0. Busy stays FALSE here -- unlike the t=0 test
+        // above -- so a sample taken only at the start of the delay misses
+        // it, exactly like a sample taken only at t=0 would in production.
+        scheduleStart = Date.now();
+      }
+    };
+    // Busy rises at t=20ms (inside the 50ms text->Enter delay, well after its
+    // start) and is still true at t=50ms when the Enter is written, and
+    // beyond -- so it is there for submitWithVerify's own post-Enter poll too
+    // (sawBusy on the very first tick), isolating midBusy as the only gate
+    // that can still stop this from reading "confirmed".
+    ctx.isSessionBusy = (id) => {
+      if (id !== SESSION_ID || scheduleStart === null) return false;
+      return (Date.now() - scheduleStart) >= 20;
+    };
+    watcher = start(ctx);
+
+    const uuid = 'midbusy-window-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, wait: 'none', command: COMMAND });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submit_retries, 0,
+      'precondition: busy was already true by the time the post-Enter poll started');
+    assert.notEqual(result.submitted, 'confirmed',
+      'busy rising mid-delay, well before this command\'s own Enter was sent, must still gate confirmed -- ' +
+      'a sample taken only at the start (or only at the end) of the window must not be trusted alone');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    process.env.SWITCHBOARD_SUBMIT_ENTER_DELAY_MS = '1';
     cleanup(tmp);
   }
 });
