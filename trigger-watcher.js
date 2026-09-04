@@ -936,8 +936,6 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     // see .ai/contexts/trigger-watcher.md, "Removing the entry"
     safeLogError(ctx, '[trigger-watcher] Trigger processing threw, writing a generic failure result:',
       name, err && err.message);
-    // `internal: true` marks this as our bug, not a validation refusal — see
-    // .ai/contexts/trigger-watcher.md, "Removing the entry".
     await writeResult({ ok: false, error: 'internal error: ' + (err && err.message), internal: true });
   }
 }
