@@ -21,6 +21,13 @@
 //   - No write into a composer holding unsubmitted input (see docs/automation.md)
 //   - Optional expectedCwd target guard, fails closed (see .ai/contexts/trigger-watcher.md)
 //
+// Startup scan: start() also enumerates whatever *.json already sits at the
+// root of the triggers dir (never processed/) and feeds it through the same
+// path a live fs.watch 'rename' event would — a trigger written while the app
+// was closed is otherwise never seen (fs.watch only reports changes after it
+// is installed). A trigger older than SWITCHBOARD_TRIGGER_MAX_AGE_MS is
+// refused, not run — see .ai/contexts/trigger-watcher.md, "Startup scan".
+//
 // Platform note: fs.watch is Linux-only reliable (I2). On macOS, inotify
 // events may be coalesced or delayed; not blocked but not tested.
 'use strict';
@@ -483,6 +490,35 @@ function getIdleTimeout() {
   return DEFAULT_IDLE_TIMEOUT;
 }
 
+// Default staleness threshold for the startup scan (see .ai/contexts/
+// trigger-watcher.md, "Startup scan"). A trigger written more than this long
+// ago is refused rather than run: it was written for a session state that may
+// no longer exist by the time the app comes back up.
+//
+// Rationale for 5 minutes: the only two "legitimate wait" durations ever
+// measured on this transport are 66s and 102s (chain step 0, five real
+// /compact incidents, see .ai/contexts/trigger-watcher.md). 300_000 ms clears
+// the larger of those by ~3x, so a trigger that is merely slow to be picked up
+// is never mistaken for a stale one — while staying far short of "hours",
+// which is the case JB's own example (a /compact issued 6h earlier no longer
+// targets the same session) treats as unambiguously stale. It also reuses
+// DEFAULT_IDLE_TIMEOUT's already-established number and rationale above
+// ("the practical upper bound for a genuine wait") rather than inventing a
+// second one. Configurable via SWITCHBOARD_TRIGGER_MAX_AGE_MS.
+const DEFAULT_TRIGGER_MAX_AGE_MS = 300_000; // ms — 5 minutes
+
+// Read live, like getIdleTimeout() above — NOT cached at module load. A
+// module-load-time constant would miss every env var set after require()
+// (the exact trap documented at the top of this file's test suite).
+function getTriggerMaxAgeMs() {
+  const v = process.env.SWITCHBOARD_TRIGGER_MAX_AGE_MS;
+  if (v !== undefined) {
+    const parsed = parseInt(v, 10);
+    return Number.isFinite(parsed) ? parsed : DEFAULT_TRIGGER_MAX_AGE_MS; // NaN guard
+  }
+  return DEFAULT_TRIGGER_MAX_AGE_MS;
+}
+
 /**
  * Poll until isSessionBusy(sessionId) returns false, or the timeout expires,
  * or the session exits (PTY no longer available).
@@ -616,6 +652,25 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     // C1: reject oversized files before reading
     ctx.log.warn('[trigger-watcher] Oversized trigger rejected:', name, stat.size);
     await writeResult({ ok: false, error: 'trigger too large (max 64 KB)' });
+    return;
+  }
+
+  // ── 1b. Staleness guard — see .ai/contexts/trigger-watcher.md, "Startup scan" ──
+  // Applies uniformly to every trigger, scan-found or live-arriving: mtime is
+  // the file's write time regardless of how this run came to look at it.
+  const ageMs    = Date.now() - stat.mtimeMs;
+  const maxAgeMs = getTriggerMaxAgeMs();
+  if (ageMs > maxAgeMs) {
+    ctx.log.warn('[trigger-watcher] Stale trigger refused:', name,
+      Math.round(ageMs) + 'ms old, max ' + maxAgeMs + 'ms');
+    await writeResult({
+      ok:        false,
+      submitted: SUBMITTED_NO,
+      error:     ERROR_NOT_SENT,
+      reason:    `trigger is ${Math.round(ageMs)}ms old, older than the ${maxAgeMs}ms ` +
+                 'staleness limit; refused rather than act on a request that may no ' +
+                 'longer target the intended session state',
+    });
     return;
   }
 
@@ -1152,6 +1207,11 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
 /**
  * Start the trigger watcher.
  *
+ * Also runs a one-time startup scan of whatever *.json already sits at the
+ * root of the triggers dir when this is called, feeding each one through the
+ * same handleFile() path a live 'rename' event would (dedup + MAX_INFLIGHT
+ * both apply identically). See .ai/contexts/trigger-watcher.md, "Startup scan".
+ *
  * @param {object} ctx
  * @param {function} ctx.getPtyForSession  (sessionId: string) => { ptyProcess, cwd } | null;
  *                                          `cwd` feeds the expectedCwd target
@@ -1224,31 +1284,42 @@ function start(ctx) {
       });
   }
 
+  // Shared by the live fs.watch callback below AND the startup scan
+  // (scanExistingTriggers) — same dedup (inFlight/retained) and same
+  // MAX_INFLIGHT backpressure (waitQueue) for either origin of a filename.
+  // See .ai/contexts/trigger-watcher.md, "Startup scan".
+  function handleFile(filename) {
+    if (!filename || !filename.endsWith('.json')) return;
+    // Ignore files inside subdirectories (e.g. processed/) — fs.watch on
+    // Linux only reports the basename for non-recursive watches, but be
+    // defensive: skip anything that looks like a path separator. readdirSync
+    // on triggersDir never returns a nested path either way, so this guard
+    // covers the watch-only case in practice.
+    if (filename.includes('/') || filename.includes(path.sep)) return;
+    if (inFlight.has(filename) || retained.has(filename)) return;
+
+    // Confirm the file still exists (a 'rename' event fires on delete too;
+    // a scanned name can also have been removed between readdir and here).
+    const filePath = path.join(triggersDir, filename);
+    try {
+      fs.accessSync(filePath, fs.constants.R_OK);
+    } catch {
+      return; // File gone or not readable yet — skip
+    }
+
+    if (inFlight.size >= MAX_INFLIGHT) {
+      // W4: backpressure — queue for later
+      waitQueue.push(filename);
+      return;
+    }
+    dispatch(filename);
+  }
+
   let watcher;
   try {
     watcher = fs.watch(triggersDir, { persistent: true }, (eventType, filename) => {
       if (eventType !== 'rename') return;
-      if (!filename || !filename.endsWith('.json')) return;
-      // Ignore files inside subdirectories (e.g. processed/) — fs.watch on
-      // Linux only reports the basename for non-recursive watches, but be
-      // defensive: skip anything that looks like a path separator.
-      if (filename.includes('/') || filename.includes(path.sep)) return;
-      if (inFlight.has(filename) || retained.has(filename)) return;
-
-      // Confirm the file still exists (the rename event fires on delete too)
-      const filePath = path.join(triggersDir, filename);
-      try {
-        fs.accessSync(filePath, fs.constants.R_OK);
-      } catch {
-        return; // File gone or not readable yet — skip
-      }
-
-      if (inFlight.size >= MAX_INFLIGHT) {
-        // W4: backpressure — queue for later
-        waitQueue.push(filename);
-        return;
-      }
-      dispatch(filename);
+      handleFile(filename);
     });
 
     watcher.on('error', (err) => {
@@ -1257,6 +1328,20 @@ function start(ctx) {
   } catch (err) {
     ctx.log.error('[trigger-watcher] Failed to start watcher:', err.message);
     return { close() {} };
+  }
+
+  // Startup scan — see .ai/contexts/trigger-watcher.md, "Startup scan". Runs
+  // AFTER the watcher is installed, deliberately: installing it first closes
+  // the window where a trigger written between "watcher up" and "scan done"
+  // would otherwise be seen by neither. Sub-directories (processed/ in
+  // particular) are never descended into — readdirSync on triggersDir itself
+  // only ever returns its direct children, and the '.json' filter in
+  // handleFile() additionally excludes the 'processed' directory entry itself.
+  try {
+    const names = fs.readdirSync(triggersDir);
+    for (const name of names) handleFile(name);
+  } catch (err) {
+    ctx.log.error('[trigger-watcher] Startup scan failed:', err.message);
   }
 
   return {

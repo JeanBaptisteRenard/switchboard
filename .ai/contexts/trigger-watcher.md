@@ -71,6 +71,103 @@ ms — and holds one of the `MAX_INFLIGHT` (8) slots for its whole duration. So
 like any other, and a few such triggers stall the queue. `timeout_ms` is the
 only lever.
 
+### Startup scan
+
+**The defect this closes**: `start()` used to do nothing but install
+`fs.watch`. A trigger file already sitting in the directory when `start()`
+runs — written while the app was closed, or between one launch and the next —
+never produces a `rename` event (there was nothing watching yet), so it was
+never processed: not on that launch, not on any later one either, since
+nothing ever revisits the directory's existing contents. Measured incident: a
+trigger written at 00:44, the app restarted for an update at 00:45:28 — no
+`.result.json` was ever produced, and the file stayed on disk, inert. The
+attempt and the loss look identical on disk (both are "a `.json` file sitting
+in the triggers directory"), which is what made this hard to diagnose from the
+outside: nothing distinguishes "still waiting" from "will never run."
+
+**The fix**: `start()` now also does one `fs.readdirSync(triggersDir)` and
+feeds every `*.json` name it finds through `handleFile()` — the exact same
+function the live `fs.watch` callback calls for a `rename` event. Scan-origin
+and watch-origin names are indistinguishable once inside `handleFile()`: same
+dedup (`inFlight`/`retained`), same `MAX_INFLIGHT` backpressure (`waitQueue`),
+same eventual call into `dispatch()` → `processTriggerFile()`. This is
+deliberate — a second, parallel dispatch path for "the ones the scan found"
+would double the surface for the two invariants "always a result" / "never
+processed twice" (see "Removing the entry" below) to disagree with each other.
+
+**Ordering: watcher installed BEFORE the scan runs.** The alternative order
+(scan first, install the watcher after) leaves a window — however
+narrow — where a trigger written between the scan's `readdirSync` and the
+watcher's installation is seen by neither: exactly the bug this section fixes,
+just narrowed rather than closed. Installing the watcher first, then scanning,
+means the only way to miss a file is for it to be written and fully
+disappear again before the scan's `readdirSync` call — not a real case for a
+trigger transport, since nothing but this module's own processing ever
+deletes a trigger file. `fs.watch` registration and the scan's `readdirSync`
+both run synchronously with no `await` between them, so there is no event-loop
+turn in which a file created in that gap could be missed by both: any
+`fs.watch` callback for a file that arrives in the gap cannot fire until the
+current synchronous call stack (which includes the scan) returns control to
+the event loop.
+
+**The staleness guard.** A trigger older than `SWITCHBOARD_TRIGGER_MAX_AGE_MS`
+(default 300 000 ms / 5 minutes) is refused rather than run — JB's framing:
+a `/compact` written six hours ago no longer targets the same session state,
+and running it anyway does more damage than dropping it. "Age" is the
+trigger file's own `mtimeMs` versus `Date.now()` at the moment
+`processTriggerFile` inspects it (the existing `lstatSync` call from the C1/C2
+size and symlink guards — the age check reads `stat.mtimeMs` off that same
+`stat`, no extra syscall). The check lives inside `processTriggerFile` itself,
+not in the scan, so it applies uniformly regardless of whether a name arrived
+via the scan or a live `rename` event — a file that ages out while queued
+behind `MAX_INFLIGHT` gets the same treatment as one that was already stale
+when the scan found it.
+
+Default of 5 minutes: the only two "legitimate wait" durations ever measured
+on this transport are 66 s and 102 s (chain step 0, five real `/compact`
+incidents — see "An unmeasured hypothesis" above for the full five-value set).
+300 000 ms clears the larger of those by roughly 3x, so a trigger that is
+merely slow through no fault of its own is never misread as stale, while
+staying far short of "hours" — the case JB's own example already treats as
+unambiguous. It also reuses `DEFAULT_IDLE_TIMEOUT`'s existing number and
+rationale ("the practical upper bound for a genuine wait", see its comment
+above) instead of inventing a second, unrelated constant. Configurable via
+`SWITCHBOARD_TRIGGER_MAX_AGE_MS`, read live per file (`getTriggerMaxAgeMs()`,
+mirrors `getIdleTimeout()`) — not cached at module load, the exact trap this
+file's own test suite documents at its top (`SWITCHBOARD_SUBMIT_ENTER_DELAY_MS`
+forced to `1` for the whole run) for module-load-time env reads.
+
+A refused-for-staleness trigger is written up like any other refusal:
+`{ok: false, submitted: "no", error: "not sent", reason: "..."}`, through the
+regular `writeResult()` path — result file in `processed/`, trigger deleted
+from the root. It is never left on disk: doing so would trade one silent loss
+(never processed) for another (processed-looking result never written, file
+still there). `error: "not sent"` specifically, not a new value: item 3 of the
+brief that produced this fix flags a real downstream constraint — the harness
+(`harness/cmd/harness/compact.go`) buckets anything other than exactly
+`"confirmed"` as pessimistic already, but distinguishes within that bucket by
+retrying on `"not sent"` while stalling on `"chain timeout"`. A stale refusal
+sent nothing to any PTY, so `"not sent"` is the semantically correct value —
+and the one that lets the harness re-evaluate the (probably-gone) session
+cleanly instead of treating the refusal as a hung chain.
+
+**Never descends into `processed/`.** `readdirSync(triggersDir)` only
+returns direct children; it does not recurse. The existing `.json`-suffix
+filter in `handleFile()` additionally excludes the `processed` directory
+entry itself (a directory name has no `.json` suffix), so no separate
+exclusion was needed for the one sub-directory this module creates.
+
+Tests: `test/trigger-watcher.test.js`, the "Startup scan" section — a
+pre-existing trigger being picked up, the age guard's refusal shape, the age
+threshold being re-read live across two triggers processed by the same
+running watcher (not fixed at the point `trigger-watcher.js` was first
+required), scan/watcher dedup (a name torn down and recreated — a plain
+overwrite reports as a `change` event on this platform and would prove
+nothing — while the scan's own dispatch is still in-flight), `processed/`
+never being scanned, and `MAX_INFLIGHT` being respected for scan-origin names
+(exactly 8 of 12 pre-existing triggers start immediately; releasing 3 lets 3
+queued ones take their place).
+
 ### Session serialization
 
 `MAX_INFLIGHT` bounds how many trigger *files* run concurrently; it is silent

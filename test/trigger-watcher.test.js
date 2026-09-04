@@ -4786,3 +4786,311 @@ test('target guard: a chain refused at step 0 releases the session lock -- a leg
     cleanup(tmp);
   }
 });
+
+// ── Startup scan ──────────────────────────────────────────────────────────
+// A trigger written while the app was closed sat inert forever: fs.watch only
+// reports changes made after it is installed, and nothing else ever looked at
+// the directory's existing contents. See .ai/contexts/trigger-watcher.md,
+// "Startup scan".
+
+test('startup scan: a trigger already on disk before start() is called is still processed', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-scan-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+
+    const uuid = 'scan-' + Date.now();
+    // Written before start() -- this is the "app was closed" case: no
+    // fs.watch instance exists yet to see it arrive.
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, wait: 'none', command: '/compact' });
+
+    watcher = start(ctx);
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.ok(ctx._written.includes('/compact'));
+    assert.ok(!fs.existsSync(path.join(tmp, uuid + '.json')),
+      'the trigger file must be gone from the root once processed');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('startup scan: a trigger older than SWITCHBOARD_TRIGGER_MAX_AGE_MS is refused, not run, and moved to processed/', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+    process.env.SWITCHBOARD_TRIGGER_MAX_AGE_MS  = '1000'; // 1s
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-stale-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+
+    const uuid = 'stale-' + Date.now();
+    const triggerPath = writeTrigger(tmp, uuid, { sessionId: SESSION_ID, wait: 'none', command: '/compact' });
+    // Backdate the file well past the 1s threshold, simulating "written
+    // hours ago, app was closed the whole time" without an actual sleep.
+    const oldTime = new Date(Date.now() - 3600000); // 1h ago
+    fs.utimesSync(triggerPath, oldTime, oldTime);
+
+    watcher = start(ctx);
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.equal(result.submitted, 'no');
+    // Item 3 of the brief: the harness treats anything but exactly "confirmed"
+    // as pessimistic, and specifically retries on "not sent" while it stalls
+    // on "chain timeout" -- a stale refusal sent nothing, so "not sent" is the
+    // value that lets the harness re-evaluate cleanly.
+    assert.equal(result.error, 'not sent');
+    assert.match(result.reason, /older than/i);
+
+    assert.deepEqual(ctx._written, [], 'a stale trigger must never reach the PTY');
+    assert.ok(!fs.existsSync(triggerPath),
+      'a refused stale trigger must not be left on disk -- that would just swap one silent loss for another');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    delete process.env.SWITCHBOARD_TRIGGER_MAX_AGE_MS;
+    cleanup(tmp);
+  }
+});
+
+test('startup scan: the max-age threshold is read live per trigger, not cached at require() time', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-liveage-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+    watcher = start(ctx);
+
+    const oldTime = new Date(Date.now() - 10000); // 10s old, fixed for both files below
+
+    // First file: threshold narrower than the file's age -> refused.
+    process.env.SWITCHBOARD_TRIGGER_MAX_AGE_MS = '1000'; // 1s
+    const uuidA = 'liveage-a-' + Date.now();
+    const pathA = writeTrigger(tmp, uuidA, { sessionId: SESSION_ID, wait: 'none', command: 'AAAA' });
+    fs.utimesSync(pathA, oldTime, oldTime);
+    await waitForFile(path.join(tmp, 'processed', uuidA + '.result.json'), 2000);
+    assert.equal(readResult(path.join(tmp, 'processed'), uuidA).ok, false,
+      'a 10s-old trigger must be refused under a 1s threshold');
+
+    // Second file, same age, but the env var is now wider than it -- must not
+    // be refused. Same running watcher, same require()'d module: this only
+    // passes if the threshold is re-read per file rather than fixed at the
+    // moment trigger-watcher.js was first loaded.
+    process.env.SWITCHBOARD_TRIGGER_MAX_AGE_MS = '3600000'; // 1h
+    const uuidB = 'liveage-b-' + Date.now();
+    const pathB = writeTrigger(tmp, uuidB, { sessionId: SESSION_ID, wait: 'none', command: 'BBBB' });
+    fs.utimesSync(pathB, oldTime, oldTime);
+    await waitForFile(path.join(tmp, 'processed', uuidB + '.result.json'), 2000);
+    assert.equal(readResult(path.join(tmp, 'processed'), uuidB).ok, true,
+      'the same 10s-old age must be accepted once the env var widens the threshold');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    delete process.env.SWITCHBOARD_TRIGGER_MAX_AGE_MS;
+    cleanup(tmp);
+  }
+});
+
+test('startup scan: never descends into processed/ -- a leftover file there is not treated as a trigger', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-noscan-processed-' + Date.now();
+    const ctx        = makeCtx(SESSION_ID);
+
+    // Pre-create processed/ with a stray .json in it before start() -- if the
+    // scan ever recursed, this would be picked up and misprocessed (it is not
+    // shaped like a trigger and has no matching *.json in the root).
+    const processedDir = path.join(tmp, 'processed');
+    fs.mkdirSync(processedDir, { recursive: true });
+    fs.writeFileSync(path.join(processedDir, 'leftover.json'), JSON.stringify({ not: 'a trigger' }), 'utf8');
+
+    watcher = start(ctx);
+
+    // Give the scan a moment to run, then drop a real trigger to confirm the
+    // watcher/scan is still alive and working normally afterward.
+    await new Promise((r) => setTimeout(r, 100));
+
+    const uuid = 'noscan-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, wait: 'none', command: '/compact' });
+    await waitForFile(path.join(tmp, 'processed', uuid + '.result.json'), 2000);
+
+    // The stray file in processed/ must be untouched -- no result.json was
+    // ever produced for it under any derived name, and it still holds its
+    // original content.
+    const leftover = fs.readFileSync(path.join(processedDir, 'leftover.json'), 'utf8');
+    assert.deepEqual(JSON.parse(leftover), { not: 'a trigger' });
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('startup scan vs watcher race: a file present at start() is dispatched exactly once', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    // Long enough that the trigger is still in-flight (mid submit-verify)
+    // when we fire a duplicate 'rename' event on it a moment later.
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '60000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-race-' + Date.now();
+    // wait:'none' skips the idle wait; SWITCHBOARD_SUBMIT_VERIFY_MS is 400ms
+    // (set at the top of this file), so the trigger stays in-flight for at
+    // least that long after being dispatched -- ample room for a duplicate
+    // event to land while it is still processing.
+    const ctx = makeCtx(SESSION_ID);
+    const payload = { sessionId: SESSION_ID, wait: 'none', command: '/compact' };
+    const uuid = 'race-' + Date.now();
+    const triggerPath = writeTrigger(tmp, uuid, payload);
+
+    watcher = start(ctx); // scan picks the file up synchronously, dispatch begins
+
+    // Fire a genuine duplicate 'rename' event for the SAME filename right
+    // away, synchronously after start() returns. A plain overwrite
+    // (fs.writeFileSync over the existing file) reports as a 'change' event
+    // on this platform, which the watcher already ignores by construction --
+    // it would prove nothing about the dedup path. unlink+recreate reliably
+    // fires 'rename' both times, the same shape a real second trigger drop
+    // under the same name (or a delayed FS event replay) would produce. The
+    // scan's own dispatch is still in-flight at this point (it takes at least
+    // SWITCHBOARD_SUBMIT_VERIFY_MS to finish, well after this synchronous
+    // block returns), so this exercises the real race the dedup exists for.
+    fs.unlinkSync(triggerPath);
+    fs.writeFileSync(triggerPath, JSON.stringify(payload), 'utf8');
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    // Give any wrongly-admitted second dispatch time to also finish and write
+    // a command, if the dedup were broken.
+    await new Promise((r) => setTimeout(r, 300));
+
+    const commandWrites = ctx._written.filter((w) => w !== '\r');
+    assert.equal(commandWrites.length, 1,
+      'the same filename must be dispatched exactly once, whether the scan or the watcher saw it first');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('startup scan respects MAX_INFLIGHT: only 8 of 12 pre-existing triggers start immediately, the rest queue', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR        = tmp;
+    // Large enough that nothing times out on its own -- completion is driven
+    // entirely by flipping busy to false below, never by the idle timeout.
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '60000';
+
+    const { start } = require('../trigger-watcher');
+
+    const COUNT = 12; // MAX_INFLIGHT (8) + 4 queued
+    const uuids      = Array.from({ length: COUNT }, (_, i) => `scanmax-${Date.now()}-${i}`);
+    const sessionIds = uuids.map((u) => 'sess-' + u);
+    const uuidBySession = new Map(sessionIds.map((sid, i) => [sid, uuids[i]]));
+
+    const busy            = new Map(sessionIds.map((sid) => [sid, true])); // all stay busy until released
+    const startedSessions = new Set(); // sessions whose isSessionBusy has been polled at least once
+    const written  = [];
+    const composer = { pending: 0, lastInputAt: 0 };
+    const ptyProcess = { pid: process.pid, write(data) { written.push(data); } };
+
+    const ctx = {
+      log: silentLog,
+      getPtyForSession() { return { ptyProcess }; },
+      isSessionBusy(sessionId) {
+        startedSessions.add(sessionId);
+        return busy.get(sessionId) === true;
+      },
+      isPtyAlive() { return true; },
+      getComposerState() { return { pending: composer.pending, lastInputAt: composer.lastInputAt }; },
+    };
+
+    // Write all 12 trigger files before start() -- this is the startup-scan
+    // path, not the live watcher.
+    for (let i = 0; i < COUNT; i++) {
+      writeTrigger(tmp, uuids[i], { sessionId: sessionIds[i], command: '/compact', wait: 'idle' });
+    }
+
+    watcher = start(ctx);
+
+    // The MAX_INFLIGHT cap itself is enforced synchronously inside the scan
+    // loop (inFlight.size is checked and incremented before any await), so
+    // this wait is only to let the dispatched triggers' first isSessionBusy
+    // poll tick fire -- it resolves via a microtask, well within 150ms.
+    await new Promise((r) => setTimeout(r, 150));
+
+    assert.equal(startedSessions.size, 8,
+      'exactly MAX_INFLIGHT (8) triggers should have begun their idle-wait poll after the scan; the rest must be queued, not dropped and not all dispatched at once');
+
+    // Release exactly 3 of the sessions proven to be in-flight (not an
+    // assumed dispatch order, which readdirSync does not guarantee).
+    const toRelease = [...startedSessions].slice(0, 3);
+    for (const sid of toRelease) busy.set(sid, false);
+
+    await Promise.all(toRelease.map((sid) =>
+      waitForFile(path.join(tmp, 'processed', uuidBySession.get(sid) + '.result.json'), 3000),
+    ));
+
+    // Give scheduleNext() + the newly-admitted triggers' first poll tick room
+    // to run.
+    await new Promise((r) => setTimeout(r, 150));
+
+    assert.equal(startedSessions.size, 11,
+      'freeing 3 in-flight slots must let 3 of the queued triggers start -- the queue must not be silently dropped or ignored');
+
+    // Release everything else so nothing is left hanging at process exit.
+    for (const sid of sessionIds) busy.set(sid, false);
+    await Promise.all(uuids.map((uuid) =>
+      waitForFile(path.join(tmp, 'processed', uuid + '.result.json'), 3000),
+    ));
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
