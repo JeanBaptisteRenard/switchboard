@@ -394,6 +394,15 @@ running at once), that `close` event can still take far longer than it does
 in isolation: CPU and disk contention from the sibling processes delays the
 event loop turn it needs.
 
+That first fix waits for the stream `close()`/`setEnabled(false, ...)`
+retires *itself* — not for streams retired by earlier `rotate()` calls
+still in flight. A run with several rapid rotations can have more than one
+old stream mid-close at once; `close()` returning as soon as its own
+stream is done left those still open, the same `ENOTEMPTY` on the
+directory. `pendingRotationCloses` tracks every in-flight rotation close;
+`close()`/`setEnabled(false, ...)` wait for that count to reach zero too,
+not just for their own stream.
+
 Two tests in `test/activity-trace.test.js` used to bridge that async gap with
 a fixed `setTimeout(60)`. That is a duration bet, not a correctness check, and
 it hides a real ordering hazard rather than just being slow: `close()` sets

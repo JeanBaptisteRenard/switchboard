@@ -175,6 +175,27 @@ function createActivityTrace(options = {}) {
   let warning = false;
   const segments = [];
   const unlinkFailures = new Set();
+  // Rotations retire a stream and wait for its own 'close' before pruning
+  // (see rotate()). close()/setEnabled(false, ...) must wait for those too,
+  // not just for the stream they retire themselves, or a still-open handle
+  // from an earlier rotation outlives the callback that promised it is safe
+  // to touch the directory now. See docs/activity-trace.md.
+  let pendingRotationCloses = 0;
+  let rotationDrainWaiters = [];
+
+  function afterRotationCloses(cb) {
+    if (pendingRotationCloses === 0) cb();
+    else rotationDrainWaiters.push(cb);
+  }
+
+  function onRotationCloseSettled() {
+    pendingRotationCloses -= 1;
+    if (pendingRotationCloses === 0 && rotationDrainWaiters.length) {
+      const waiters = rotationDrainWaiters;
+      rotationDrainWaiters = [];
+      for (const w of waiters) w();
+    }
+  }
 
   function segmentPath(index) {
     return path.join(dir, index === 0 ? baseName + '.jsonl' : baseName + '.' + String(index + 1).padStart(3, '0') + '.jsonl');
@@ -255,7 +276,8 @@ function createActivityTrace(options = {}) {
     // .end(callback)'s 'finish'. See docs/activity-trace.md "Testing the
     // async prune path".
     if (old) {
-      old.once('close', pruneSegments);
+      pendingRotationCloses += 1;
+      old.once('close', () => { pruneSegments(); onRotationCloseSettled(); });
       old.end();
     } else {
       pruneSegments();
@@ -317,12 +339,13 @@ function createActivityTrace(options = {}) {
     stream = null;
     // currentPath outlives the stream until the fd is released — see
     // docs/activity-trace.md "Testing the async prune path".
+    const finish = () => afterRotationCloses(() => { if (done) done(); });
     if (old) {
-      old.once('close', () => { currentPath = null; if (done) done(); });
+      old.once('close', () => { currentPath = null; finish(); });
       old.end();
     } else {
       currentPath = null;
-      if (done) done();
+      finish();
     }
     return null;
   }
@@ -348,13 +371,14 @@ function createActivityTrace(options = {}) {
   function close(done) {
     const old = stream;
     stream = null;
+    // See setEnabled(false, ...) above and docs/activity-trace.md.
+    const finish = () => afterRotationCloses(() => { if (done) done(); });
     if (old) {
-      // See setEnabled(false, ...) above and docs/activity-trace.md.
-      old.once('close', () => { currentPath = null; if (done) done(); });
+      old.once('close', () => { currentPath = null; finish(); });
       old.end();
     } else {
       currentPath = null;
-      if (done) done();
+      finish();
     }
   }
 
