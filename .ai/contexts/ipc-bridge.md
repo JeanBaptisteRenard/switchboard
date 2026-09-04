@@ -10,6 +10,7 @@ This file is the **canonical inventory** of the IPC surface. When you add a new 
 |---|---|---|
 | `preload.js` | ~150 | The `contextBridge.exposeInMainWorld('api', {...})` block. Every renderer-facing function. |
 | `main.js` | ~2600 | The `ipcMain.handle('<name>', ...)` and `ipcMain.on('<name>', ...)` handlers, scattered throughout. |
+| `schedule-ipc.js` | ~220 | **Also registers IPC handlers** (`get-schedule-creator-command`, `create-schedule-session`, `run-schedule-now`) — `init()` is called from `main.js`, but a `main.js`-only search for `ipcMain.handle` misses these three. Audit both files. |
 
 ## Public surface (IPC inventory)
 
@@ -107,12 +108,33 @@ This file is the **canonical inventory** of the IPC surface. When you add a new 
 
 - **No `nodeIntegration` in renderer**. The renderer can only call what's in `window.api`. `contextIsolation: true` is mandatory in BrowserWindow options.
 - **Every IPC must validate its arguments** at the main-side handler. The renderer is trusted-ish (single user, single window) but a compromised renderer should not be able to escape the user's working directories.
-- **Path-touching IPCs (`read-work-file`, `delete-work-file`, `read-memory`, etc.) MUST guard their paths**. Pattern: `path.resolve(input).includes('/.work-files/')` for the work-files IPC. Audit every new path IPC.
+- **Path-touching IPCs (`read-work-file`, `delete-work-file`, `read-memory`, `run-schedule-now`, `delete-worktree`, etc.) MUST guard their paths, and the guard must resolve on disk, not just `path.resolve()`**. `path.resolve()` normalises `..` but does not follow symlinks — a path can look contained by every string check and still open a file somewhere else through a symlinked directory. The shared primitive is `resolveOnDisk()` in `resolve-path-on-disk.js` (realpath, or `null` when nothing exists there yet); it is called *inside* the guards, not duplicated at each call site:
+  - `isSensitivePath` / `resolveAllowedMemoryPath` (+ its boolean form `isAllowedMemoryPath`) / `isKnownProjectRoot` (`ipc-path-validator.js`) — denylist, allowlist, and exact-match-against-known-projects, used by the memory, file-panel and worktree handlers. `resolveAllowedMemoryPath` returns the resolved path, not a boolean, and callers that go on to read/write MUST use that returned value for the operation — a caller that re-resolves its own literal path afterwards reopens a TOCTOU (checked path and used path can diverge if a symlinked ancestor is swapped in between). See `resolve-path-on-disk.js` for the documented gap when the target does not exist yet.
+  - `resolveDeletionTargets` (`delete-session-target.js`) — session deletion, the first handler to need this and the source the primitive was extracted from.
+  - `resolveRunNowTarget` (`run-schedule-now-target.js`) — `run-schedule-now`'s shape + allowlist check, run before any read or spawn.
+  Work-files still use the narrower `.includes('/.work-files/')` substring check — same weakness against a symlinked ancestor, not yet migrated (see "IPC path-guard inventory" below). A handler that reads *content* back to the renderer (file panel, memory) and a handler that only decides *whether to run a command* (`run-schedule-now`) both need a guard, and neither one is safe with `path.resolve()` alone.
 - **Trust boundary is the contextBridge call**. Anything passed across must survive structured-clone serialization. No functions, no DOM nodes, no class instances — only plain JSON.
 - **Async handlers return promises**. Renderer uses `await window.api.foo(...)`. Throws cross the boundary as rejected promises; return `{ok, error}` if you want graceful failure handling on the renderer side.
 - **Never call a method on `session.pty` directly.** Go through `pty-ops.js` (`resizePty` / `killPty` / `writePty`, or the generic `withPty`). See "PTY operations race the exit" below.
 
-## Non-obvious behaviors
+### IPC path-guard inventory
+
+Every handler that takes a renderer-supplied path or derives a spawn location from one, and what guards it as of this pass:
+
+| IPC | Guard | Kind |
+|---|---|---|
+| `read-memory` / `save-memory` | `resolveAllowedMemoryPath` (read/write the returned path, not the caller's own re-resolved one) | disk-resolved allowlist |
+| `open-path` / `read-file-for-panel` / `save-file-for-panel` / `watch-file` | `isSensitivePath` | disk-resolved denylist |
+| `delete-worktree` / `worktree-status` | `WORKTREE_PATH_RE` (shape) + `isKnownProjectRoot` (disk-resolved exact match) | shape + disk-resolved allowlist |
+| `delete-session-preview` / `delete-session` | `resolveDeletionTargets` (`delete-session-target.js`) | disk-resolved containment |
+| `run-schedule-now` | `resolveRunNowTarget` (`run-schedule-now-target.js`), which composes filename shape + `isAllowedMemoryPath` | disk-resolved allowlist — **the only handler in the app that both reads a file and spawns a process from a renderer-supplied path; had no guard at all before this pass** |
+| `read-work-file` / `delete-work-file` | `.includes('/.work-files/')` substring | ad hoc string, **not disk-resolved** — a symlinked ancestor defeats it the same way it defeated `isSensitivePath`/`isAllowedMemoryPath` before they were fixed here. Not migrated in this pass; same fix shape (`resolveOnDisk` + a `.work-files` component check instead of a substring test) would close it |
+| `read-activity-trace-file` / `delete-activity-trace-file` | `resolveTraceFilePath` (`activity-trace.js`) | ad hoc string (directory + basename pattern), **not disk-resolved** — narrower surface (one generated file family) lowers the stakes, not migrated |
+| `add-project` / `remap-project` | none on the probe (`fs.statSync`/`fs.existsSync`/`fs.lstatSync`); the actual write is confined through `encodeProjectPath` | existence/type oracle only — inherent to the feature (both accept an arbitrary disk location by design), not cheaply fixable without breaking it |
+| `open-terminal` (`preLaunchCmd`) | `validatePreLaunchCmd` (`pre-launch-cmd-guard.js`) | not a path guard — a character allowlist on a raw-shell-by-design string (the documented prefix's character set plus its analogues: `env VAR=val`, `doas`, an absolute binary path); a denylist here proved incomplete (process substitution `<(...)`/`>(...)` needed none of the blocked characters), so this is closed by construction instead of by enumeration. Known cost: bare `$VAR` expansion and quoted arguments, both previously accepted, are now refused |
+| `read-session-jsonl` / `read-subagent-jsonl` / `start-subagent-watch` / `create-schedule-session` | none directly — path is derived from a SQLite key or built via `encodeProjectPath`, not taken verbatim from the renderer | out of scope for a path guard; flag if a renderer-controlled string is ever found reaching the derivation unencoded |
+
+### Non-obvious behaviors
 
 - **`preload.js` is the *single* surface the renderer sees**. If you add `ipcMain.handle('xyz', ...)` but forget to add `xyz: () => ipcRenderer.invoke('xyz')` in preload, the renderer can't call it. Symptom: `window.api.xyz is not a function`.
 - **Webcontents `send` events vs `invoke`**: `invoke`/`handle` is request-response (returns a promise). `send`/`on` is fire-and-forget (no return). Pick based on whether the caller needs the result.
