@@ -2237,7 +2237,24 @@ ipcMain.handle('get-activity-trace-state', () => activityTraceState());
 
 ipcMain.handle('set-activity-trace-enabled', async (_event, enabled) => {
   const on = !!enabled;
-  await new Promise((resolve) => activityTrace.setEnabled(on, resolve));
+  // activityTrace.setEnabled has its own bounded fallback (see
+  // docs/activity-trace.md), but this toggle must never hang on it either —
+  // belt and suspenders against a stream close that never comes.
+  await new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      log.warn('[activity-trace] setEnabled did not call back in time; unblocking the Diagnostics toggle anyway');
+      resolve();
+    }, 8000);
+    activityTrace.setEnabled(on, () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    });
+  });
   const global = getSetting('global') || {};
   global.activityTrace = on;
   setSetting('global', global);
