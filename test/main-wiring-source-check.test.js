@@ -133,6 +133,21 @@ test('main-wiring source check: the open-terminal session carries composerState'
   );
 });
 
+test('main-wiring source check: the open-terminal session carries its real spawn cwd', () => {
+  // trigger-context.js's getPtyForSession reads session.cwd for the trigger
+  // watcher's expectedCwd target guard (.ai/contexts/trigger-watcher.md,
+  // "Target guard"). Losing this field silently downgrades every guarded
+  // trigger to "indeterminate" without anything failing loudly here.
+  const handler = argsOf("ipcMain.handle('open-terminal'", 'ipcMain.handle');
+  const at = handler.indexOf('const session = {');
+  assert.notEqual(at, -1, 'open-terminal should still build a `const session = { ... }`');
+  const literal = balancedBraces(handler, at);
+  assert.match(
+    literal, /\bcwd:\s*spawnCwd\b/,
+    'the session built in open-terminal must carry cwd: spawnCwd',
+  );
+});
+
 test('main-wiring source check: no PTY method is called bare on a session', () => {
   // The crash this guards: a `terminal-resize` for a session whose pty exited
   // between the `!exited` check and the call. See .ai/contexts/ipc-bridge.md.

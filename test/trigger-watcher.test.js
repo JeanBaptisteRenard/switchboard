@@ -48,6 +48,10 @@ const silentLog = {
  * @param {function} [isBusyFn]  () => boolean  (default: always false)
  * @param {object}   [opts]
  * @param {boolean}  [opts.ptyThrows]  if true, pty.write throws an error
+ * @param {string}   [opts.cwd]        if set, getPtyForSession's entry carries
+ *                                     this as `cwd` (target guard tests).
+ *                                     Omitted entirely otherwise, matching
+ *                                     every ctx that predates the guard.
  */
 function makeCtx(sessionId, isBusyFn = () => false, opts = {}) {
   const written = [];
@@ -72,7 +76,8 @@ function makeCtx(sessionId, isBusyFn = () => false, opts = {}) {
     log: silentLog,
     getPtyForSession(id) {
       if (!sessionPresent) return null;
-      return id === sessionId ? { ptyProcess } : null;
+      if (id !== sessionId) return null;
+      return ('cwd' in opts) ? { ptyProcess, cwd: opts.cwd } : { ptyProcess };
     },
     isSessionBusy(id) {
       return id === sessionId ? isBusyFn() : false;
@@ -3918,6 +3923,296 @@ test('session serialization: two triggers on different sessions still run in par
     await waitForFile(resultPathA, 5000);
     const resultA = readResult(path.join(tmp, 'processed'), uuidA);
     assert.equal(resultA.ok, true);
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// ── Target guard (expectedCwd) ─────────────────────────────────────────────
+// see .ai/contexts/trigger-watcher.md, "Target guard"
+
+// These fold only on win32 (NTFS/ReFS case-insensitivity, \ as the native
+// separator, the \\?\ long-path prefix) -- CI also runs on Linux and macOS
+// (see docs/testing-a-pr.md / README "Tooling"), where none of that applies,
+// so the platform-specific claims are gated and a platform-neutral variant
+// covers every OS. This suite failed exactly this way on ubuntu on first
+// submission (node 20 and 22): a hardcoded Windows-style pair compared equal
+// only by accident of `path.normalize`'s POSIX behavior never being exercised.
+test('normalizeCwd: case, separators, the long-path prefix and a bare root fold correctly on Windows',
+  { skip: process.platform !== 'win32' && 'Windows-only path forms (case-fold, \\\\?\\, UNC)' }, () => {
+  const { normalizeCwd } = require('../trigger-watcher');
+
+  assert.equal(normalizeCwd('C:\\Projects\\Foo'), normalizeCwd('c:/projects/foo/'),
+    'case, separator style and a trailing slash must not matter');
+  assert.equal(normalizeCwd('\\\\?\\C:\\Projects\\Foo'), normalizeCwd('C:\\Projects\\Foo'),
+    'the \\\\?\\ long-path prefix must be stripped before comparing');
+  assert.equal(normalizeCwd('\\\\?\\UNC\\server\\share\\dir'), normalizeCwd('\\\\server\\share\\dir'),
+    'the \\\\?\\UNC\\ prefix must fold to a plain UNC path');
+  assert.equal(normalizeCwd('C:\\'), normalizeCwd('c:\\'), 'a bare drive root must not be mangled');
+});
+
+test('normalizeCwd: case is NOT folded on a case-sensitive filesystem (the POSIX contrast)',
+  { skip: process.platform === 'win32' && 'covered by the Windows case-folding test above' }, () => {
+  const { normalizeCwd } = require('../trigger-watcher');
+
+  assert.notEqual(normalizeCwd('/Projects/Foo'), normalizeCwd('/projects/foo'),
+    'ext4 and friends are case-sensitive -- folding case here would fold together two real, distinct paths');
+});
+
+test('normalizeCwd: a trailing separator is stripped and a genuinely different path is not folded, on every platform', () => {
+  const { normalizeCwd } = require('../trigger-watcher');
+
+  const base = path.join(os.tmpdir(), 'sw-normalize-test', 'foo');
+  assert.equal(normalizeCwd(base + path.sep), normalizeCwd(base),
+    'a trailing separator must not matter');
+  assert.notEqual(normalizeCwd(base), normalizeCwd(base + 'bar'),
+    'a genuinely different path must not be folded together');
+});
+
+test('normalizeCwd: malformed input always returns null, regardless of platform', () => {
+  const { normalizeCwd } = require('../trigger-watcher');
+
+  assert.equal(normalizeCwd(undefined), null, 'undefined has nothing to compare');
+  assert.equal(normalizeCwd(null), null, 'null has nothing to compare');
+  assert.equal(normalizeCwd(''), null, 'an empty string has nothing to compare');
+  assert.equal(normalizeCwd(42), null, 'a non-string is never a cwd');
+});
+
+test('target guard: expectedCwd absent -- behavior is unchanged even when the session cwd would disagree', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-guard-absent-' + Date.now();
+    // The session's real cwd disagrees with nothing in particular, because
+    // nothing declared an expectation -- the guard must never even look.
+    const ctx = makeCtx(SESSION_ID, () => false, { cwd: 'C:\\Projects\\real' });
+    watcher = start(ctx);
+
+    const uuid = 'guard-absent-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, wait: 'none', command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true, 'an absent expectedCwd must not block an otherwise-normal trigger');
+    // busy never rises in this ctx -> submit-verify retries the bare Enter once,
+    // same as every other unguarded trigger against makeCtx's default.
+    assert.deepEqual(ctx._written, ['/compact', '\r', '\r']);
+    assert.equal(result.targetMismatch, undefined);
+    assert.equal(result.targetCwdUnknown, undefined);
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('target guard: expectedCwd concordant (differently spelled but the same real cwd) -- the command still goes out', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-guard-match-' + Date.now();
+    const sessionCwd = 'C:\\Projects\\Foo';
+    // Case/separator/trailing-slash folding is a Windows-only property of
+    // normalizeCwd() -- on POSIX the two sides are spelled identically, which
+    // still exercises the concordant path (just not the folding itself; that
+    // is covered on its own in the normalizeCwd unit tests above).
+    const declaredCwd = (process.platform === 'win32') ? 'c:/projects/foo/' : sessionCwd;
+    const ctx = makeCtx(SESSION_ID, () => false, { cwd: sessionCwd });
+    watcher = start(ctx);
+
+    const uuid = 'guard-match-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID, wait: 'none', command: '/compact',
+      expectedCwd: declaredCwd,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true, 'a concordant expectedCwd must let the command through');
+    // busy never rises in this ctx -> submit-verify retries the bare Enter once,
+    // same as every other unguarded trigger against makeCtx's default.
+    assert.deepEqual(ctx._written, ['/compact', '\r', '\r']);
+    assert.equal(result.targetMismatch, undefined);
+    assert.equal(result.targetCwdUnknown, undefined);
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('target guard: expectedCwd discordant -- refused, nothing written, distinct from the indeterminate case', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-guard-mismatch-' + Date.now();
+    const ctx = makeCtx(SESSION_ID, () => false, { cwd: 'C:\\Projects\\real' });
+    watcher = start(ctx);
+
+    const uuid = 'guard-mismatch-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID, wait: 'none', command: '/compact',
+      expectedCwd: 'C:\\Projects\\wrong-agent',
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.equal(result.submitted, 'no');
+    assert.equal(result.error, 'not sent');
+    assert.equal(result.targetMismatch, true, 'a disagreement must be flagged, not just narrated in reason');
+    assert.equal(result.targetCwdUnknown, undefined, 'the two refusal shapes must never both be set');
+    assert.equal(result.expectedCwd, 'C:\\Projects\\wrong-agent');
+    assert.equal(result.observedCwd, 'C:\\Projects\\real');
+    assert.deepEqual(ctx._written, [], 'a mismatched target guard must write NOTHING into the PTY');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('target guard: session cwd indeterminate -- refused, distinct result shape from a mismatch, nothing written', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-guard-unknown-' + Date.now();
+    // No opts.cwd at all -- the session entry carries no cwd, exactly like a
+    // ctx that predates this field (or a session whose registry entry hasn't
+    // been populated yet).
+    const ctx = makeCtx(SESSION_ID, () => false);
+    watcher = start(ctx);
+
+    const uuid = 'guard-unknown-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID, wait: 'none', command: '/compact',
+      expectedCwd: 'C:\\Projects\\wrong-agent',
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.equal(result.submitted, 'no');
+    assert.equal(result.error, 'not sent');
+    assert.equal(result.targetCwdUnknown, true, 'indetermination must be flagged, not just narrated in reason');
+    assert.equal(result.targetMismatch, undefined, 'the two refusal shapes must never both be set');
+    assert.equal(result.expectedCwd, 'C:\\Projects\\wrong-agent');
+    assert.equal(result.observedCwd, null);
+    assert.notEqual(result.reason, undefined);
+    assert.ok(!/does not match/.test(result.reason),
+      'the indeterminate reason must not read like a disagreement was found');
+    assert.deepEqual(ctx._written, [], 'an unresolvable target guard must write NOTHING into the PTY');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('target guard: a malformed expectedCwd (empty string) is refused before any session lookup', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    // No session registered at all -- if this reaches session lookup it fails
+    // with "session not found" instead, so reaching the expectedCwd shape
+    // error at all proves the ordering.
+    const ctx = makeCtx('nonexistent-session', () => false);
+    watcher = start(ctx);
+
+    const uuid = 'guard-malformed-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: 'nonexistent-session', wait: 'none', command: '/compact',
+      expectedCwd: '',
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'not sent');
+    assert.match(result.reason, /expectedCwd must be a non-empty string/);
+    assert.notEqual(result.error, 'session not found');
+    assert.deepEqual(ctx._written, []);
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('target guard: a mismatched expectedCwd on a chain refuses the whole chain -- no step ever runs, no partial progress claimed', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-guard-chain-' + Date.now();
+    const ctx = makeCtx(SESSION_ID, () => false, { cwd: 'C:\\Projects\\real' });
+    watcher = start(ctx);
+
+    const uuid = 'guard-chain-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      expectedCwd: 'C:\\Projects\\wrong-agent',
+      chain: [{ command: '/compact' }, { command: 'resume the task' }],
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 3000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, false);
+    assert.equal(result.submitted, 'no');
+    assert.equal(result.targetMismatch, true);
+    assert.equal(result.steps, undefined, 'a refused chain must not report any steps at all, not even zero');
+    assert.equal(result.partial, undefined, 'a refusal before the chain starts is not a partial chain');
+    assert.deepEqual(ctx._written, [], 'no chain step may write anything once the guard refuses');
 
   } finally {
     if (watcher) watcher.close();

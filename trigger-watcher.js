@@ -19,6 +19,7 @@
 //   - Child-process liveness check before write (W7)
 //   - Max chain length: 20 steps (W8)
 //   - No write into a composer holding unsubmitted input (see docs/automation.md)
+//   - Optional expectedCwd target guard, fails closed (see .ai/contexts/trigger-watcher.md)
 //
 // Platform note: fs.watch is Linux-only reliable (I2). On macOS, inotify
 // events may be coalesced or delayed; not blocked but not tested.
@@ -122,6 +123,35 @@ function envNumber(name) {
   if (raw === undefined || raw.trim() === '') return undefined;
   const v = Number(raw);
   return Number.isFinite(v) && v >= 0 ? v : undefined;
+}
+
+// Normalizes a cwd for the target guard's comparison — see
+// .ai/contexts/trigger-watcher.md, "Target guard" for what this does and does not paper over.
+function normalizeCwd(p) {
+  if (typeof p !== 'string' || !p) return null;
+  let n;
+  try {
+    n = path.normalize(p);
+  } catch (_) {
+    return null;
+  }
+  if (process.platform === 'win32') {
+    // \\?\UNC\server\share\... -> \\server\share\...
+    if (n.toLowerCase().startsWith('\\\\?\\unc\\')) {
+      n = '\\\\' + n.slice(8);
+    } else if (n.toLowerCase().startsWith('\\\\?\\')) {
+      // \\?\C:\foo -> C:\foo
+      n = n.slice(4);
+    }
+    // NTFS/ReFS are case-insensitive; fold so "C:\Foo" === "c:\foo".
+    n = n.toLowerCase();
+  }
+  // Strip one trailing separator, but never collapse a bare root ("C:\", "/").
+  if (n.length > 1 && n.endsWith(path.sep) &&
+      !(process.platform === 'win32' && /^[a-z]:\\$/.test(n))) {
+    n = n.slice(0, -1);
+  }
+  return n;
 }
 
 function getQuietMs() {
@@ -543,7 +573,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
   }
 
   // ── 3. Validate shape ─────────────────────────────────────────────────────
-  const { sessionId, command, chain, wait = 'none', timeout_ms } = trigger;
+  const { sessionId, command, chain, wait = 'none', timeout_ms, expectedCwd } = trigger;
 
   if (typeof sessionId !== 'string' || !sessionId) {
     await writeResult({ ok: false, error: 'missing required field: sessionId', sessionId: sessionId || null });
@@ -658,6 +688,18 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
   // When timeout_ms is absent, resolvedTimeoutMs stays undefined and waitForIdle
   // falls back to getIdleTimeout() (env var → compiled default).
 
+  // ── 3c. Validate optional expectedCwd — see .ai/contexts/trigger-watcher.md, "Target guard" ──
+  if (expectedCwd !== undefined && (typeof expectedCwd !== 'string' || !expectedCwd)) {
+    await writeResult({
+      ok:        false,
+      submitted: SUBMITTED_NO,
+      error:     ERROR_NOT_SENT,
+      reason:    'expectedCwd must be a non-empty string when present',
+      sessionId,
+    });
+    return;
+  }
+
   // ── 4. Look up session ────────────────────────────────────────────────────
   const sessionEntry = ctx.getPtyForSession(sessionId);
   if (!sessionEntry) {
@@ -678,6 +720,39 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     ctx.log.warn('[trigger-watcher] Target process not running:', sessionId);
     await writeResult({ ok: false, error: 'target process not running', sessionId });
     return;
+  }
+
+  // ── Target guard (optional) — see .ai/contexts/trigger-watcher.md, "Target guard" ──
+  if (expectedCwd !== undefined) {
+    const observedCwd = normalizeCwd(sessionEntry.cwd);
+    if (observedCwd === null) {
+      ctx.log.warn('[trigger-watcher] Target guard: session cwd could not be determined, refusing:', sessionId);
+      await writeResult({
+        ok:               false,
+        submitted:        SUBMITTED_NO,
+        error:            ERROR_NOT_SENT,
+        reason:           "this session's cwd could not be determined; refusing rather than risk targeting the wrong session",
+        targetCwdUnknown: true,
+        expectedCwd,
+        observedCwd:      null,
+        sessionId,
+      });
+      return;
+    }
+    if (normalizeCwd(expectedCwd) !== observedCwd) {
+      ctx.log.warn('[trigger-watcher] Target guard: expectedCwd does not match session cwd, refusing:', sessionId);
+      await writeResult({
+        ok:             false,
+        submitted:      SUBMITTED_NO,
+        error:          ERROR_NOT_SENT,
+        reason:         "expectedCwd does not match this session's actual cwd",
+        targetMismatch: true,
+        expectedCwd,
+        observedCwd:    sessionEntry.cwd,
+        sessionId,
+      });
+      return;
+    }
   }
 
   // ── 5. Single-command path ────────────────────────────────────────────────
@@ -1000,7 +1075,9 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
  * Start the trigger watcher.
  *
  * @param {object} ctx
- * @param {function} ctx.getPtyForSession  (sessionId: string) => { ptyProcess } | null
+ * @param {function} ctx.getPtyForSession  (sessionId: string) => { ptyProcess, cwd } | null;
+ *                                          `cwd` feeds the expectedCwd target
+ *                                          guard (see .ai/contexts/trigger-watcher.md, "Target guard")
  * @param {function} ctx.isSessionBusy     (sessionId: string) => boolean
  * @param {function} [ctx.getComposerState] (sessionId) => { pending, lastInputAt } | null;
  *                                          absent or null means busy, never free
@@ -1111,4 +1188,4 @@ function start(ctx) {
   };
 }
 
-module.exports = { start, weakestSubmitted, SUBMITTED_RANK };
+module.exports = { start, weakestSubmitted, SUBMITTED_RANK, normalizeCwd };

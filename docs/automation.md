@@ -56,6 +56,7 @@ The trigger watcher lets any external script type into an open session's termina
 - `command` — written to the PTY, followed by a discrete Enter keypress.
 - `wait` — `"none"` (default) does not wait for the session to stop being busy; `"idle"` does. Neither sends into a composer with unsubmitted input: see "Politeness" — `"none"` can still wait, up to `timeout_ms`. Use `"idle"` for anything that must not interrupt a mid-response stream.
 - `timeout_ms` — optional cap on the waiting, idle **and politeness** (≤ 600 000 ms; default 300 000). See "Politeness" below: with `wait: "none"` this is the only bound on how long a trigger sits waiting for a free composer.
+- `expectedCwd` — optional. See "Target guard" below.
 
 Environment overrides: `SWITCHBOARD_TRIGGERS_DIR` (watched directory), `SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS` (default idle wait), `SWITCHBOARD_TRIGGER_QUIET_MS` (the politeness quiet window, default 3000 ms).
 
@@ -373,3 +374,37 @@ long as the directory lives, and nothing in the app ever removes them. Callers
 that write many triggers should prune it themselves.
 
 The primary use case is context-management harnesses — e.g. an agent hook that detects a full context window and injects `/compact` into its own session. Write the trigger file atomically (write to a temp name, then rename) so the watcher never reads a half-written file.
+
+### Target guard
+
+`sessionId` alone is not proof the trigger is aimed where the writer thinks:
+a valid id naming an open session looks identical whether it was chosen
+correctly or picked up a race (two sessions writing their transcript at the
+same instant, one trigger addressing the wrong one — a real incident). The
+optional `expectedCwd` field lets the writer state what it believes the
+target session's working directory is, checked before anything is written:
+
+```json
+{ "sessionId": "abc-123-def", "command": "/compact", "expectedCwd": "C:\\Projects\\my-worktree" }
+```
+
+- **Absent** — no change from today: nobody declared an expectation, so
+  nothing is checked.
+- **Present and it matches** the session's actual cwd (case, `/` vs `\`, a
+  trailing slash and the Windows long-path prefix are all normalized first)
+  — the trigger proceeds exactly as it would without the field.
+- **Present and it disagrees** — refused before any write:
+  `{ "ok": false, "submitted": "no", "error": "not sent", "targetMismatch": true, "expectedCwd": "...", "observedCwd": "..." }`.
+- **Present but the session's cwd cannot be determined** — refused the same
+  way, `targetCwdUnknown: true` instead of `targetMismatch`, so a reader can
+  tell "disagreement" from "couldn't check" without parsing `reason`. This is
+  deliberate: a check that silently lets the trigger through when it cannot
+  verify would reopen the exact hole it exists to close.
+
+**What this does not protect against.** The comparison is by folder. Two
+sessions open in the *same* directory are not distinguished by it — the guard
+narrows the incident it was built for (two different worktrees), it does not
+generally solve "which of several sessions in one folder did the writer
+mean". It also does not resolve 8.3 short names, `subst` drives, or
+junctions/symlinks to their real target — two spellings of the same real
+folder in any of those forms are treated as a mismatch, not folded together.
