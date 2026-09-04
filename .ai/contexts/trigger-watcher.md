@@ -71,6 +71,35 @@ ms — and holds one of the `MAX_INFLIGHT` (8) slots for its whole duration. So
 like any other, and a few such triggers stall the queue. `timeout_ms` is the
 only lever.
 
+### Session serialization
+
+`MAX_INFLIGHT` bounds how many trigger *files* run concurrently; it is silent
+on which `sessionId` they target — nothing before this fix stopped two
+trigger files naming the same session from running their `waitForComposerFree`
+/ `submitWithVerify` sequences interleaved, each unaware of the other's
+in-flight write. Two commands landing in one composer half-typed into each
+other is a worse failure than anything `submitted` reports: corrupted input,
+not just a wrong report field.
+
+`start()` keeps `sessionLocks`, a `Map<sessionId, Promise>` used as a FIFO
+mutex queue (`acquireSessionLock`). `processTriggerFile` awaits it right after
+`sessionId` is known to be a non-empty string — before any wait, any PTY
+lookup, any write — and releases it in the function's own `finally`, so every
+exit path (success, validation refusal, thrown exception) releases exactly
+once. A second trigger for the same session blocks on `await
+acquireSessionLock(...)` until the first's entire `processTriggerFile` run —
+including its own idle-wait, politeness wait, and submit-verify — has
+produced a result. Two triggers naming *different* sessions each get their own
+map entry and never wait on each other, still bounded only by `MAX_INFLIGHT`.
+
+This does not create a new way to hang: whichever trigger holds the lock is
+still bounded by its own `timeout_ms` / idle-wait deadline exactly as before,
+so the queued trigger's worst case is "the first trigger's own bound, then
+mine" — not unbounded. See `test/trigger-watcher.test.js`, the "session
+serialization" tests, for same-session ordering and cross-session
+independence, both proved by write-order assertions rather than by inspecting
+the lock directly.
+
 **Liveness is probed after the waits, never before them.** `isPtyAlive` runs
 once as a pre-flight, then again *after* `waitForComposerFree` on the
 single-`command` path and on every chain step. A probe taken before a wait that
@@ -356,7 +385,9 @@ each closing a concrete gap:
    outright when it is `true` closes this — not by claiming proof, but by
    refusing to claim one where none exists. (This is a *gate*, not the
    discredited pattern above: it can only prevent a false `confirmed`, never
-   produce one.)
+   produce one.) It closes the incident's own shape — a write landing mid-turn
+   — not the broader causality gap; see "What `confirmed` still does not
+   claim" below for what is left open.
 2. **A turn must still be independently observed** (the existing busy-rise
    poll). Composer-emptiness on its own cannot distinguish "genuinely
    unwritten" from "written, but nothing downstream ever reacts to it" — a
@@ -371,6 +402,25 @@ the first Enter did not visibly register, so the strongest claim left is
 whatever the retry's own busy observation supports (`activity` or `assumed`).
 
 ### What `confirmed` still does not claim
+
+**It does not claim the turn it observed is the one our write started.**
+Stated exactly, `confirmed` means: the session was idle the instant before we
+wrote, a turn was observed within the verify window after that write, and it
+was the first attempt. That is all three checks — no more. `pollForBusyObserved`
+is a level probe over the whole window (`SWITCHBOARD_SUBMIT_VERIFY_MS`,
+2 s default), not an edge wired to our own write: any `busy` transition
+inside that window satisfies it, whatever caused it. Reproduced directly — a
+session at rest, a write that never touches `busy`, and an unrelated timer
+flipping `busy` at t=120 ms independently of that write — still reads
+`confirmed`. Calling the not-already-busy gate above "the exact shape of the
+field incident" describes what it closes for the *same-session* case
+(serialization above closes the rest of that case at the source, since a
+second same-session trigger can no longer even attempt a write while one is
+in flight) — it does not mean the causality gap itself is closed. An actor
+outside this transport's own admission queue — a human at the keyboard, a
+process this watcher does not serialize against — produces the identical
+`confirmed` for a turn our write did not start, and no PTY byte stream can
+tell the difference. Narrowed, not eliminated.
 
 Composer-emptiness plus a not-already-busy write plus an observed turn is the
 strongest signal this module can produce without reading the CLI's own effect

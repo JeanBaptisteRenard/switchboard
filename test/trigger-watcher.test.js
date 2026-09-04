@@ -535,16 +535,28 @@ test('W4 concurrency cap: 12 simultaneous triggers all get processed', async () 
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
 
     const { start } = require('../trigger-watcher');
-    const SESSION_ID = 'sess-w4-' + Date.now();
-    const ctx        = makeCtx(SESSION_ID);
+    // W4 bounds concurrent trigger *files*, independent of sessionId — a
+    // dozen triggers on one session are now serialized by session (see the
+    // "session serialization" tests), so this test uses 12 distinct sessions
+    // sharing one PTY stand-in, to keep exercising MAX_INFLIGHT itself.
+    const written = [];
+    const composer = { pending: 0, lastInputAt: 0 };
+    const ptyProcess = { pid: process.pid, write(data) { written.push(data); } };
+    const ctx = {
+      log: silentLog,
+      getPtyForSession() { return { ptyProcess }; },
+      isSessionBusy() { return false; },
+      isPtyAlive() { return true; },
+      getComposerState() { return { pending: composer.pending, lastInputAt: composer.lastInputAt }; },
+    };
     watcher = start(ctx);
 
     const COUNT  = 12;
     const uuids  = Array.from({ length: COUNT }, (_, i) => `w4-${Date.now()}-${i}`);
 
-    // Drop all 12 triggers at once
+    // Drop all 12 triggers at once, each targeting its own session
     for (const uuid of uuids) {
-      writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+      writeTrigger(tmp, uuid, { sessionId: 'sess-' + uuid, command: '/compact' });
     }
 
     // Wait for all 12 result files
@@ -561,7 +573,7 @@ test('W4 concurrency cap: 12 simultaneous triggers all get processed', async () 
     // 12 command texts should have been written. We count by command texts
     // (w !== '\r') rather than Enters, because submit-verify may add a retry '\r'
     // per command when no busy-rise is observed.
-    assert.equal(ctx._written.filter((w) => w !== '\r').length, COUNT, `expected ${COUNT} submitted commands`);
+    assert.equal(written.filter((w) => w !== '\r').length, COUNT, `expected ${COUNT} submitted commands`);
 
   } finally {
     if (watcher) watcher.close();
@@ -3737,6 +3749,175 @@ test('submitted: preBusy must be sampled before the write, not after -- a sessio
     assert.equal(result.submitted, 'activity',
       'the session was still busy the instant we wrote -- observing a turn afterward must not upgrade this to "confirmed"');
     assert.notEqual(result.submitted, 'confirmed');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// ── Session serialization ────────────────────────────────────────────────────
+
+test('session serialization: two triggers on the same session run one after another, never in parallel', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '3000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-serialize-same-' + Date.now();
+
+    // Trigger A blocks on wait:'idle' until busy flips false at +200ms.
+    // Trigger B is written +60ms in, with wait:'none' against a composer
+    // that is free from the start -- nothing of its own keeps it waiting.
+    // Without per-session serialization B has no reason to wait for A and
+    // writes first; with it, B cannot even attempt a write until A's whole
+    // run (including A's own wait) has produced a result.
+    let busy = true;
+    const composer = { pending: 0, lastInputAt: 0 };
+    const written = [];
+    const ptyProcess = {
+      pid: process.pid,
+      write(data) {
+        written.push(data);
+        // Make each Enter resolve its own submitWithVerify immediately (busy
+        // flips synchronously, before the first poll tick) so this test is
+        // not slowed down or destabilized by the verify-retry path.
+        if (data === '\r') {
+          busy = true;
+          setTimeout(() => { busy = false; }, 60);
+        }
+      },
+    };
+    const ctx = {
+      log: silentLog,
+      getPtyForSession(id) { return id === SESSION_ID ? { ptyProcess } : null; },
+      isSessionBusy(id) { return id === SESSION_ID ? busy : false; },
+      isPtyAlive() { return true; },
+      getComposerState(id) {
+        return id === SESSION_ID ? { pending: composer.pending, lastInputAt: composer.lastInputAt } : null;
+      },
+    };
+
+    setTimeout(() => { busy = false; }, 200); // unblocks trigger A's wait:'idle'
+    watcher = start(ctx);
+
+    const uuidA = 'serialize-same-a-' + Date.now();
+    const uuidB = 'serialize-same-b-' + Date.now();
+    writeTrigger(tmp, uuidA, { sessionId: SESSION_ID, command: 'AAAA', wait: 'idle' });
+    await new Promise((r) => setTimeout(r, 60));
+    writeTrigger(tmp, uuidB, { sessionId: SESSION_ID, command: 'BBBB', wait: 'none' });
+
+    const resultPathA = path.join(tmp, 'processed', uuidA + '.result.json');
+    const resultPathB = path.join(tmp, 'processed', uuidB + '.result.json');
+    await waitForFile(resultPathA, 3000);
+    await waitForFile(resultPathB, 3000);
+
+    const resultA = readResult(path.join(tmp, 'processed'), uuidA);
+    const resultB = readResult(path.join(tmp, 'processed'), uuidB);
+    assert.equal(resultA.ok, true);
+    assert.equal(resultB.ok, true);
+
+    const idxA = written.indexOf('AAAA');
+    const idxB = written.indexOf('BBBB');
+    assert.ok(idxA !== -1 && idxB !== -1, 'both commands should have been written');
+    assert.ok(idxA < idxB,
+      'trigger A (blocked on wait:"idle" until +200ms) must fully own the session before trigger B ' +
+      '(ready to write from t=0) ever writes into it -- otherwise the two triggers ran in parallel ' +
+      `on one session. Full write order: ${JSON.stringify(written)}`);
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('session serialization: two triggers on different sessions still run in parallel', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '3000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_A = 'sess-serialize-parallel-a-' + Date.now();
+    const SESSION_C = 'sess-serialize-parallel-c-' + Date.now();
+
+    let busyA = true;
+    let busyC = false;
+    // Captured the instant C's own write happens -- a state check, not a wall
+    // clock threshold, so this stays reliable under heavy system load: as long
+    // as C's dispatch isn't stalled for the whole 3s A is blocked for (a load
+    // spike no other assertion in this suite tolerates either), the check
+    // holds regardless of how long C itself actually took.
+    let busyAWhenCWrote;
+    const composerA = { pending: 0, lastInputAt: 0 };
+    const composerC = { pending: 0, lastInputAt: 0 };
+    const writtenA = [];
+    const writtenC = [];
+    const ptyA = {
+      pid: process.pid,
+      write(data) {
+        writtenA.push(data);
+        if (data === '\r') { busyA = true; setTimeout(() => { busyA = false; }, 60); }
+      },
+    };
+    const ptyC = {
+      pid: process.pid,
+      write(data) {
+        if (busyAWhenCWrote === undefined) busyAWhenCWrote = busyA;
+        writtenC.push(data);
+        if (data === '\r') { busyC = true; setTimeout(() => { busyC = false; }, 60); }
+      },
+    };
+    const ctx = {
+      log: silentLog,
+      getPtyForSession(id) {
+        if (id === SESSION_A) return { ptyProcess: ptyA };
+        if (id === SESSION_C) return { ptyProcess: ptyC };
+        return null;
+      },
+      isSessionBusy(id) {
+        if (id === SESSION_A) return busyA;
+        if (id === SESSION_C) return busyC;
+        return false;
+      },
+      isPtyAlive() { return true; },
+      getComposerState(id) {
+        if (id === SESSION_A) return { pending: composerA.pending, lastInputAt: composerA.lastInputAt };
+        if (id === SESSION_C) return { pending: composerC.pending, lastInputAt: composerC.lastInputAt };
+        return null;
+      },
+    };
+
+    setTimeout(() => { busyA = false; }, 3000); // unblocks A's wait:'idle'
+    watcher = start(ctx);
+
+    const uuidA = 'serialize-parallel-a-' + Date.now();
+    const uuidC = 'serialize-parallel-c-' + Date.now();
+    writeTrigger(tmp, uuidA, { sessionId: SESSION_A, command: 'AAAA', wait: 'idle' });
+    await new Promise((r) => setTimeout(r, 60));
+    writeTrigger(tmp, uuidC, { sessionId: SESSION_C, command: 'CCCC', wait: 'none' });
+
+    const resultPathC = path.join(tmp, 'processed', uuidC + '.result.json');
+    await waitForFile(resultPathC, 2500);
+
+    const resultC = readResult(path.join(tmp, 'processed'), uuidC);
+    assert.equal(resultC.ok, true);
+    assert.deepEqual(writtenC, ['CCCC', '\r']);
+    assert.equal(busyAWhenCWrote, true,
+      'session C wrote while session A was still blocked on its own wait:"idle" (busyA had not ' +
+      'flipped false yet) -- session C must not have waited behind session A to get there');
+
+    const resultPathA = path.join(tmp, 'processed', uuidA + '.result.json');
+    await waitForFile(resultPathA, 5000);
+    const resultA = readResult(path.join(tmp, 'processed'), uuidA);
+    assert.equal(resultA.ok, true);
 
   } finally {
     if (watcher) watcher.close();

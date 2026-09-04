@@ -231,6 +231,18 @@ default. For all of that time the trigger holds one of the 8 concurrent slots
 away mid-sentence can stall the queue for every other session. Set a short
 `timeout_ms` on triggers that would rather renounce than wait.
 
+**Two triggers naming the same session never run at once.** `MAX_INFLIGHT`
+bounds how many trigger *files* the watcher processes in parallel; it says
+nothing about which sessions they target. Two triggers aimed at the same
+`sessionId` are serialized independently of that cap — the second waits for
+the first's result to be written before it so much as samples that session's
+`busy` state — so their writes can never land in the same composer
+interleaved. Triggers aimed at different sessions are unaffected and keep
+running in parallel, still bounded only by `MAX_INFLIGHT`. A trigger's own
+`timeout_ms` / idle-wait deadline is what still bounds how long a second
+trigger for the same session can end up waiting — nothing here waits longer
+than that.
+
 ### Reading a result
 
 Every path that decides a trigger's fate — success, validation refusal, timeout,
@@ -282,6 +294,23 @@ effect itself — a smaller context window, a new transcript, a file on disk —
 even when `submitted` reads `confirmed`; treat `confirmed` as "the handoff to
 the session went through cleanly", and `activity` as "something happened,
 unattributed".
+
+**What `confirmed` proves, stated exactly, and the one thing it does not.**
+`confirmed` means three checked facts and nothing more: the session was idle
+the instant before we wrote, a turn was observed within the verify window
+after that write, and this was the first attempt (no retry). **It does not
+prove that the turn it observed is the one our write started.**
+`pollForBusyObserved` is a level probe over the whole window, not an edge
+tied to our write — any `busy` transition inside that window satisfies it,
+regardless of what caused it. A second trigger on the same session, a human
+resuming, or any other actor going busy inside the same window produces
+`confirmed` exactly as our own write would. Serializing triggers per session
+(above) closes the same-session case at the source — the second trigger
+cannot even attempt a write until the first has fully finished — but an
+actor outside this transport's own admission queue (a human, another
+process) is not something a PTY byte stream can distinguish from our own
+effect. **A false `confirmed` remains reachable in that case: it is narrowed
+by construction, never eliminated.**
 
 > **Changed — read this if you parse `submitted`.**
 > `confirmed` used to be emitted whenever the session was seen busy after a

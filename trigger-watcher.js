@@ -444,8 +444,13 @@ function safeLogError(ctx, ...args) {
 /**
  * Process a single trigger file (by basename, e.g. "abc-123.json").
  * Never throws — all errors land in the result file.
+ *
+ * @param {function} [acquireSessionLock] (sessionId) => Promise<releaseFn>;
+ *        awaited right after sessionId is known valid, released in the
+ *        `finally` below so a second trigger for the same session cannot
+ *        touch its PTY/composer until this one is fully done.
  */
-async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryRetained) {
+async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryRetained, acquireSessionLock) {
   // Only handle *.json files, ignore the processed/ subdir itself and
   // any stray files.
   if (!name.endsWith('.json')) return;
@@ -478,6 +483,8 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
       }
     }
   }
+
+  let releaseSessionLock;
 
   try {
 
@@ -541,6 +548,11 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
   if (typeof sessionId !== 'string' || !sessionId) {
     await writeResult({ ok: false, error: 'missing required field: sessionId', sessionId: sessionId || null });
     return;
+  }
+
+  // see .ai/contexts/trigger-watcher.md, "Session serialization"
+  if (acquireSessionLock) {
+    releaseSessionLock = await acquireSessionLock(sessionId);
   }
 
   // An unknown `wait` is refused before anything is written: falling back to
@@ -979,6 +991,8 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     safeLogError(ctx, '[trigger-watcher] Trigger processing threw, writing a generic failure result:',
       name, err && err.message);
     await writeResult({ ok: false, error: 'internal error: ' + (err && err.message), internal: true });
+  } finally {
+    if (releaseSessionLock) releaseSessionLock();
   }
 }
 
@@ -1018,6 +1032,20 @@ function start(ctx) {
   // .ai/contexts/trigger-watcher.md.
   const retained = new Set();
 
+  // see .ai/contexts/trigger-watcher.md, "Session serialization"
+  const sessionLocks = new Map(); // sessionId -> tail Promise of the queue
+  function acquireSessionLock(sessionId) {
+    const previous = sessionLocks.get(sessionId) || Promise.resolve();
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    const tail = previous.then(() => held);
+    sessionLocks.set(sessionId, tail);
+    return previous.then(() => () => {
+      release();
+      if (sessionLocks.get(sessionId) === tail) sessionLocks.delete(sessionId);
+    });
+  }
+
   function scheduleNext() {
     while (waitQueue.length > 0 && inFlight.size < MAX_INFLIGHT) {
       const filename = waitQueue.shift();
@@ -1029,7 +1057,7 @@ function start(ctx) {
 
   function dispatch(filename) {
     inFlight.add(filename);
-    processTriggerFile(filename, ctx, triggersDir, processedDir, () => retained.add(filename))
+    processTriggerFile(filename, ctx, triggersDir, processedDir, () => retained.add(filename), acquireSessionLock)
       .catch((err) => {
         retained.add(filename);
         safeLogError(ctx, '[trigger-watcher] Trigger processing threw, will not be run again:',
