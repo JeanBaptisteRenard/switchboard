@@ -32,6 +32,6 @@ Grab the latest release for your platform from the [GitHub Releases page](https:
 
 ## For Developers
 
-See [../CLAUDE.md](../CLAUDE.md) for fork-specific conventions, architecture invariants, and AI agent guidance.
+See [../.ai/shared-guidelines.md](../.ai/shared-guidelines.md) (the file `../CLAUDE.md` includes) for fork-specific conventions, architecture invariants, and AI agent guidance.
 
 See [decisions/](decisions/README.md) for architecture decision records (e.g. why there's no full Go rewrite).

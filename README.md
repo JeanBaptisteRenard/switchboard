@@ -165,7 +165,7 @@ If your `~/Applications/Switchboard.AppImage` is open while you develop:
 
 ### For AI agents
 
-If you're an AI working in this repo, read [CLAUDE.md](CLAUDE.md) at the project root — it documents the fork-specific features, invariants (no double Electron, no `Co-Authored-By`, worktree isolation pattern), and the helpers worth reusing (`enumerateSessionFiles`, `encodeProjectPath`, `ViewerPanel`).
+If you're an AI working in this repo, read [CLAUDE.md](CLAUDE.md) at the project root — it's a one-line `@.ai/shared-guidelines.md` include, and it's [.ai/shared-guidelines.md](.ai/shared-guidelines.md) itself that documents the fork-specific features, invariants (no double Electron, no `Co-Authored-By`, worktree isolation pattern), and the helpers worth reusing (`enumerateSessionFiles`, `encodeProjectPath`, `ViewerPanel`).
 
 ## Building
 
