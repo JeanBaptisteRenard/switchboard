@@ -202,6 +202,11 @@ test('composer-state: an unrecognised sequence still counts as input', () => {
     ['\x1b[1;2O',        'a modified CSI O'],
     ['\x1bOM',           'SS3 M, not CSI M'],
     ['\x1b[<0;42;13X',   'the right shape with the wrong final byte'],
+    // Empty numeric fields: the near-miss a `\d*` mutant would let through
+    // silently, since `*` accepts zero digits where `{1,10}` requires one.
+    ['\x1b[<;42;13M',   'SGR report with an empty button field'],
+    ['\x1b[<0;;13M',    'SGR report with an empty x field'],
+    ['\x1b[<0;42;M',    'SGR report with an empty y field'],
   ];
   for (const [seq, why] of cases) {
     const state = createComposerState();
@@ -234,6 +239,111 @@ test('composer-state: a typed ESC [ M is input, not a mouse report', () => {
   assert.equal(keyByKey.text, 'ise');
   assert.equal(keyByKey.pending, 3);
   assert.equal(keyByKey.lastInputAt, 7000);
+});
+
+// ── Cursor position reports (CPR / DECXCPR) ─────────────────────────────────
+// Regression cover for the 2026-09-04 measurement: CPR chunks dominated a
+// real idle-session trace and, left unhandled, kept the quiet clock from ever
+// opening. See .ai/contexts/trigger-watcher.md ("Found it — CPR") for the numbers.
+
+const CPR_DECX  = '\x1b[?59;3R';       // DECXCPR, as measured
+const CPR_PAGE  = '\x1b[?59;3;1R';     // DECXCPR with a page field
+
+test('composer-state: a cursor position report is neither text nor activity', () => {
+  assertInert([CPR_DECX]);
+  assertInert([CPR_PAGE]);
+  // The measured cadence: back-to-back queries as the column advances.
+  assertInert(['\x1b[?59;3R', '\x1b[?59;4R', '\x1b[?59;6R', '\x1b[?59;8R']);
+});
+
+// A bare `CSI n;m R` with no `?` is not a report at all on this CLI/terminal
+// pairing: it is what xterm.js sends for a modified F3 keypress (`case 114`
+// in xterm.js, `ESC[1;<mod+1>R`). 24,795/24,795 CPR chunks measured in the
+// 2026-09-04 trace carried the `?`; zero did not — see
+// .ai/contexts/trigger-watcher.md ("Found it — CPR"). The `?` is therefore
+// mandatory in CPR_PARAMS_RE, not optional: a bare `n;m R` must count as
+// input, exactly like any other unrecognised sequence.
+test('composer-state: a bare (non-DECXCPR) CPR-shaped sequence is a keystroke, not a report', () => {
+  const bareCases = [
+    ['\x1b[24;80R', 'bare CPR: no `?`, plausible-looking but never measured'],
+    ['\x1b[1;2R',   'Shift+F3'],
+    ['\x1b[1;3R',   'Alt+F3'],
+    ['\x1b[1;4R',   'Alt+Shift+F3'],
+    ['\x1b[1;5R',   'Ctrl+F3'],
+    ['\x1b[1;6R',   'Ctrl+Shift+F3'],
+    ['\x1b[1;7R',   'Ctrl+Alt+F3'],
+    ['\x1b[1;8R',   'Ctrl+Alt+Shift+F3'],
+  ];
+  for (const [seq, why] of bareCases) {
+    const state = createComposerState();
+    noteUserInput(state, 'hi', 1000);
+    noteUserInput(state, seq, 9000);
+    assert.equal(state.lastInputAt, 9000, `${why} (${JSON.stringify(seq)}) must push the quiet clock`);
+  }
+});
+
+test('composer-state: a CPR mixing with a keystroke counts only the keystroke', () => {
+  const state = createComposerState();
+  noteUserInput(state, 'hi', 1000);
+  noteUserInput(state, CPR_DECX + 'x', 5000);
+  assert.equal(state.pending, 3, 'the keystroke lands in the composer');
+  assert.equal(state.lastInputAt, 5000, 'and pushes the quiet clock');
+  // The discriminating half: further CPRs on their own, after the keystroke,
+  // must not advance the clock past it.
+  noteUserInput(state, CPR_DECX, 9000);
+  assert.equal(state.lastInputAt, 5000, 'a later CPR alone must not push the clock again');
+});
+
+test('composer-state: a CPR split across chunks is never counted as text', () => {
+  const state = createComposerState();
+  noteUserInput(state, '\x1b[?59;', 1000);
+  assert.equal(state.pending, 0, 'a half report is held back, not typed');
+  assert.equal(state.partial, '\x1b[?59;');
+  noteUserInput(state, '3R', 2000);
+  assert.equal(state.pending, 0, 'the completed report adds nothing');
+  assert.equal(state.partial, '');
+  assert.equal(state.lastInputAt, 1000, 'the completing chunk is silence');
+});
+
+test('composer-state: a near-miss CPR still counts as input', () => {
+  // Same safety principle as the SGR near-misses: only the exact shape is
+  // exempt. Arbitrary params ending in R must resolve towards busy.
+  const cases = [
+    ['\x1b[24R',           'CPR missing the column field'],
+    ['\x1b[24;80;1;1R',    'one field too many'],
+    ['\x1b[24;80;1;1;1R',  'two fields too many'],
+    ['\x1b[a;bR',          'non-numeric CPR parameters'],
+    ['\x1b[24;80;1;R',     'a dangling separator'],
+    ['\x1b[5R',            'CSI 5 R — not a position report at all'],
+    // Empty numeric fields on an otherwise well-formed DECXCPR: the near-miss
+    // a `\d*` mutant would let through silently, since `*` accepts zero
+    // digits where `{1,4}` requires one.
+    ['\x1b[?;3R',          'DECXCPR with an empty row field'],
+    ['\x1b[?59;R',         'DECXCPR with an empty column field'],
+  ];
+  for (const [seq, why] of cases) {
+    const state = createComposerState();
+    noteUserInput(state, 'hi', 1000);
+    noteUserInput(state, seq, 9000);
+    assert.equal(state.lastInputAt, 9000, `${why} must push the quiet clock`);
+  }
+});
+
+// NOTE: whether a CPR could corrupt `text`/`cursor`/`pending` (not just the
+// clock) was checked by reading `applyCsi` rather than by a test here — see
+// .ai/contexts/trigger-watcher.md ("Found it — CPR") for why no runtime
+// assertion on this can ever go red post-fix.
+
+test('composer-state: ordinary typing still pushes the clock through a CPR flood', () => {
+  // The guarantee that matters: excluding CPR must not accidentally exclude
+  // real keystrokes that merely resemble one in shape.
+  const state = createComposerState();
+  let t = 1000;
+  for (let i = 0; i < 20; i++) noteUserInput(state, CPR_DECX, (t += 50));
+  assert.equal(state.lastInputAt, 0, 'a CPR flood alone must never look like typing');
+  noteUserInput(state, 'x', (t += 50));
+  assert.equal(state.lastInputAt, t, 'a real keystroke still pushes the clock');
+  assert.equal(state.pending, 1);
 });
 
 test('composer-state: a bare CSI M never swallows the bytes that follow it', () => {

@@ -184,6 +184,102 @@ The SGR-and-focus exemption above (PR #160) is correct and worth keeping, but it
 **cannot** be the cause of this symptom: exempting mouse reports cannot quiet a
 channel that carries none, since Claude Code never turns motion tracking on.
 
+**Found it — CPR, fixed 2026-09-04.** A 340 s trace of two idle sessions
+(`SWITCHBOARD_ACTIVITY_TRACE`, real machine, nobody at the keyboard) put a
+number on the suspects above:
+
+| Shape | Count | out of 2,422 `pty.input` chunks |
+|---|---|---|
+| CPR / DECXCPR (`CSI [?] row ; col [; page] R`) | 1,427 | 59% |
+| SGR mouse (`CSI < b ; x ; y M`/`m`) | 495 | 20% — already excluded, working |
+| plain text, no control byte (real typing) | 473 | 20% — real keystrokes, correctly counted |
+| DEL / CR | 27 | 1% — real keystrokes |
+| OSC, DCS | 0 | not observed on this machine, ever |
+
+CPR alone, arriving roughly every 240 ms, kept `lastInputAt` reassigned
+continuously: the 3000 ms quiet window (`DEFAULT_QUIET_MS`) could not open
+between two sessions still on screen, whatever the pointer or the CLI's own
+busy state were doing. The 2026-09-02 fix above was correct but aimed at 20%
+of the traffic; the dominant 59% was untouched, which is why the symptom
+outlived it.
+
+`composer-state.js`'s `reportLength()` now recognises CPR/DECXCPR the same
+way it recognises SGR mouse and focus reports: a dedicated regex bounding
+every numeric field (`CPR_PARAMS_RE`), not a bare check on the final byte.
+`applyCsi` has no case for final `R` — falls through its default — so before
+this fix a CPR chunk pushed the clock but never touched `text`/`cursor`/
+`pending`; the defect was confined to the quiet window, not to composer
+content. Verified by reading the switch, not by a runtime test: once
+`reportLength` claims `R`, `applyCsi` never sees it, so nothing post-fix can
+exercise that unreachable case (see `test/composer-state.test.js`).
+
+**"The same way" is an analogy, not the safety argument — the two exemptions
+rest on different properties.** What makes `SGR_MOUSE_PARAMS_RE` safe is that
+its final bytes (`M`/`m`) only reach `reportLength` on a chunk starting with
+`CSI <`, and no keyboard on this machine's key-event handler
+(`public/terminal-manager.js`, `attachCustomKeyEventHandler`) or xterm.js's own
+`onData` emits `<` as the third byte of a CSI sequence — the prefix is
+terminal-report-only by construction, so bounding the numeric fields is
+enough. Final `R` has no such prefix to lean on: xterm.js emits bare
+`CSI n ; m R` for a *modified F3 keypress* (`xterm.js`, `case 114`:
+`ESC+"[1;"+(mod+1)+"R"`, `1;2` through `1;8` for Shift/Alt/Ctrl combinations).
+An earlier version of `CPR_PARAMS_RE` made the `?` optional (`\??`), so it
+matched that shape too — a real keystroke silently exempted from the quiet
+clock, the direction this whole guard exists to prevent, and strictly worse
+than the CPR flood it was fixing. Caught before merge by checking a keyboard
+source (xterm.js) rather than reasoning by analogy from the mouse case.
+
+The actual safety argument for `CPR_PARAMS_RE`, mandatory `?` included: DECXCPR
+(`CSI ? row ; col [; page] R`) is what this terminal answers with, and it is
+the *only* shape observed — 24,795 CPR chunks in the 2026-09-04 trace, `?`
+present in all 24,795, present in zero of the responses this codebase has ever
+seen without it. Requiring the `?` excludes exactly the modified-F3 shape
+above and nothing measured. **Residual**: this is a measurement on one
+CLI/terminal pairing, not a proof that no terminal ever answers CPR without
+`?` (plain DSR-6, `CSI row ; col R`, is a legal *bare* CPR in the DEC standard
+— just not one this xterm.js/ConPTY combination has been observed to send).
+If a future terminal or `xterm.js` config starts answering bare CPR, this
+regex will — correctly, per the "doubt resolves to busy" principle — count
+that as a keystroke rather than false-exempt it; the failure mode of being
+wrong here is a spurious wait, not a swallowed keypress.
+
+The end-to-end proof — a CPR flood no longer blocking `waitForComposerFree`'s
+free condition — lives in `test/composer-state-quiet-window.test.js`, which
+reimplements the one-line predicate against fake time rather than importing
+`waitForComposerFree`: that function is not exported, and PR #168 edits it
+directly, so adding an export here would create an avoidable conflict for a
+one-line predicate that composer-state.js's own clock behaviour already
+proves.
+
+**DSR, DA1/DA2, DECRPM, window-ops (`t`) — not added, zero occurrences
+measured.** The brief that produced this fix asked for all of these as a
+matter of course; the trace has none of them, on either the 103 s or the
+340 s window, so they are deliberately left out rather than excluded on
+reasoning alone — the same conservatism the SGR-params regex already applies
+to mouse reports. DECRPM (`CSI ? Pd $ y`) additionally can't be told apart
+from a bare final `y` with the current `matchEscape`: the intermediate `$`
+byte is consumed but not returned in the match, so distinguishing it would
+mean changing `matchEscape`'s return shape, not just adding a param regex —
+out of scope for a fix this size. If a future CLI release starts querying any
+of these (plausible — Claude Code already probes DECRPM-style modes for
+things like synchronized-output support), re-run the trace and treat it the
+same way CPR was: measure first, then add the exact shape, never the final
+byte alone.
+
+**OSC and DCS replies — parsed differently, and both unmeasured.** OSC
+replies (colour query, `10`/`11`) are matched whole by `matchEscape` (kind
+`osc`) and, since nothing in `noteUserInput` applies to that kind, push
+`lastInputAt` without touching `text`/`pending` — a defect of the same shape
+as CPR's, just with zero observed occurrences here. DCS is worse and
+structural, not a report-recognition gap: `matchEscape` has no DCS
+introducer case, so `ESC P` falls into the generic 2-byte `esc` catch-all,
+and everything up to the terminator (`ESC \` or the DECRQSS/XTGETTCAP
+payload) is then walked byte-by-byte as literal text — a DCS reply, if one
+ever arrived, would be typed into the composer. Not fixed here: zero measured
+occurrences, and the fix is a `matchEscape` change (recognising and
+discarding a whole DCS sequence), not a `reportLength` addition — a
+different, larger piece of work than this PR's scope.
+
 **`submitted`.** Every result carries it, compared by strict equality:
 `confirmed` (a busy rising edge was observed after our write), `assumed`
 (written, no failure seen, nothing observed after), `no` (nothing written, or
