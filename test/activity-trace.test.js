@@ -718,7 +718,11 @@ test('close() waits for its own stream\'s close, not just finish', async () => {
     // below races the exact same handle-still-open condition this whole
     // suite is about. See docs/activity-trace.md.
     await waitUntil(() => made.every(s => s.fd === null || s.fd === undefined));
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Windows can still hold a just-closed file for a moment after autoClose
+    // nulls its fd (a real-time AV scan on close, e.g.) — the fd check above
+    // catches the case this PR is about, this catches the OS's own
+    // documented aftermath of a close it already completed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -749,7 +753,11 @@ test('setEnabled(false, ...) waits for its own stream\'s close, not just finish'
     fs.createWriteStream = realCreate;
     // See the matching comment in the close() version of this test.
     await waitUntil(() => made.every(s => s.fd === null || s.fd === undefined));
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Windows can still hold a just-closed file for a moment after autoClose
+    // nulls its fd (a real-time AV scan on close, e.g.) — the fd check above
+    // catches the case this PR is about, this catches the OS's own
+    // documented aftermath of a close it already completed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -787,7 +795,11 @@ test('close() waits for a still-pending rotation close, not just its own stream'
     fs.createWriteStream = realCreate;
     // See the comment in "close() waits for its own stream's close" above.
     await waitUntil(() => made.every(s => s.fd === null || s.fd === undefined));
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Windows can still hold a just-closed file for a moment after autoClose
+    // nulls its fd (a real-time AV scan on close, e.g.) — the fd check above
+    // catches the case this PR is about, this catches the OS's own
+    // documented aftermath of a close it already completed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -822,7 +834,11 @@ test('setEnabled(false, ...) waits for a still-pending rotation close, not just 
     fs.createWriteStream = realCreate;
     // See the comment in "close() waits for its own stream's close" above.
     await waitUntil(() => made.every(s => s.fd === null || s.fd === undefined));
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Windows can still hold a just-closed file for a moment after autoClose
+    // nulls its fd (a real-time AV scan on close, e.g.) — the fd check above
+    // catches the case this PR is about, this catches the OS's own
+    // documented aftermath of a close it already completed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -855,7 +871,11 @@ test('close() falls back to done() if the stream never emits close', async () =>
     // The intercepted close is held forever by design, but the real stream
     // still closes on its own via autoClose — wait for that before rmSync.
     await waitUntil(() => made.every(s => s.fd === null || s.fd === undefined));
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Windows can still hold a just-closed file for a moment after autoClose
+    // nulls its fd (a real-time AV scan on close, e.g.) — the fd check above
+    // catches the case this PR is about, this catches the OS's own
+    // documented aftermath of a close it already completed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
