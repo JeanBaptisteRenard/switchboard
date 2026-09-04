@@ -16,7 +16,8 @@ function createTriggerContext({ activeSessions, log, isPtyAlive }) {
     getPtyForSession(sessionId) {
       const session = activeSessions.get(sessionId);
       if (!session || session.exited) return null;
-      return { ptyProcess: session.pty };
+      // cwd: see .ai/contexts/trigger-watcher.md, "Target guard"
+      return { ptyProcess: session.pty, cwd: session.cwd };
     },
     isSessionBusy(sessionId) {
       const session = activeSessions.get(sessionId);

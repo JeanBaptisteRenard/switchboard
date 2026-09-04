@@ -100,6 +100,17 @@ serialization" tests, for same-session ordering and cross-session
 independence, both proved by write-order assertions rather than by inspecting
 the lock directly.
 
+**Interaction with the target guard.** The lock is acquired before the target
+guard ever runs (both sit inside the same outer `try`), so a guard refusal —
+single command or a chain refused at step 0 — is itself a lock holder for the
+brief moment it takes to write its result and `return`. That `return` runs the
+same `finally` as every other exit path, so the lock is released exactly like
+a success would release it; the only visible cost is a rejected trigger
+briefly occupying the front of the queue. Proved by two tests under "Target
+guard" that queue a legitimate trigger for the same session right behind a
+refused one and require it to still produce a result — and by mutating the
+release call itself to confirm those tests go red when it stops firing.
+
 **Liveness is probed after the waits, never before them.** `isPtyAlive` runs
 once as a pre-flight, then again *after* `waitForComposerFree` on the
 single-`command` path and on every chain step. A probe taken before a wait that
@@ -522,6 +533,7 @@ Fields:
 - `chain` — array of up to 20 `{command, ...}` steps (`MAX_CHAIN_LENGTH`), injected sequentially; each step's submission is verified (busy-rise) with one bare-Enter retry before the next step is sent. Mutually exclusive with `command`; exactly one of the two is required.
 - `wait` — `"none"` (default) | `"idle"`.  `"idle"` polls `isSessionBusy` every 100 ms until the session goes idle or the timeout fires.
 - `timeout_ms` — optional positive integer, ≤ 600 000 ms.  Overrides both the env var and the default for this trigger only.  On invalid value → `{ok:false, error:"invalid timeout_ms"}`, semaphore released, no PTY write.
+- `expectedCwd` — optional. See "Target guard" below.
 
 **Timeout precedence**: per-trigger `timeout_ms` > `SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS` env var > compiled default (300 000 ms).
 
@@ -661,9 +673,102 @@ and nothing prunes them.
 - **Timeout env var for tests** — `SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS` lets tests use a 200 ms timeout instead of 30 s, making the idle-timeout test fast.
 - **`persistent: true` on `fs.watch`** — the watcher keeps the Node event loop alive, matching the pattern of all other persistent watchers in `main.js` (projects watcher, subagent watcher).
 
+## Target guard (`expectedCwd`)
+
+**The incident this closes.** An auto-compaction trigger named the session of
+a *different* agent — the writer chose its target by taking the session whose
+transcript had the most recent `ModTime`, across every project, which is a
+race: another session writing at the same instant is addressed instead. That
+correction belongs in the writer (in progress, tracked as harness card #85);
+what belongs here is a check the transport itself can make before it types
+anything, because a valid `sessionId` naming an open session is otherwise
+indistinguishable from a stale or racy one.
+
+**The field.** `expectedCwd` (optional, string) is what the writer believes
+the target session's cwd to be. It is compared against `sessionEntry.cwd` —
+`session.cwd` in `main.js` (the PTY's actual spawn cwd, set at session
+creation; see the comment above `spawnCwd`'s declaration in `open-terminal`),
+surfaced through `getPtyForSession` in `trigger-context.js`. This is an
+extension of `ctx`: before this field, `getPtyForSession` returned only
+`{ ptyProcess }`.
+
+**Why cwd, and why the PTY's spawn cwd rather than `projectPath`.** The field
+exists to catch exactly the shape of the incident: two agents, two sessions,
+open in two different folders (typically two worktrees of the same repo).
+`session.projectPath` is the *collapsed* project root — the same for every
+worktree of one repo — so it cannot tell two such sessions apart; it is
+literally useless for the case that motivated this guard. `session.cwd`
+(`spawnCwd`) is the directory the CLI process actually runs in, which does
+differ between worktrees. Two sessions open in the *same* folder remain
+indistinguishable by this field — stated in `docs/automation.md` so a reader
+does not credit it with more than it does.
+
+**Comparison: `normalizeCwd()` in `trigger-watcher.js`.** Both sides go
+through it before `!==`. It folds: separator style (`path.normalize`,
+platform-aware), a trailing separator (except a bare root), the `\\?\` and
+`\\?\UNC\` long-path prefixes, and — on Windows only — case (NTFS/ReFS are
+case-insensitive; POSIX is left case-sensitive, matching ext4). The bare-root
+exemption checks `n !== path.sep` rather than a length threshold: a length
+guard degrades silently the moment `path.sep` is a single character, which it
+always is on every platform this runs on, so a POSIX/UNC-style root would
+otherwise be one edit away from being stripped down to `""`. It does
+**not** fold: 8.3 short names (`JEAN-B~1`) against their long form, a
+substituted drive (`subst`) against its real target, or a junction/symlink
+against the real folder it points at — two spellings of the same real
+directory in any of those three shapes read as a mismatch. Returns `null` for
+anything that is not a usable non-empty string, which is also the "nothing to
+compare" signal the guard's indeterminate branch reads.
+
+**Three outcomes, and how a reader tells them apart without parsing text.**
+The result of a refusal carries a boolean set only on its own path — the same
+pattern `internal: true` uses elsewhere in this file — so a reader checks a
+key, never a substring of `reason`:
+
+| Outcome | `ok` | `targetMismatch` | `targetCwdUnknown` |
+|---|---|---|---|
+| absent, or present and concordant | (trigger proceeds normally) | — | — |
+| present, discordant | `false` | `true` | — |
+| present, target cwd indeterminate | `false` | — | `true` |
+
+Both refusal shapes also carry `expectedCwd` (the raw declared value) and
+`observedCwd` (the raw session cwd, or `null` when unknown) — the field
+neither side could otherwise read back, since the trigger file that carried
+`expectedCwd` is deleted like every other trigger (see "Removing the entry").
+Without echoing it in the result, only the transport's own log line records
+what was declared. Both refusals write `error: "not sent"` (the whole
+contract's "nothing was written" value) with the detail in `reason`.
+
+**Fails closed.** An `expectedCwd` the guard cannot check is refused exactly
+like one that disagrees — never waved through. This is the failure mode the
+guard exists to close: a session whose registry entry is not yet populated,
+or a `ctx` that predates the `cwd` field, must not silently degrade back to
+"any valid sessionId is trusted", which is the exact hole this guard closes.
+
+**Where it runs.** Right after the session lookup and liveness pre-flight
+(step 4), before either the single-`command` or the `chain` path — one check
+per trigger file, not per chain step, so a chain refused here reports no
+`steps` and no `partial` at all, the same shape as "session not found".
+Malformed `expectedCwd` (present, not a non-empty string) is refused earlier
+still, in shape validation (3c), before the session lookup — the same
+ordering `wait` and `timeout_ms` already use.
+
+**Unconditionally backward-compatible.** No `expectedCwd` in the trigger means the
+guard block is never entered; behaviour is byte-for-byte what it was before
+this field existed. A `ctx.getPtyForSession` that still returns bare
+`{ ptyProcess }` (an older or a test-only `ctx`) reads as `cwd: undefined`,
+which is the indeterminate case — refused only when `expectedCwd` is present,
+otherwise never consulted.
+
+Tests: `test/trigger-watcher.test.js` ("Target guard" section) and
+`test/trigger-context.test.js` (the `cwd` passthrough);
+`test/main-wiring-source-check.test.js` checks `main.js` still builds the
+session literal with `cwd: spawnCwd` (source-only, proves nothing at
+runtime).
+
 ## Change-also checklist
 
 - If you rename `_cliBusy` on `session` in `main.js`, update `isSessionBusy` in `trigger-context.js`.
 - If you rename `session.composerState` or stop feeding it from `terminal-input.js`, `getComposerState` returns `null` and **every trigger renounces with `not sent`** — the safe direction, but the channel goes silent.  Tests for the model live in `test/composer-state.test.js`; the handler and the ctx are exercised in `test/terminal-input-handler.test.js` and `test/trigger-context.test.js`, and `test/main-wiring-source-check.test.js` reads `main.js` as text to check the remaining glue is still written down (source only — it proves nothing at runtime).
 - If you rename `activeSessions` or change the structure (`session.pty` → `session.ptyProcess`), update `getPtyForSession` and `isSessionBusy` in `trigger-context.js`, and `handleTerminalInput` in `terminal-input.js`.
+- If you rename `session.cwd` in `main.js`, update `getPtyForSession` in `trigger-context.js` — the target guard silently falls back to "indeterminate" (refuses every guarded trigger) rather than throwing, so this one fails quiet, not loud.
 - Tests live in `test/trigger-watcher.test.js`.  They use `SWITCHBOARD_TRIGGERS_DIR` env override — do not hardcode paths there.

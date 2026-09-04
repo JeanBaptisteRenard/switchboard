@@ -56,6 +56,16 @@ test('getPtyForSession exposes the pty of a live session and null otherwise', ()
   assert.equal(ctx.getPtyForSession('nope'), null);
 });
 
+test('getPtyForSession exposes the session\'s cwd for the target guard, undefined when the session predates the field', () => {
+  const withCwd    = makeSession({ cwd: 'C:\\Projects\\foo' });
+  const withoutCwd = makeSession();
+  const ctx        = ctxWith([['with', withCwd], ['without', withoutCwd]]);
+
+  assert.equal(ctx.getPtyForSession('with').cwd, 'C:\\Projects\\foo');
+  assert.equal(ctx.getPtyForSession('without').cwd, undefined,
+    'a session predating this field must read as indeterminate, not as some default path');
+});
+
 test('isSessionBusy reads _cliBusy and is false for an unknown session', () => {
   const ctx = ctxWith([
     ['busy', makeSession({ _cliBusy: true })],

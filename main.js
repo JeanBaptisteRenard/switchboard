@@ -2052,6 +2052,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     pty: ptyProcess, rendererAttached: true, exited: false,
     outputBuffer: [], outputBufferSize: 0, altScreen: false,
     projectPath, firstResize: true,
+    // see .ai/contexts/trigger-watcher.md, "Target guard"
+    cwd: spawnCwd,
     projectFolder, knownJsonlFiles,
     isPlainTerminal, forkFrom: sessionOptions?.forkFrom || null,
     // Recorded so a reattach can report it too — the renderer badges sandboxed
