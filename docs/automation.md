@@ -71,6 +71,34 @@ Instead of a single `command`, you can send a `chain` — a sequence of up to 20
 
 `command` and `chain` are mutually exclusive.
 
+**`waited_ms` / `total_waited_ms`.** Both fields mean the same thing — every
+wait this trigger spent — scoped differently: a single `command` result
+carries `waited_ms` for the whole trigger; a `chain` result carries
+`total_waited_ms` for the whole chain, plus a per-step `waited_ms` inside each
+`steps[]` entry.
+
+- **`command`'s `waited_ms`** is the `wait:"idle"` wait (0 if `wait` is
+  `"none"` or the session was already idle), plus the politeness wait, plus
+  the submit-verification poll and its retry, if one fired.
+- **`chain`'s `total_waited_ms`** is the initial `wait:"idle"` wait (same rule)
+  plus, for every step the chain attempted, that step's own politeness wait,
+  its submit-verification poll(s), and — for every step but the last — its
+  busy-fall wait. `steps[i].waited_ms` is the same sum scoped to step `i`
+  alone, so `total_waited_ms` equals the initial wait plus the sum of every
+  entry in `steps[]`, **except** when the last attempted step is abandoned
+  before it ever writes anything (composer never free, the session exits, or
+  the global deadline fires): that step's partial wait still counts toward
+  `total_waited_ms`, but it has no entry in `steps[]` to be attributed to,
+  since `steps[]` only lists steps that actually reached a write.
+
+A measured gap of roughly 158 s between `total_waited_ms` and the sum of
+`steps[*].waited_ms` on 2026-09-03 was this: each step's own politeness wait
+was folded into `total_waited_ms` but left out of that step's own
+`waited_ms` — fixed so the identity above holds exactly on every chain that
+completes. The `command` path had the matching gap on its own smaller scale —
+its `waited_ms` left out the submit-verification poll entirely — fixed the
+same way, so a reader comparing the two paths finds them consistent.
+
 `wait` accepts **`idle` and `none`, and nothing else.** An absent field still
 means `none`, because existing triggers rely on that default, but any other
 value — an empty string, `null`, `"idel"` — is refused before anything is
@@ -203,6 +231,18 @@ default. For all of that time the trigger holds one of the 8 concurrent slots
 away mid-sentence can stall the queue for every other session. Set a short
 `timeout_ms` on triggers that would rather renounce than wait.
 
+**Two triggers naming the same session never run at once.** `MAX_INFLIGHT`
+bounds how many trigger *files* the watcher processes in parallel; it says
+nothing about which sessions they target. Two triggers aimed at the same
+`sessionId` are serialized independently of that cap — the second waits for
+the first's result to be written before it so much as samples that session's
+`busy` state — so their writes can never land in the same composer
+interleaved. Triggers aimed at different sessions are unaffected and keep
+running in parallel, still bounded only by `MAX_INFLIGHT`. A trigger's own
+`timeout_ms` / idle-wait deadline is what still bounds how long a second
+trigger for the same session can end up waiting — nothing here waits longer
+than that.
+
 ### Reading a result
 
 Every path that decides a trigger's fate — success, validation refusal, timeout,
@@ -212,21 +252,75 @@ trigger file. The directory therefore holds exactly the triggers still waiting
 to be processed:
 
 ```json
-{ "ok": true,  "submitted": "confirmed", "sessionId": "...", "command": "...", "sent_at": "...", "waited_ms": 320 }
+{ "ok": true,  "submitted": "activity", "sessionId": "...", "command": "...", "sent_at": "...", "waited_ms": 320 }
 { "ok": false, "submitted": "no", "error": "not sent", "reason": "4 byte(s) of input are sitting unsubmitted in the composer" }
 ```
 
 **`submitted` is the field to read, not `ok`.** A payload written into a
-composer is not a message received. Three values, compared by strict equality:
+composer is not a message received. Four values, compared by strict equality,
+in this order (`no` < `assumed` < `activity` < `confirmed`):
 
 | Value | Meaning |
 |---|---|
-| `confirmed` | the session went busy after our write — the submission was observed |
+| `confirmed` | the composer was read back empty right after our own Enter, the session was **not** already busy the instant we wrote, and a turn was independently observed in the same window — checked on the first attempt only, never after a retry |
+| `activity` | the session was seen busy after our write, but the composer readback could not rule out interference, or the session was already mid-turn when we wrote |
 | `assumed` | written, no failure seen, nothing observed afterwards |
 | `no` | nothing was written, or it was written and not submitted |
 
-A `chain` reports the **weakest** value any of its steps reached
-(`no` < `assumed` < `confirmed`).
+A `chain` reports the **weakest** value any of its steps reached.
+
+**What `activity` refuses to claim, and what a bare composer reading cannot
+prove on its own.** Busy is sampled, not compared against a baseline taken
+before the write, and nothing ties it to that write: a session already
+mid-turn when the trigger fires reads busy on the very first sample. Reading
+the composer back does not close that gap by itself either — the composer
+model only ever sees bytes the renderer sends (see "Politeness" above); this
+transport's own writes go straight to the PTY and are invisible to it. So "the
+composer reads empty after our write" only proves no *human's* unsubmitted
+sentence is visible at that instant; it says nothing about whether the CLI
+consumed what we ourselves just wrote, since the model never knew that text
+existed. `confirmed` is only granted when that reading is paired with two more
+things: the session was **not** already busy when we wrote (a session mid-turn
+can swallow or queue injected text with the composer model none the wiser),
+and a turn was still independently observed. Even then, a turn starting says
+nothing about *what* the CLI made of the text — a slash command that misses
+the CLI's completion menu is submitted as an ordinary message whose text
+merely starts with `/`, and that message produces a turn too. Only reading
+back the effect you asked for distinguishes those, and no transport in this
+repository does that.
+
+So a caller that must not act twice on the same intent still has to check the
+effect itself — a smaller context window, a new transcript, a file on disk —
+even when `submitted` reads `confirmed`; treat `confirmed` as "the handoff to
+the session went through cleanly", and `activity` as "something happened,
+unattributed".
+
+**What `confirmed` proves, stated exactly, and the one thing it does not.**
+`confirmed` means three checked facts and nothing more: the session was idle
+the instant before we wrote, a turn was observed within the verify window
+after that write, and this was the first attempt (no retry). **It does not
+prove that the turn it observed is the one our write started.**
+`pollForBusyObserved` is a level probe over the whole window, not an edge
+tied to our write — any `busy` transition inside that window satisfies it,
+regardless of what caused it. A second trigger on the same session, a human
+resuming, or any other actor going busy inside the same window produces
+`confirmed` exactly as our own write would. Serializing triggers per session
+(above) closes the same-session case at the source — the second trigger
+cannot even attempt a write until the first has fully finished — but an
+actor outside this transport's own admission queue (a human, another
+process) is not something a PTY byte stream can distinguish from our own
+effect. **A false `confirmed` remains reachable in that case: it is narrowed
+by construction, never eliminated.**
+
+> **Changed — read this if you parse `submitted`.**
+> `confirmed` used to be emitted whenever the session was seen busy after a
+> write, which asserted more than the transport could know (a session already
+> mid-turn satisfied it in milliseconds, with a turn the write did not cause).
+> That case reported `activity` for a time, and `confirmed` was reserved and
+> never emitted. `confirmed` is back, gated as described above, so a reader
+> testing `submitted === 'confirmed'` matches again — on a narrower, verified
+> case than before. A reader testing `submitted === 'no'` or
+> `submitted !== 'no'` is unaffected by any of this.
 
 **`error` is compared by strict equality too**, so explanations go in `reason`
 and never into `error`: `not sent: input pending` is not `not sent`. `reason`

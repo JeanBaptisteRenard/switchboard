@@ -535,16 +535,28 @@ test('W4 concurrency cap: 12 simultaneous triggers all get processed', async () 
     process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
 
     const { start } = require('../trigger-watcher');
-    const SESSION_ID = 'sess-w4-' + Date.now();
-    const ctx        = makeCtx(SESSION_ID);
+    // W4 bounds concurrent trigger *files*, independent of sessionId — a
+    // dozen triggers on one session are now serialized by session (see the
+    // "session serialization" tests), so this test uses 12 distinct sessions
+    // sharing one PTY stand-in, to keep exercising MAX_INFLIGHT itself.
+    const written = [];
+    const composer = { pending: 0, lastInputAt: 0 };
+    const ptyProcess = { pid: process.pid, write(data) { written.push(data); } };
+    const ctx = {
+      log: silentLog,
+      getPtyForSession() { return { ptyProcess }; },
+      isSessionBusy() { return false; },
+      isPtyAlive() { return true; },
+      getComposerState() { return { pending: composer.pending, lastInputAt: composer.lastInputAt }; },
+    };
     watcher = start(ctx);
 
     const COUNT  = 12;
     const uuids  = Array.from({ length: COUNT }, (_, i) => `w4-${Date.now()}-${i}`);
 
-    // Drop all 12 triggers at once
+    // Drop all 12 triggers at once, each targeting its own session
     for (const uuid of uuids) {
-      writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+      writeTrigger(tmp, uuid, { sessionId: 'sess-' + uuid, command: '/compact' });
     }
 
     // Wait for all 12 result files
@@ -561,7 +573,7 @@ test('W4 concurrency cap: 12 simultaneous triggers all get processed', async () 
     // 12 command texts should have been written. We count by command texts
     // (w !== '\r') rather than Enters, because submit-verify may add a retry '\r'
     // per command when no busy-rise is observed.
-    assert.equal(ctx._written.filter((w) => w !== '\r').length, COUNT, `expected ${COUNT} submitted commands`);
+    assert.equal(written.filter((w) => w !== '\r').length, COUNT, `expected ${COUNT} submitted commands`);
 
   } finally {
     if (watcher) watcher.close();
@@ -2168,7 +2180,7 @@ test('politeness: the bare recovery Enter is withheld when the user types during
   }
 });
 
-test('submitted: a busy rising edge after our write yields "confirmed"', async () => {
+test('submitted: activity seen after our write yields "activity", never "confirmed", when the composer readback is inconclusive', async () => {
   const tmp = mkTmp();
   let watcher;
   try {
@@ -2178,6 +2190,15 @@ test('submitted: a busy rising edge after our write yields "confirmed"', async (
     const { start } = require('../trigger-watcher');
     const SESSION_ID = 'sess-submitted-confirmed-' + Date.now();
     const ctx       = makeChainCtx(SESSION_ID); // auto-turn: busy 50ms after '\r'
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      // Something the model cannot attribute lands in the composer right after
+      // our own Enter -- a turn still starts (auto-turn, below), but the
+      // readback cannot rule out that our own submission is what is sitting
+      // there unconsumed. Doubt must resolve to "activity", never "confirmed".
+      if (ctx._written.length === 2) ctx._composer.pending = 3;
+    };
     watcher = start(ctx);
 
     const uuid = 'submitted-confirmed-' + Date.now();
@@ -2188,8 +2209,96 @@ test('submitted: a busy rising edge after our write yields "confirmed"', async (
 
     const result = readResult(path.join(tmp, 'processed'), uuid);
     assert.equal(result.ok, true);
-    assert.equal(result.submitted, 'confirmed');
-    assert.deepEqual(ctx._written, ['/compact', '\r'], 'a confirmed turn needs no recovery Enter');
+    assert.equal(result.submitted, 'activity');
+    assert.notEqual(result.submitted, 'confirmed',
+      'seeing the session go busy does not prove the CLI ran what we wrote, and the ' +
+      'composer readback here is inconclusive, not empty');
+    assert.deepEqual(ctx._written, ['/compact', '\r'], 'an observed turn needs no recovery Enter');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('submitted: an ordinary clean write — idle beforehand, activity observed, composer read back empty — is "confirmed"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-submitted-genuine-confirmed-' + Date.now();
+    const ctx       = makeChainCtx(SESSION_ID); // auto-turn: busy 50ms after '\r'; composer untouched
+    watcher = start(ctx);
+
+    const uuid = 'submitted-genuine-confirmed-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submit_retries, 0);
+    assert.equal(result.submitted, 'confirmed',
+      'not busy beforehand, a turn observed, and the composer read back empty: ' +
+      'the ordinary success path must still reach "confirmed"');
+    assert.deepEqual(ctx._written, ['/compact', '\r'], 'no recovery Enter on the ordinary path');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('submitted: the composer stays non-empty after our own Enter (it did not take) — never "confirmed", and a retry fires', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-submitted-stuck-' + Date.now();
+    // No auto-turn: busy never rises on its own, mirroring the field incident
+    // where the injected Enter did not register as a submit at all.
+    const ctx       = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      // Right after our own Enter, the composer still shows content -- exactly
+      // "le composer reste non vide" from the field measurement. It clears a
+      // little later (well inside the verify window), the way it would once a
+      // human's own Enter, arriving separately, finally resolves it.
+      if (ctx._written.length === 2) {
+        ctx._composer.pending = 5;
+        setTimeout(() => {
+          ctx._composer.pending     = 0;
+          ctx._composer.lastInputAt = 0;
+        }, 100);
+      }
+    };
+    watcher = start(ctx);
+
+    const uuid = 'submitted-stuck-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.notEqual(result.submitted, 'confirmed',
+      'the composer read back non-empty right after our own Enter: never confirmed');
+    assert.equal(result.submitted, 'assumed', 'busy is never observed in this scenario');
+    assert.equal(result.submit_retries, 1, 'a retry must fire when the Enter did not take');
+    assert.deepEqual(ctx._written, ['/compact', '\r', '\r'], 'the bare recovery Enter was actually sent');
 
   } finally {
     if (watcher) watcher.close();
@@ -2296,7 +2405,7 @@ test('wait: an absent field keeps the "none" default', async () => {
 
     const result = readResult(path.join(tmp, 'processed'), uuid);
     assert.equal(result.ok, true);
-    assert.equal(result.submitted, 'confirmed', 'the session was already busy when we polled');
+    assert.equal(result.submitted, 'activity', 'the session was already busy when we polled');
     assert.deepEqual(ctx._written, ['/compact', '\r']);
 
   } finally {
@@ -3233,6 +3342,584 @@ test('dispatch() backstop log call cannot escape even when ctx.log.error throws 
     Set.prototype.add = realSetAdd;
     process.removeListener('uncaughtException', onUncaught);
     process.removeListener('unhandledRejection', onRejection);
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// ── submitted: the strength order and what "activity" refuses to claim ────────
+// see .ai/contexts/trigger-watcher.md ("submitted")
+
+test('submitted: a session already busy before our write never reports "confirmed"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-preexisting-busy-' + Date.now();
+    // Busy from the start and never idle: every busy reading the watcher takes
+    // predates its own write, so no observation of ours caused it.
+    const ctx = makeCtx(SESSION_ID, () => true);
+    watcher = start(ctx);
+
+    const uuid = 'preexisting-busy-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, wait: 'none', command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 5000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.deepEqual(ctx._written, ['/compact', '\r']);
+    assert.notEqual(result.submitted, 'confirmed',
+      'busy that predates the write must never be reported as a confirmation');
+    assert.equal(result.submitted, 'activity');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('submitted: the strength order is total, and "confirmed" sits strictly above "activity"', () => {
+  const { weakestSubmitted, SUBMITTED_RANK } = require('../trigger-watcher');
+
+  const ORDER = ['no', 'assumed', 'activity', 'confirmed'];
+
+  assert.deepEqual(Object.keys(SUBMITTED_RANK).sort(), [...ORDER].sort(),
+    'every value carries a rank, and no rank exists without a value');
+
+  const ranks = ORDER.map((v) => SUBMITTED_RANK[v]);
+  assert.equal(new Set(ranks).size, ORDER.length, 'no two values share a rank');
+  for (let i = 1; i < ranks.length; i++) {
+    assert.ok(ranks[i - 1] < ranks[i],
+      `${ORDER[i - 1]} must rank strictly below ${ORDER[i]}`);
+  }
+  assert.ok(SUBMITTED_RANK.confirmed > SUBMITTED_RANK.activity,
+    'an effect readback must outrank a bare activity observation');
+
+  for (const a of ORDER) {
+    for (const b of ORDER) {
+      const expected = SUBMITTED_RANK[a] <= SUBMITTED_RANK[b] ? a : b;
+      assert.equal(weakestSubmitted(a, b), expected, `weakest(${a}, ${b})`);
+      assert.equal(SUBMITTED_RANK[weakestSubmitted(a, b)],
+        Math.min(SUBMITTED_RANK[a], SUBMITTED_RANK[b]), `min rank of (${a}, ${b})`);
+    }
+  }
+});
+
+// ── submitted: the chain fold must weigh each step's own observation ──────────
+// see .ai/contexts/trigger-watcher.md ("submitted"). A prior version of this
+// suite never asserted result.submitted on a multi-step chain where a step is
+// legitimately submitted but never observed as busy -- the exact shape of the
+// 2026-09-03 incident (a "/compact" step that IS observed, followed by a
+// resume prompt that sits unsubmitted and is never seen going busy).
+
+test('chain "activity" fold: a step that never observes busy pulls the whole chain down to "assumed"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-fold-assumed-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    let busy = false;
+    ctx.isSessionBusy = (id) => (id === SESSION_ID ? busy : false);
+
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      writeCount++;
+      // Step 0 ('/compact'): busy window wider than the 100ms poll interval so
+      // the poll reliably catches it (see CHAIN-8 above) -- this step is
+      // genuinely observed ("activity").
+      if (writeCount === 2) {
+        setTimeout(() => { busy = true; }, 50);
+        setTimeout(() => { busy = false; }, 350);
+      }
+      // Step 1 ('resume the task'): busy is never seen, neither on the first
+      // Enter nor on the retry -- "assumed", same as a lone unobserved command.
+    };
+
+    watcher = start(ctx);
+
+    const uuid = 'chain-fold-assumed-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [
+        { command: '/compact' },
+        { command: 'resume the task' },
+      ],
+      timeout_ms: 3000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 2);
+    assert.equal(result.steps[0].submit_retries, 0,
+      'precondition: step 0 was observed on its first poll, no retry needed');
+    assert.equal(result.steps[1].submit_retries, 1,
+      'precondition: step 1 never observed busy, so the retry fired');
+    assert.equal(result.submitted, 'assumed',
+      'a step never observed as busy must pull the whole chain down to "assumed", never "activity"');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('chain "activity" fold: a step observed only through its retry still counts as "activity"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-fold-retry-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    let busy = false;
+    ctx.isSessionBusy = (id) => (id === SESSION_ID ? busy : false);
+
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      writeCount++;
+      // Writes: 1 = command text, 2 = the first discrete Enter (absorbed, no
+      // turn), 3 = the bare recovery Enter -- the one that actually wakes the
+      // session, on the retry's own verify poll.
+      if (writeCount === 3) busy = true;
+    };
+
+    watcher = start(ctx);
+
+    const uuid = 'chain-fold-retry-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: 'resume the task' }],
+      timeout_ms: 3000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 1);
+    assert.equal(result.steps[0].submit_retries, 1,
+      'precondition: the first Enter alone was not observed, the retry fired');
+    assert.equal(result.submitted, 'activity',
+      'busy observed only after the retry Enter must still register as activity, not assumed');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('chain "confirmed" fold: every step idle beforehand, observed, and read back clean -> the whole chain is "confirmed"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-fold-confirmed-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID); // auto-turn on every '\r'; composer untouched throughout
+    watcher = start(ctx);
+
+    const uuid = 'chain-fold-confirmed-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume the task' }],
+      timeout_ms: 3000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 2);
+    assert.equal(result.steps[0].submit_retries, 0);
+    assert.equal(result.steps[1].submit_retries, 0);
+    assert.equal(result.submitted, 'confirmed',
+      'neither step was ever busy beforehand, both were observed, and the composer never showed anything unaccounted for');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('chain "confirmed" fold: one step composer readback is inconclusive -> pulls a fully-observed chain down to "activity"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-chain-fold-weak-confirm-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID); // auto-turn on every '\r'
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      writeCount++;
+      // Writes: 1/2 = step 0 text/Enter (clean, confirmable), 3/4 = step 1
+      // text/Enter. Something lands in the composer right after step 1's own
+      // Enter -- that step's readback is inconclusive even though its own
+      // turn is genuinely observed a moment later.
+      if (writeCount === 4) ctx._composer.pending = 2;
+    };
+    watcher = start(ctx);
+
+    const uuid = 'chain-fold-weak-confirm-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume the task' }],
+      timeout_ms: 3000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 2);
+    assert.equal(result.steps[0].submit_retries, 0, 'precondition: step 0 was clean and observed');
+    assert.equal(result.steps[1].submit_retries, 0, 'precondition: step 1 was observed too, just not confirmable');
+    assert.equal(result.submitted, 'activity',
+      'one step being merely "activity" must drag a chain down from "confirmed", never the other way round');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('total_waited_ms: equals the sum of steps[*].waited_ms, including each step\'s own politeness wait', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-total-waited-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    // The composer is not free when the single step is first attempted -- it
+    // frees itself 150ms later, so this step's own politeness wait is not
+    // instantaneous and must show up in its own waited_ms.
+    ctx._composer.pending     = 3;
+    ctx._composer.lastInputAt = 0;
+    setTimeout(() => { ctx._composer.pending = 0; }, 150);
+
+    watcher = start(ctx);
+
+    const uuid = 'total-waited-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: 'resume the task' }],
+      timeout_ms: 3000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 1);
+    assert.ok(result.steps[0].waited_ms >= 150,
+      'the step\'s own politeness wait must show up in its own waited_ms, not only in the chain total');
+    const sumSteps = result.steps.reduce((acc, s) => acc + s.waited_ms, 0);
+    assert.equal(result.total_waited_ms, sumSteps,
+      'with no initial wait:idle and every step reaching a write, total_waited_ms must equal the sum of steps[*].waited_ms exactly');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('waited_ms (single command): includes the submit-verification poll, not only the idle/politeness wait', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-waited-ms-verify-' + Date.now();
+    // Busy never rises: submitWithVerify runs its full first window, then the
+    // recovery Enter, then a second full window -- two ~400ms windows worth
+    // of polling that must show up in waited_ms.
+    const ctx = makeCtx(SESSION_ID);
+    watcher = start(ctx);
+
+    const uuid = 'waited-ms-verify-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submit_retries, 1, 'precondition: busy never observed, the retry fired');
+    assert.ok(result.waited_ms >= 700,
+      `waited_ms must include the submit-verification poll (two ~400ms windows); got ${result.waited_ms}`);
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('submitted: preBusy must be sampled before the write, not after -- a session busy only until our own write must never read as "confirmed"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-prebusy-order-' + Date.now();
+
+    // Deterministic ORDER, not a race: busy is true until the instant our own
+    // Enter write lands, flips false right there, then a genuine turn rises a
+    // little later so a turn is still observed. Sampling busy before the
+    // write (correct) reads true; sampling it after (the mutation this test
+    // exists to catch) reads false, and would wrongly call the result
+    // "confirmed" -- the overestimating direction, the one that costs.
+    let busy = true;
+    const ctx = makeCtx(SESSION_ID, () => busy);
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      if (data === '\r' && ctx._written.length === 2) {
+        busy = false;
+        setTimeout(() => { busy = true; }, 50);
+        setTimeout(() => { busy = false; }, 250);
+      }
+    };
+    watcher = start(ctx);
+
+    const uuid = 'prebusy-order-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, wait: 'none', command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submit_retries, 0, 'precondition: the turn was observed on the first poll');
+    assert.equal(result.submitted, 'activity',
+      'the session was still busy the instant we wrote -- observing a turn afterward must not upgrade this to "confirmed"');
+    assert.notEqual(result.submitted, 'confirmed');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+// ── Session serialization ────────────────────────────────────────────────────
+
+test('session serialization: two triggers on the same session run one after another, never in parallel', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '3000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-serialize-same-' + Date.now();
+
+    // Trigger A blocks on wait:'idle' until busy flips false at +200ms.
+    // Trigger B is written +60ms in, with wait:'none' against a composer
+    // that is free from the start -- nothing of its own keeps it waiting.
+    // Without per-session serialization B has no reason to wait for A and
+    // writes first; with it, B cannot even attempt a write until A's whole
+    // run (including A's own wait) has produced a result.
+    let busy = true;
+    const composer = { pending: 0, lastInputAt: 0 };
+    const written = [];
+    const ptyProcess = {
+      pid: process.pid,
+      write(data) {
+        written.push(data);
+        // Make each Enter resolve its own submitWithVerify immediately (busy
+        // flips synchronously, before the first poll tick) so this test is
+        // not slowed down or destabilized by the verify-retry path.
+        if (data === '\r') {
+          busy = true;
+          setTimeout(() => { busy = false; }, 60);
+        }
+      },
+    };
+    const ctx = {
+      log: silentLog,
+      getPtyForSession(id) { return id === SESSION_ID ? { ptyProcess } : null; },
+      isSessionBusy(id) { return id === SESSION_ID ? busy : false; },
+      isPtyAlive() { return true; },
+      getComposerState(id) {
+        return id === SESSION_ID ? { pending: composer.pending, lastInputAt: composer.lastInputAt } : null;
+      },
+    };
+
+    setTimeout(() => { busy = false; }, 200); // unblocks trigger A's wait:'idle'
+    watcher = start(ctx);
+
+    const uuidA = 'serialize-same-a-' + Date.now();
+    const uuidB = 'serialize-same-b-' + Date.now();
+    writeTrigger(tmp, uuidA, { sessionId: SESSION_ID, command: 'AAAA', wait: 'idle' });
+    await new Promise((r) => setTimeout(r, 60));
+    writeTrigger(tmp, uuidB, { sessionId: SESSION_ID, command: 'BBBB', wait: 'none' });
+
+    const resultPathA = path.join(tmp, 'processed', uuidA + '.result.json');
+    const resultPathB = path.join(tmp, 'processed', uuidB + '.result.json');
+    await waitForFile(resultPathA, 3000);
+    await waitForFile(resultPathB, 3000);
+
+    const resultA = readResult(path.join(tmp, 'processed'), uuidA);
+    const resultB = readResult(path.join(tmp, 'processed'), uuidB);
+    assert.equal(resultA.ok, true);
+    assert.equal(resultB.ok, true);
+
+    const idxA = written.indexOf('AAAA');
+    const idxB = written.indexOf('BBBB');
+    assert.ok(idxA !== -1 && idxB !== -1, 'both commands should have been written');
+    assert.ok(idxA < idxB,
+      'trigger A (blocked on wait:"idle" until +200ms) must fully own the session before trigger B ' +
+      '(ready to write from t=0) ever writes into it -- otherwise the two triggers ran in parallel ' +
+      `on one session. Full write order: ${JSON.stringify(written)}`);
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('session serialization: two triggers on different sessions still run in parallel', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '3000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_A = 'sess-serialize-parallel-a-' + Date.now();
+    const SESSION_C = 'sess-serialize-parallel-c-' + Date.now();
+
+    let busyA = true;
+    let busyC = false;
+    // Captured the instant C's own write happens -- a state check, not a wall
+    // clock threshold, so this stays reliable under heavy system load: as long
+    // as C's dispatch isn't stalled for the whole 3s A is blocked for (a load
+    // spike no other assertion in this suite tolerates either), the check
+    // holds regardless of how long C itself actually took.
+    let busyAWhenCWrote;
+    const composerA = { pending: 0, lastInputAt: 0 };
+    const composerC = { pending: 0, lastInputAt: 0 };
+    const writtenA = [];
+    const writtenC = [];
+    const ptyA = {
+      pid: process.pid,
+      write(data) {
+        writtenA.push(data);
+        if (data === '\r') { busyA = true; setTimeout(() => { busyA = false; }, 60); }
+      },
+    };
+    const ptyC = {
+      pid: process.pid,
+      write(data) {
+        if (busyAWhenCWrote === undefined) busyAWhenCWrote = busyA;
+        writtenC.push(data);
+        if (data === '\r') { busyC = true; setTimeout(() => { busyC = false; }, 60); }
+      },
+    };
+    const ctx = {
+      log: silentLog,
+      getPtyForSession(id) {
+        if (id === SESSION_A) return { ptyProcess: ptyA };
+        if (id === SESSION_C) return { ptyProcess: ptyC };
+        return null;
+      },
+      isSessionBusy(id) {
+        if (id === SESSION_A) return busyA;
+        if (id === SESSION_C) return busyC;
+        return false;
+      },
+      isPtyAlive() { return true; },
+      getComposerState(id) {
+        if (id === SESSION_A) return { pending: composerA.pending, lastInputAt: composerA.lastInputAt };
+        if (id === SESSION_C) return { pending: composerC.pending, lastInputAt: composerC.lastInputAt };
+        return null;
+      },
+    };
+
+    setTimeout(() => { busyA = false; }, 3000); // unblocks A's wait:'idle'
+    watcher = start(ctx);
+
+    const uuidA = 'serialize-parallel-a-' + Date.now();
+    const uuidC = 'serialize-parallel-c-' + Date.now();
+    writeTrigger(tmp, uuidA, { sessionId: SESSION_A, command: 'AAAA', wait: 'idle' });
+    await new Promise((r) => setTimeout(r, 60));
+    writeTrigger(tmp, uuidC, { sessionId: SESSION_C, command: 'CCCC', wait: 'none' });
+
+    const resultPathC = path.join(tmp, 'processed', uuidC + '.result.json');
+    await waitForFile(resultPathC, 2500);
+
+    const resultC = readResult(path.join(tmp, 'processed'), uuidC);
+    assert.equal(resultC.ok, true);
+    assert.deepEqual(writtenC, ['CCCC', '\r']);
+    assert.equal(busyAWhenCWrote, true,
+      'session C wrote while session A was still blocked on its own wait:"idle" (busyA had not ' +
+      'flipped false yet) -- session C must not have waited behind session A to get there');
+
+    const resultPathA = path.join(tmp, 'processed', uuidA + '.result.json');
+    await waitForFile(resultPathA, 5000);
+    const resultA = readResult(path.join(tmp, 'processed'), uuidA);
+    assert.equal(resultA.ok, true);
+
+  } finally {
     if (watcher) watcher.close();
     delete process.env.SWITCHBOARD_TRIGGERS_DIR;
     delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
