@@ -689,9 +689,11 @@ test('an error on a rotated-out stream does not kill the live one', async () => 
 test('close() waits for its own stream\'s close, not just finish', async () => {
   const dir = tmpTraceDir('close-own');
   const realCreate = fs.createWriteStream;
+  const made = [];
   let holder;
   fs.createWriteStream = (...args) => {
     const s = realCreate.apply(fs, args);
+    made.push(s);
     holder = interceptOnceClose(s);
     return s;
   };
@@ -710,6 +712,12 @@ test('close() waits for its own stream\'s close, not just finish', async () => {
     assert.equal(done, true, 'close() must resolve once its own stream closes');
   } finally {
     fs.createWriteStream = realCreate;
+    // Releasing the intercepted .once('close', ...) callback settles
+    // activity-trace's own bookkeeping, but the real stream's fd is closed
+    // independently by Node's autoClose — wait for that too, or the rmSync
+    // below races the exact same handle-still-open condition this whole
+    // suite is about. See docs/activity-trace.md.
+    await waitUntil(() => made.every(s => s.fd === null || s.fd === undefined));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -717,9 +725,11 @@ test('close() waits for its own stream\'s close, not just finish', async () => {
 test('setEnabled(false, ...) waits for its own stream\'s close, not just finish', async () => {
   const dir = tmpTraceDir('disable-own');
   const realCreate = fs.createWriteStream;
+  const made = [];
   let holder;
   fs.createWriteStream = (...args) => {
     const s = realCreate.apply(fs, args);
+    made.push(s);
     holder = interceptOnceClose(s);
     return s;
   };
@@ -737,6 +747,8 @@ test('setEnabled(false, ...) waits for its own stream\'s close, not just finish'
     assert.equal(done, true, 'setEnabled(false, ...) must resolve once its own stream closes');
   } finally {
     fs.createWriteStream = realCreate;
+    // See the matching comment in the close() version of this test.
+    await waitUntil(() => made.every(s => s.fd === null || s.fd === undefined));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -773,6 +785,8 @@ test('close() waits for a still-pending rotation close, not just its own stream'
     assert.equal(done, true, 'close() must resolve once the pending rotation close lands');
   } finally {
     fs.createWriteStream = realCreate;
+    // See the comment in "close() waits for its own stream's close" above.
+    await waitUntil(() => made.every(s => s.fd === null || s.fd === undefined));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -806,6 +820,8 @@ test('setEnabled(false, ...) waits for a still-pending rotation close, not just 
     assert.equal(done, true, 'setEnabled(false, ...) must resolve once the pending rotation close lands');
   } finally {
     fs.createWriteStream = realCreate;
+    // See the comment in "close() waits for its own stream's close" above.
+    await waitUntil(() => made.every(s => s.fd === null || s.fd === undefined));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -813,8 +829,10 @@ test('setEnabled(false, ...) waits for a still-pending rotation close, not just 
 test('close() falls back to done() if the stream never emits close', async () => {
   const dir = tmpTraceDir('close-timeout');
   const realCreate = fs.createWriteStream;
+  const made = [];
   fs.createWriteStream = (...args) => {
     const s = realCreate.apply(fs, args);
+    made.push(s);
     interceptOnceClose(s); // held forever — never released, on purpose
     return s;
   };
@@ -834,6 +852,9 @@ test('close() falls back to done() if the stream never emits close', async () =>
   } finally {
     process.removeListener('warning', onWarning);
     fs.createWriteStream = realCreate;
+    // The intercepted close is held forever by design, but the real stream
+    // still closes on its own via autoClose — wait for that before rmSync.
+    await waitUntil(() => made.every(s => s.fd === null || s.fd === undefined));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
