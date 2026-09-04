@@ -1,6 +1,8 @@
 # Context engineering — Switchboard
 
-Seven sub-system docs, ~150 lines each, written for AI agents who need to make a focused change without re-reading 1800 LOC of `main.js`.
+Seven sub-system docs (76 to 526 lines as of 2026-09, most have grown well past
+their original size), written for AI agents who need to make a focused change
+without re-reading `main.js`, now ~2600 LOC.
 
 ## When to read which
 

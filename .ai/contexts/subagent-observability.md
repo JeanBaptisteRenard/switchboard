@@ -88,7 +88,7 @@ This is the **#1 fork-specific feature** (upstream PR #47 still pending). It per
   `pruneStaleGridSubagents()` in `grid-view.js`, pruned from `wrapInGridCard()`
   rather than on a timer). Renderer files are plain non-module `<script>`s
   sharing one global scope and `sidebar.js` loads *after* `grid-view.js`
-  (`index.html:132` then `:136`), so a top-level function declared under the
+  (`index.html:135` then `:139`), so a top-level function declared under the
   same name in both is silently shadowed — that is what froze the grid's TTL
   prune until PR #137. Keep cross-file names distinct;
   `test/dom-grid-sidebar-prune-collision.test.js` pins the pair.
@@ -515,7 +515,7 @@ invariant enforced anywhere.
   the resurrection guards above
 - `test/dom-grid-subagent-pills.test.js` — pins the grid-view IPC handler arity
   (`preload.js` passes the payload as the callback's only argument)
-- `public/sidebar.js:771` (the routing branch) — the one-line decision that makes the whole feature work
+- `public/sidebar.js:1082` (the routing branch) — the one-line decision that makes the whole feature work
 - IPC handler security: `read-subagent-jsonl` MUST validate that `agentId` and `parentSessionId` are filename-safe (see `resolveJsonlPath` calls in main.js — fixed in PR #8 hardening)
 
 ## History

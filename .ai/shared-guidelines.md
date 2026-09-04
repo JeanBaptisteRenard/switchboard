@@ -23,7 +23,20 @@ For a guided tour of the codebase architecture, start at [contexts/README.md](co
 
 ## Critical invariants for AI agents
 
-### 1. Don't spawn a second Electron while JB's AppImage is running
+**Invariants #1, #2 and part of #6 below were written against a Linux AppImage
+deployment** (`~/Applications/Switchboard.AppImage`, `npm run build:linux`,
+`appimagelauncherd`). This repo checkout is on Windows
+(`C:\Serveur\switchboard`, Windows 11) — do not follow their commands or paths
+literally here. They are kept, not deleted, because they document real
+production incidents (a build that killed a running instance, a `cp` that got
+an instance killed by `appimagelauncherd`) whose underlying principle — don't
+touch a native module or executable a live process has open — applies on any
+platform. **The Windows equivalent (packaged `.exe` via NSIS, per
+`README.md` "Download") has not been field-tested for the same failure
+modes**: whether rebuilding native modules or replacing the installed binary
+can kill a running Windows instance is unverified, not "safe by omission."
+
+### 1. Don't spawn a second Electron while JB's AppImage is running (Linux-specific example — see note above)
 
 The user runs `~/Applications/Switchboard.AppImage` daily. **PR #13 (`requestSingleInstanceLock`) means a second `npx electron .` from your worktree quits immediately and focuses the user's window** — your dev session never starts. Use `SWITCHBOARD_DATA_DIR` isolation if you genuinely need a live process, otherwise stay read-only / unit-test-driven.
 
@@ -38,7 +51,7 @@ The AppImage uses `~/.switchboard/switchboard.db`. The dev electron uses `~/.swi
 
 To test a specific PR live, alongside the running AppImage, use `task test-pr PR=<number>` — it isolates the DB, the automation triggers dir, and warns about the schedule-runner duplicate-fire risk. See [docs/testing-a-pr.md](docs/testing-a-pr.md) for the full procedure; do not improvise the isolation env vars by hand.
 
-### 2. Running `npm run build:linux` CAN kill the running instance — and so can the `cp` to ~/Applications
+### 2. Running `npm run build:linux` CAN kill the running instance — and so can the `cp` to ~/Applications (Linux-specific example — see note above)
 
 **Corrected 2026-05-31** — the previous version of this section claimed the build was safe. It isn't.
 
@@ -69,7 +82,7 @@ Workspace-level rule (`~/workspace/CLAUDE.md`). Applies to commits and MR/PR des
 
 ### 6. Overnight / unattended work: don't touch the live app while a session is mid-run
 
-If you're working autonomously (overnight, AFK mode) while the user's AppImage is live with an active session open, treat the app as **read-only from the outside** for the duration: no `npm run build:linux` / `task build` without the `--config.npmRebuild=false` flag (§2), no `cp` to `~/Applications/Switchboard.AppImage` (§2 — `appimagelauncherd` can silently kill the running instance), and no second `npx electron .` (§1 — it just quits and steals focus instead of giving you a usable dev process). None of these produce an obvious error at the time you run them; the damage shows up later as a dead session the user didn't ask to lose. If you need a live process to test against, use `SWITCHBOARD_DATA_DIR` isolation (§1) and only do the disruptive steps (uncontrolled rebuild, `cp` swap) once the user is ready to restart.
+If you're working autonomously (overnight, AFK mode) while the user's app is live with an active session open, treat it as **read-only from the outside** for the duration. On the Linux AppImage deployment §1/§2 describe: no `npm run build:linux` / `task build` without the `--config.npmRebuild=false` flag (§2), no `cp` to `~/Applications/Switchboard.AppImage` (§2 — `appimagelauncherd` can silently kill the running instance), and no second `npx electron .` (§1 — it just quits and steals focus instead of giving you a usable dev process). None of these produce an obvious error at the time you run them; the damage shows up later as a dead session the user didn't ask to lose. If you need a live process to test against, use `SWITCHBOARD_DATA_DIR` isolation (§1) and only do the disruptive steps (uncontrolled rebuild, binary swap) once the user is ready to restart. The general principle — don't rebuild or replace a binary a live process has open — is platform-independent even though the concrete commands above are not; on Windows, treat `task build` / replacing the installed `.exe` with the same caution until someone actually measures what happens here.
 
 > This is a Switchboard-specific writeup of a more general pattern — "don't touch shared mutable state a human is actively using" applies to any AI agent working unattended alongside a live app.
 
@@ -115,7 +128,7 @@ These exist on `devsuitup/switchboard` main but not on `doctly/switchboard` main
 - `node:test` runner via `npm test` / `task test`.
 - Renderer tests use jsdom via `test/dom-setup.js` + `vm.runInContext` to evaluate `public/*.js` in isolation.
 - Pitfall: `installSpies: false` is required when the eval defines functions you also spy on — function declarations from eval overwrite property spies.
-- Always test in the **primary checkout** (`~/workspace/switchboard`), not inside `.claude/worktrees/agent-*`. Worktrees may have incomplete `node_modules` and produce false negatives on tests that require native modules (e.g. `morphdom`).
+- Always test in the **primary checkout** (`C:\Serveur\switchboard` on this machine), not inside `.claude/worktrees/agent-*`. Worktrees may have incomplete `node_modules` and produce false negatives on tests that require native modules (e.g. `morphdom`).
 
 ## When you finish work
 
@@ -136,7 +149,7 @@ These exist on `devsuitup/switchboard` main but not on `doctly/switchboard` main
 The fork has features upstream maintainers might want. When adapting a fork-only feature for upstream:
 
 1. Branch off `upstream/main` (NOT fork main), name `upstream/<topic>`.
-2. Cherry-pick the relevant commit(s). Expect manual merges — our `main.js` is ~1850 LOC vs upstream's ~350; insertion points exist but contexts differ.
+2. Cherry-pick the relevant commit(s). Expect manual merges — our `main.js` is ~2600 LOC (measured 2026-09) vs upstream's ~350; insertion points exist but contexts differ.
 3. Strip fork-specific dependencies (subagent groups, work-files IPC, etc.) — keep the patch minimally scoped.
 4. PR against `doctly/switchboard:main`. Link the originating fork PR.
 
@@ -144,7 +157,7 @@ Example: fork PR #13 → upstream PR #56 (`upstream/fix-single-instance-lock` br
 
 ## When in doubt
 
-- Read the [README.md](README.md) for what the app does.
+- Read the [README.md](../README.md) for what the app does.
 - `git log --oneline upstream/main..main` shows everything the fork carries.
 - `.work-files/switchboard/` has session notes from past compaction events.
 - Recent merged PRs on the fork are the highest-signal "how do we do things" reference.

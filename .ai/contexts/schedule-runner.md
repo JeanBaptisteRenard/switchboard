@@ -6,7 +6,7 @@
 
 | File | LOC | Role |
 |---|---|---|
-| `schedule-runner.js` | ~220 | The cron loop, cron parser, file scanner, session pre-seeder, command builder. |
+| `schedule-runner.js` | ~310 | The cron loop, cron parser, file scanner, session pre-seeder, command builder. |
 | `schedule-ipc.js` | ~220 | IPC handlers + the inline `SCHEDULE_CREATOR_TEMPLATE` (an embedded Claude command that teaches Claude how to write schedule files). |
 
 ## Public surface
@@ -64,7 +64,7 @@ cli:
 - `public/memory-workfiles-view.js` brain tab — lists existing `schedule-*.md` files, surfaces the "run now" play button
 - `public/sidebar.js` — `.project-schedule-btn` clock icon wiring per project
 - `schedule-ipc.js` `SCHEDULE_CREATOR_TEMPLATE` — if you change the schedule file format, update the template's instructions
-- `main.js:1618` (or wherever `startScheduler(log, runScheduleCommand)` is invoked at app boot)
+- `main.js:2517` (or wherever `startScheduler(log, runScheduleCommand)` is invoked at app boot — checked 2026-09, it moves as main.js grows)
 - The `runScheduleCommand` factory in `main.js` — uses `child_process.spawn`, `cleanPtyEnv`, and the global shell profile. Schedules don't get their own shell selector.
 
 ## Limitations worth knowing
