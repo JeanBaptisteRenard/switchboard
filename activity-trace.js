@@ -251,8 +251,15 @@ function createActivityTrace(options = {}) {
     currentPath = null;
     segment += 1;
     try { openSegment(); } catch { stream = null; currentPath = null; }
-    // Windows refuses to unlink a handle that is still open.
-    if (old) old.end(pruneSegments); else pruneSegments();
+    // Windows refuses to unlink an open handle — wait for 'close', not
+    // .end(callback)'s 'finish'. See docs/activity-trace.md "Testing the
+    // async prune path".
+    if (old) {
+      old.once('close', pruneSegments);
+      old.end();
+    } else {
+      pruneSegments();
+    }
   }
 
   // see docs/activity-trace.md "Turning it off, and on again"
@@ -308,10 +315,11 @@ function createActivityTrace(options = {}) {
     state.on = false;
     const old = stream;
     stream = null;
-    // currentPath outlives the stream until the flush completes: it is what
-    // stops the panel deleting a file that is still being written out.
+    // currentPath outlives the stream until the fd is released — see
+    // docs/activity-trace.md "Testing the async prune path".
     if (old) {
-      old.end(() => { currentPath = null; if (done) done(); });
+      old.once('close', () => { currentPath = null; if (done) done(); });
+      old.end();
     } else {
       currentPath = null;
       if (done) done();
@@ -341,7 +349,9 @@ function createActivityTrace(options = {}) {
     const old = stream;
     stream = null;
     if (old) {
-      old.end(() => { currentPath = null; if (done) done(); });
+      // See setEnabled(false, ...) above and docs/activity-trace.md.
+      old.once('close', () => { currentPath = null; if (done) done(); });
+      old.end();
     } else {
       currentPath = null;
       if (done) done();

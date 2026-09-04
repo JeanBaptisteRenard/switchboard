@@ -376,12 +376,23 @@ flushes and closes (`app.quit` is the last line).
 ## Testing the async prune path
 
 `rotate()` runs `openSegment()` synchronously but hands the retired stream's
-cleanup (`pruneSegments`) to its `end()` callback, because Windows refuses to
-unlink a handle that is still open — the callback only fires once the OS has
-actually closed the file. Under `node --test`'s default concurrency (one
-process per test file, dozens running at once), that callback can take far
-longer than it does in isolation: CPU and disk contention from the sibling
-processes delays the event loop turn it needs.
+cleanup (`pruneSegments`) to its `close()`, because Windows refuses to unlink
+a handle that is still open. `close()`, `setEnabled(false, ...)` and the
+module's own `close()` used to pass that continuation straight to `.end()`
+instead: `.end(callback)`'s callback fires on the stream's `finish` event,
+which only means the data was handed off — `autoClose`'s own internal
+`fs.close()` runs after that, and only the stream's separate `close` event
+means the fd is actually released. That gap was invisible on Linux/macOS
+(POSIX lets you unlink or remove a directory entry with an open handle on
+it) and surfaced as Windows-only CI failures (`ENOTEMPTY` on the test
+temp-dir cleanup right after `close()`) once the Windows leg of the test
+matrix existed to see it. Fixed by listening for `close` before running the
+continuation, instead of relying on `.end()`'s own callback.
+
+Under `node --test`'s default concurrency (one process per test file, dozens
+running at once), that `close` event can still take far longer than it does
+in isolation: CPU and disk contention from the sibling processes delays the
+event loop turn it needs.
 
 Two tests in `test/activity-trace.test.js` used to bridge that async gap with
 a fixed `setTimeout(60)`. That is a duration bet, not a correctness check, and
