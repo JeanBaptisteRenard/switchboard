@@ -9,33 +9,22 @@
 //   1. isValidSessionId  — the id is used as a filename component under
 //      PROJECTS_DIR and nowhere else, so it must not be able to carry a path,
 //      a separator, or a dot segment.
-//   2. isInsideDir       — every target is realpath'd and required to remain
-//      inside PROJECTS_DIR, so a symlinked transcript cannot be used to make
-//      this delete something elsewhere on disk.
+//   2. isInsideDir       — every target is realpath'd (via resolveOnDisk, see
+//      resolve-path-on-disk.js) and required to remain inside PROJECTS_DIR,
+//      so a symlinked transcript cannot be used to make this delete something
+//      elsewhere on disk.
 
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
+const { resolveOnDisk, isInsideDir } = require('./resolve-path-on-disk');
 
 /** A session id may only be a plain filename component. */
 function isValidSessionId(id) {
   if (typeof id !== 'string' || id === '') return false;
   if (id === '.' || id === '..') return false;
   return /^[A-Za-z0-9._-]+$/.test(id);
-}
-
-/**
- * True when `child` is `parent` itself or lies beneath it.
- *
- * Compares with a trailing separator so a sibling directory sharing a prefix
- * (…/projects-evil next to …/projects) does not satisfy the check.
- */
-function isInsideDir(child, parent) {
-  if (!child || !parent) return false;
-  const c = path.resolve(child);
-  const p = path.resolve(parent);
-  return c === p || c.startsWith(p + path.sep);
 }
 
 /**
@@ -80,12 +69,8 @@ function resolveDeletionTargets(projectsDir, sessionId, preferredFolder = null) 
     const base = path.join(projectsDir, folder);
     for (const candidate of [path.join(base, sessionId + '.jsonl'), path.join(base, sessionId)]) {
       if (!fs.existsSync(candidate)) continue;
-      let real;
-      try {
-        real = fs.realpathSync(candidate);
-      } catch {
-        continue;
-      }
+      const real = resolveOnDisk(candidate);
+      if (!real) continue;
       if (!isInsideDir(real, root)) {
         refused.push({ path: candidate, real, reason: 'resolves outside the projects directory' });
         continue;

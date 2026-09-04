@@ -11,13 +11,20 @@
 //      (read-memory, save-memory) that should only touch ~/.claude/ or active
 //      project directories.
 //
-// Both helpers resolve the incoming path (path.resolve) before comparing, so
-// ../traversal sequences are normalised before any check fires.
+//   3. isKnownProjectRoot — exact-match check used by the worktree handlers
+//      (delete-worktree, worktree-status), whose regex only validates the
+//      *shape* of a path, not that it points at a project this install has
+//      ever heard of.
+//
+// All three also resolve on disk (resolveOnDisk) when the target exists, and
+// check that resolved location too — path.resolve() alone does not survive a
+// symlink. See .ai/contexts/ipc-bridge.md, "IPC path-guard inventory".
 
 'use strict';
 
 const os   = require('os');
 const path = require('path');
+const { resolveOnDisk } = require('./resolve-path-on-disk');
 
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 
@@ -42,7 +49,17 @@ const SENSITIVE_PATH_PATTERNS = [
  */
 function isSensitivePath(filePath) {
   const resolved = path.resolve(filePath);
-  return SENSITIVE_PATH_PATTERNS.some(pattern => pattern.test(resolved));
+  if (SENSITIVE_PATH_PATTERNS.some(pattern => pattern.test(resolved))) return true;
+
+  // Also test the on-disk real path: a symlink (e.g. a "notes" directory that
+  // is actually a link to ~/.ssh) makes the literal string look harmless
+  // while the file it opens is not. Skipped when nothing exists there yet —
+  // see the file header.
+  const real = resolveOnDisk(resolved);
+  if (real && real !== resolved) {
+    return SENSITIVE_PATH_PATTERNS.some(pattern => pattern.test(real));
+  }
+  return false;
 }
 
 /**
@@ -58,20 +75,53 @@ function isSensitivePath(filePath) {
  */
 function isAllowedMemoryPath(filePath, activeProjectPaths) {
   const resolved = path.resolve(filePath);
+  // Prefer the on-disk real path when the target exists: this is what a
+  // symlinked directory inside an allowed root (allowed/cache -> /etc) would
+  // otherwise hide. Nothing on disk yet (about to be created, or already
+  // deleted) means there is no symlink target to defeat the check with, so
+  // fall back to the plain resolved string as before.
+  const candidate = resolveOnDisk(resolved) || resolved;
 
-  // Must start with CLAUDE_DIR + sep, or equal CLAUDE_DIR exactly.
-  if (resolved === CLAUDE_DIR || resolved.startsWith(CLAUDE_DIR + path.sep)) {
-    return true;
-  }
+  if (isWithinRoot(candidate, CLAUDE_DIR)) return true;
 
-  // Must start with an active project path + sep (strict prefix, not a substring).
   for (const projectPath of activeProjectPaths) {
-    if (projectPath && resolved.startsWith(projectPath + path.sep)) {
-      return true;
-    }
+    if (projectPath && isWithinRoot(candidate, projectPath)) return true;
   }
 
   return false;
 }
 
-module.exports = { isSensitivePath, isAllowedMemoryPath };
+/**
+ * True when `candidatePath` (already resolved) is `rootPath` itself or lies
+ * beneath it. `rootPath` is resolved on disk too — with the same fallback —
+ * so a root that is itself reached through a symlinked ancestor (a project
+ * living behind a mapped/junctioned directory) still compares like-for-like
+ * against an already-resolved candidate, instead of failing a prefix check
+ * against its own unresolved string.
+ */
+function isWithinRoot(candidatePath, rootPath) {
+  const root = resolveOnDisk(rootPath) || path.resolve(rootPath);
+  return candidatePath === root || candidatePath.startsWith(root + path.sep);
+}
+
+/**
+ * True when `candidatePath` resolves on disk to the same location as one of
+ * `knownProjectPaths` — an exact match, not a containment check: a worktree's
+ * parent repo either *is* a project root this install knows about, or it
+ * isn't.
+ *
+ * @param {string}   candidatePath
+ * @param {string[]} knownProjectPaths
+ * @returns {boolean}
+ */
+function isKnownProjectRoot(candidatePath, knownProjectPaths) {
+  const real = resolveOnDisk(candidatePath) || path.resolve(candidatePath);
+  for (const known of knownProjectPaths) {
+    if (!known) continue;
+    const knownReal = resolveOnDisk(known) || path.resolve(known);
+    if (real === knownReal) return true;
+  }
+  return false;
+}
+
+module.exports = { isSensitivePath, isAllowedMemoryPath, isKnownProjectRoot };

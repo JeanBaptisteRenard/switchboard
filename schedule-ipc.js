@@ -5,6 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { encodeProjectPath } = require('./encode-project-path');
+const { resolveRunNowTarget } = require('./run-schedule-now-target');
 
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
@@ -122,7 +123,7 @@ function ensureScheduleCreatorCommand() {
   }
 }
 
-function init(log, runCommand) {
+function init(log, runCommand, isPathAllowed) {
   const { parseFrontmatter, createScheduleSession, buildScheduleCommand } = require('./schedule-runner');
 
   ipcMain.handle('get-schedule-creator-command', () => {
@@ -184,21 +185,24 @@ function init(log, runCommand) {
   });
   ipcMain.handle('run-schedule-now', (_event, filePath) => {
     try {
-      const content = fs.readFileSync(filePath, 'utf8');
+      const target = resolveRunNowTarget(filePath, isPathAllowed);
+      if (!target.ok) {
+        log.warn(`[schedule] Refused run-schedule-now for ${JSON.stringify(filePath)}: ${target.error}`);
+        return { ok: false, error: target.error };
+      }
+      const { realPath, projectPath } = target;
+
+      const content = fs.readFileSync(realPath, 'utf8');
       const { meta, body } = parseFrontmatter(content);
       if (!body) return { ok: false, error: 'No prompt in schedule file' };
 
-      const commandsDir = path.dirname(filePath);
-      const dotClaudeDir = path.dirname(commandsDir);
-      const projectPath = path.dirname(dotClaudeDir);
-
       const folder = encodeProjectPath(projectPath);
       const schedule = {
-        file: path.basename(filePath),
-        filePath, projectPath, folder,
-        name: meta.name || path.basename(filePath),
+        file: path.basename(realPath),
+        filePath: realPath, projectPath, folder,
+        name: meta.name || path.basename(realPath),
         cron: meta.cron || '* * * * *',
-        slug: meta.slug || path.basename(filePath, '.md').replace(/^schedule-/, ''),
+        slug: meta.slug || path.basename(realPath, '.md').replace(/^schedule-/, ''),
         cli: meta.cli || {},
         prompt: body,
       };

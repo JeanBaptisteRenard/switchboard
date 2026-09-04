@@ -73,7 +73,8 @@ function spawnPty(file, args, opts) {
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgvForShell } = require('./shell-profiles');
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
-const { isSensitivePath, isAllowedMemoryPath: _isAllowedMemoryPath } = require('./ipc-path-validator');
+const { isSensitivePath, isAllowedMemoryPath: _isAllowedMemoryPath, isKnownProjectRoot: _isKnownProjectRoot } = require('./ipc-path-validator');
+const { validatePreLaunchCmd } = require('./pre-launch-cmd-guard');
 const { normalizePtySize } = require('./pty-size');
 const { setPtyOpLogger, resizePty, killPty } = require('./pty-ops');
 const { createComposerState } = require('./composer-state');
@@ -194,17 +195,16 @@ const STATS_CACHE_PATH = path.join(CLAUDE_DIR, 'stats-cache.json');
 const activeSessions = new Map();
 let mainWindow = null;
 
-// Wrapper that plumbs the set of known project roots into isAllowedMemoryPath.
-// The Memory panel (get-memories) surfaces CLAUDE.md / agents.md and
-// .claude/*.md from EVERY indexed project — not just ones with a live session —
-// so the allowlist must cover every known project root, otherwise reading a
-// memory file for a project without an open session would be rejected.
-function isAllowedMemoryPath(filePath) {
+// Every project root Switchboard currently knows about: live sessions plus
+// every indexed project (same enumeration as the get-memories handler).
+// Shared by every guard that needs to bound a renderer-supplied path to "a
+// project this install actually knows about" — the memory allowlist below,
+// and the worktree-path containment check next to WORKTREE_PATH_RE.
+function getKnownProjectPaths() {
   const projectPaths = new Set();
   for (const [, s] of activeSessions) {
     if (s.projectPath) projectPaths.add(s.projectPath);
   }
-  // All indexed projects (same enumeration as the get-memories handler).
   try {
     const { deriveProjectPath } = require('./derive-project-path');
     if (fs.existsSync(PROJECTS_DIR)) {
@@ -216,7 +216,16 @@ function isAllowedMemoryPath(filePath) {
       }
     }
   } catch {}
-  return _isAllowedMemoryPath(filePath, [...projectPaths]);
+  return projectPaths;
+}
+
+// Wrapper that plumbs the set of known project roots into isAllowedMemoryPath.
+// The Memory panel (get-memories) surfaces CLAUDE.md / agents.md and
+// .claude/*.md from EVERY indexed project — not just ones with a live session —
+// so the allowlist must cover every known project root, otherwise reading a
+// memory file for a project without an open session would be rejected.
+function isAllowedMemoryPath(filePath) {
+  return _isAllowedMemoryPath(filePath, [...getKnownProjectPaths()]);
 }
 
 // Subagent live-tail watchers (watchId → { filePath, parentSessionId, agentId, teardown })
@@ -593,6 +602,15 @@ ipcMain.handle('remap-project', (_event, oldPath, newPath) => {
 // Matches .claude/worktrees/<n>, .claude-worktrees/<n>, .worktrees/<n>
 const WORKTREE_PATH_RE = /^(.+?)\/\.(?:claude\/worktrees|claude-worktrees|worktrees)\/([^/]+)\/?$/;
 
+// WORKTREE_PATH_RE only checks *shape* (a string that looks like
+// <something>/.claude/worktrees/<name>) — match[1] can be any string with
+// that suffix stripped, including a directory this install has never heard
+// of. Bind it to a project root Switchboard actually knows about before
+// letting `git -C <parentRepo> worktree remove` run against it.
+function isKnownProjectRoot(candidatePath) {
+  return _isKnownProjectRoot(candidatePath, [...getKnownProjectPaths()]);
+}
+
 ipcMain.handle('delete-worktree', (_event, worktreePath) => {
   return new Promise((resolve) => {
     // Normalize trailing slash
@@ -604,6 +622,9 @@ ipcMain.handle('delete-worktree', (_event, worktreePath) => {
       return resolve({ ok: false, error: 'Path does not match a recognized worktree layout' });
     }
     const parentRepo = match[1];
+    if (!isKnownProjectRoot(parentRepo)) {
+      return resolve({ ok: false, error: 'Parent repository is not a known project' });
+    }
 
     // Helper: run git worktree remove, optionally double-force
     function runRemove(doubleForce, callback) {
@@ -675,6 +696,9 @@ ipcMain.handle('worktree-status', (_event, worktreePath) => {
       return resolve({ ok: false, error: 'Path does not match a recognized worktree layout' });
     }
     const parentRepo = match[1];
+    if (!isKnownProjectRoot(parentRepo)) {
+      return resolve({ ok: false, error: 'Parent repository is not a known project' });
+    }
 
     execFile('git', ['-C', parentRepo, '-C', normalizedPath, 'status', '--porcelain'], (err, stdout, stderr) => {
       if (err) {
@@ -1936,11 +1960,13 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
         claudeCmd = quoteArgvForShell(shell, ['bash', sandboxScriptPath()]) + ' ' + quoteArgvForShell(shell, claudeArgs);
       }
 
-      // preLaunchCmd is raw shell by design (e.g. "aws-vault exec profile --") — block newlines only
+      // preLaunchCmd is raw shell by design (e.g. "aws-vault exec profile --")
+      // — see pre-launch-cmd-guard.js for what is and isn't blocked and why.
       if (sessionOptions?.preLaunchCmd) {
         const pre = String(sessionOptions.preLaunchCmd);
-        if (/[\r\n]/.test(pre)) {
-          return { ok: false, error: 'preLaunchCmd must not contain newlines' };
+        const preCheck = validatePreLaunchCmd(pre);
+        if (!preCheck.ok) {
+          return { ok: false, error: preCheck.error };
         }
         claudeCmd = pre + ' ' + claudeCmd;
       }
@@ -2513,7 +2539,7 @@ if (!gotSingleInstanceLock) {
       });
     }
 
-    scheduleIpc.init(log, runScheduleCommand);
+    scheduleIpc.init(log, runScheduleCommand, isAllowedMemoryPath);
     startScheduler(log, runScheduleCommand);
 
     // File-trigger watcher — allows harness scripts to inject input into open
