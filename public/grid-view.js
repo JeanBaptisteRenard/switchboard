@@ -5,11 +5,14 @@
 // Depends on globals from app.js: openSessions, activeSessionId, sessionMap, activePtyIds,
 // sortedOrder, sidebarContent, terminalsEl, gridViewActive, gridViewer, gridViewerCount,
 // placeholder, terminalHeader, statsViewer, memoryViewer, settingsViewer,
-// jsonlViewer, terminalArea, cachedProjects, isMac
+// jsonlViewer, terminalArea, isMac
 // Depends on: cleanDisplayName, formatDate (utils.js), fitAndScroll, showSession (terminal-manager.js)
 
 let gridCards = new Map(); // sessionId → card wrapper element
 let gridFocusedSessionId = null;
+
+// Grouping is the historical layout, so an unset preference means "grouped".
+let gridGroupByProject = localStorage.getItem('gridGroupByProject') !== '0';
 
 // Active subagents tracked via IPC events (subagent-spawned / subagent-completed).
 // parentSessionId → Set of { agentId, subagentType, spawnedAt }
@@ -211,7 +214,7 @@ function wrapInGridCard(sessionId) {
   card.appendChild(footer);
 
   // Insert card into the correct project group in the grid
-  if (gridViewActive) {
+  if (gridViewActive && gridGroupByProject) {
     const pp = session.projectPath || '';
     // Find or create the project heading for this session
     let targetHeading = null;
@@ -247,7 +250,7 @@ function wrapInGridCard(sessionId) {
     }
     terminalsEl.insertBefore(card, insertBefore);
   } else {
-    // Not in grid view — just place where the terminal container was
+    // Flat grid, or not in grid view at all — no heading to slot under.
     terminalsEl.appendChild(card);
   }
 
@@ -320,6 +323,71 @@ function focusGridCard(sessionId) {
   if (entry) entry.terminal.focus();
 }
 
+// Wraps one card per open session in sidebar order, emitting a project heading
+// on each project change when grouping is on.
+function layoutGridCards(openSet) {
+  document.querySelectorAll('.terminal-container').forEach(el => el.classList.remove('visible'));
+  const sessionIds = [];
+  const sidebarItems = sidebarContent.querySelectorAll('.session-item[data-session-id]');
+  let currentProjectPath = null;
+  for (const item of sidebarItems) {
+    const sid = item.dataset.sessionId;
+    if (!openSet.has(sid)) continue;
+    const session = sessionMap.get(sid);
+    const projectPath = session ? session.projectPath : null;
+    if (gridGroupByProject && projectPath && projectPath !== currentProjectPath) {
+      currentProjectPath = projectPath;
+      const heading = document.createElement('div');
+      heading.className = 'grid-project-heading';
+      heading.dataset.projectPath = projectPath;
+      heading.textContent = shortProjectPath(projectPath);
+      terminalsEl.appendChild(heading);
+    }
+    wrapInGridCard(sid);
+    sessionIds.push(sid);
+  }
+  return sessionIds;
+}
+
+function openGridSessionIds() {
+  const openSet = new Set();
+  for (const [sid, entry] of openSessions) {
+    if (!entry.closed) openSet.add(sid);
+  }
+  return openSet;
+}
+
+function setGridGroupByProject(on) {
+  gridGroupByProject = !!on;
+  localStorage.setItem('gridGroupByProject', gridGroupByProject ? '1' : '0');
+  syncGridGroupToggleBtn();
+  if (!gridViewActive) return;
+
+  const restoreId = gridFocusedSessionId || activeSessionId;
+  unwrapGridCards();
+  const sessionIds = layoutGridCards(openGridSessionIds());
+  for (const sid of sessionIds) {
+    const entry = openSessions.get(sid);
+    if (entry) fitAndScroll(entry);
+  }
+  const toFocus = sessionIds.includes(restoreId) ? restoreId : sessionIds[0];
+  if (toFocus) focusGridCard(toFocus);
+}
+
+function syncGridGroupToggleBtn() {
+  const btn = document.getElementById('grid-group-toggle-btn');
+  if (!btn) return;
+  btn.classList.toggle('active', gridGroupByProject);
+  btn.setAttribute('aria-pressed', gridGroupByProject ? 'true' : 'false');
+}
+
+function initGridGroupToggle() {
+  const btn = document.getElementById('grid-group-toggle-btn');
+  if (!btn) return;
+  btn.addEventListener('click', () => setGridGroupByProject(!gridGroupByProject));
+  syncGridGroupToggleBtn();
+}
+
 function showGridView() {
   gridViewActive = true;
   localStorage.setItem('gridViewActive', '1');
@@ -336,53 +404,11 @@ function showGridView() {
   // Switch #terminals to grid layout
   terminalsEl.classList.add('grid-layout');
 
-  // Collect open (non-closed) session IDs
-  const openSet = new Set();
-  for (const [sid, entry] of openSessions) {
-    if (!entry.closed) openSet.add(sid);
-  }
-
-  // Use cachedProjects sorted by sortedOrder — same grouping & order as sidebar
-  let projects = [...cachedProjects];
-  if (sortedOrder.length > 0) {
-    const orderIndex = new Map(sortedOrder.map((e, i) => [e.projectPath, i]));
-    projects.sort((a, b) => {
-      const aPos = orderIndex.get(a.projectPath);
-      const bPos = orderIndex.get(b.projectPath);
-      if (aPos !== undefined && bPos !== undefined) return aPos - bPos;
-      if (aPos === undefined && bPos !== undefined) return -1;
-      if (aPos !== undefined && bPos === undefined) return 1;
-      return 0;
-    });
-  }
-
-  // Hide all terminals first, then wrap cards in sidebar order (grouped by project)
-  document.querySelectorAll('.terminal-container').forEach(el => el.classList.remove('visible'));
-  const sessionIds = [];
-  // Walk sidebar items to get sessions in display order, grouped by project
-  const sidebarItems = sidebarContent.querySelectorAll('.session-item[data-session-id]');
-  let currentProjectPath = null;
-  for (const item of sidebarItems) {
-    const sid = item.dataset.sessionId;
-    if (!openSet.has(sid)) continue;
-    // Determine project path for this session
-    const session = sessionMap.get(sid);
-    const projectPath = session ? session.projectPath : null;
-    // Add project heading when project changes
-    if (projectPath && projectPath !== currentProjectPath) {
-      currentProjectPath = projectPath;
-      const heading = document.createElement('div');
-      heading.className = 'grid-project-heading';
-      heading.dataset.projectPath = projectPath;
-      heading.textContent = shortProjectPath(projectPath);
-      terminalsEl.appendChild(heading);
-    }
-    wrapInGridCard(sid);
-    sessionIds.push(sid);
-  }
+  const sessionIds = layoutGridCards(openGridSessionIds());
 
   // Show grid header bar with session count
   gridViewer.style.display = 'block';
+  syncGridGroupToggleBtn();
   gridViewerCount.textContent = sessionIds.length + ' session' + (sessionIds.length !== 1 ? 's' : '');
 
   const btn = document.getElementById('grid-toggle-btn');
