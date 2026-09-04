@@ -278,7 +278,7 @@ test('the trace rotates segments and retains a bounded number of them', async ()
   t.init(dir);
   for (let i = 0; i < 60; i++) t.trace('fill', 's1', { i, pad: 'xxxxxxxxxxxxxxxxxxxx' });
   assert.ok(t.files.length > 2, 'the run produced more segments than it retains');
-  t.close();
+  await new Promise(r => t.close(r));
 
   let files = [];
   await waitUntil(() => {
@@ -317,7 +317,7 @@ test('a segment that cannot be unlinked stays queued and is retried, not forgott
   await waitUntil(() => t.files.length === 2);
   assert.equal(t.files.length, 2, 'the backlog drains back to the ceiling once the lock clears');
   assert.equal(t.files.includes(stale), false);
-  t.close();
+  await new Promise(r => t.close(r));
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -337,7 +337,7 @@ test('a failed prune is reported in the trace itself, once per file', async () =
     warnings = readEntries(files).filter(e => e.cat === 'trace.prune-failed');
     return warnings.length >= 1;
   });
-  t.close();
+  await new Promise(r => t.close(r));
 
   assert.ok(warnings.length >= 1, 'exceeding the announced ceiling is not silent');
   assert.equal(warnings[0].error, 'EBUSY');
@@ -609,7 +609,7 @@ test('setEnabled calls back on every path, including the no-ops', { timeout: 100
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('an enable whose open failed is retried instead of latching on', () => {
+test('an enable whose open failed is retried instead of latching on', async () => {
   const base = tmpTraceDir('failed-open');
   const blocked = path.join(base, 'not-a-directory');
   fs.writeFileSync(blocked, 'x');
@@ -626,7 +626,7 @@ test('an enable whose open failed is retried instead of latching on', () => {
   assert.ok(file, 'a second enable retried rather than short-circuiting as a no-op');
   t.trace('recovered', null, {});
   assert.equal(t.sequence, 1);
-  t.close();
+  await new Promise(r => t.close(r));
   fs.rmSync(base, { recursive: true, force: true });
 });
 
