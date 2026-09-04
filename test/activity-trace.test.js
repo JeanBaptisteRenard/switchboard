@@ -722,7 +722,7 @@ test('close() waits for its own stream\'s close, not just finish', async () => {
     // nulls its fd (a real-time AV scan on close, e.g.) — the fd check above
     // catches the case this PR is about, this catches the OS's own
     // documented aftermath of a close it already completed.
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -757,7 +757,7 @@ test('setEnabled(false, ...) waits for its own stream\'s close, not just finish'
     // nulls its fd (a real-time AV scan on close, e.g.) — the fd check above
     // catches the case this PR is about, this catches the OS's own
     // documented aftermath of a close it already completed.
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -799,7 +799,7 @@ test('close() waits for a still-pending rotation close, not just its own stream'
     // nulls its fd (a real-time AV scan on close, e.g.) — the fd check above
     // catches the case this PR is about, this catches the OS's own
     // documented aftermath of a close it already completed.
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -838,7 +838,7 @@ test('setEnabled(false, ...) waits for a still-pending rotation close, not just 
     // nulls its fd (a real-time AV scan on close, e.g.) — the fd check above
     // catches the case this PR is about, this catches the OS's own
     // documented aftermath of a close it already completed.
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -875,7 +875,7 @@ test('close() falls back to done() if the stream never emits close', async () =>
     // nulls its fd (a real-time AV scan on close, e.g.) — the fd check above
     // catches the case this PR is about, this catches the OS's own
     // documented aftermath of a close it already completed.
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
