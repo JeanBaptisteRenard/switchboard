@@ -403,6 +403,31 @@ directory. `pendingRotationCloses` tracks every in-flight rotation close;
 `close()`/`setEnabled(false, ...)` wait for that count to reach zero too,
 not just for their own stream.
 
+Both fixes are covered directly, not just by absence-of-flake: the tests
+intercept the exact `.once('close', ...)` registration production code
+makes (`interceptOnceClose` in the test file) and hold it back deliberately,
+then assert the callback under test has *not* resolved yet, release it, and
+assert it now has. A regression back to `.end(callback)` (waiting on
+`finish`) skips that registration entirely, so the held callback is never
+even captured — the callback under test resolves immediately instead of
+waiting, and the assertion catches it. This is deliberately not a race
+against real OS timing in either direction: unlike the `ENOTEMPTY` failure
+itself (genuinely intermittent, load-dependent, unreproducible on demand),
+whether the code *asks* to wait for `close` at all is a fact about the
+code, checkable without needing the underlying stream to misbehave.
+
+**The wait is bounded.** `fs.WriteStream`'s `close` is not guaranteed to
+fire in bounded time — an AV/backup lock on Windows can hold the handle
+indefinitely, which is the same class of behavior this whole page is about.
+`close()`/`setEnabled(false, ...)` fall back to calling `done()` anyway
+after `closeTimeoutMs` (default 5 s, overridable via `options.closeTimeoutMs`
+for tests) if the real completion never lands, via `process.emitWarning`
+with `code: 'SWITCHBOARD_TRACE_CLOSE_TIMEOUT'`. `main.js`'s Diagnostics
+toggle handler (`set-activity-trace-enabled`) adds its own outer 8 s bound
+around the whole call, independent of the library's — degraded (a stray
+directory entry, one possibly-missed prune) beats the toggle hanging for
+the rest of the session with no recovery short of a restart.
+
 Two tests in `test/activity-trace.test.js` used to bridge that async gap with
 a fixed `setTimeout(60)`. That is a duration bet, not a correctness check, and
 it hides a real ordering hazard rather than just being slow: `close()` sets

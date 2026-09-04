@@ -12,6 +12,10 @@ const MAX_MB_VAR = 'SWITCHBOARD_ACTIVITY_TRACE_MAX_MB';
 
 const DEFAULT_MAX_MB = 64;
 const DEFAULT_SEGMENTS = 4;
+// A stream's 'close' is not guaranteed to ever fire (a Windows AV/backup
+// lock on the file, e.g.) — close()/setEnabled(false, ...) must not hang
+// their caller forever waiting for it. See docs/activity-trace.md.
+const DEFAULT_CLOSE_TIMEOUT_MS = 5000;
 
 // Envelope keys; a payload field of the same name gets a `_` prefix instead.
 const RESERVED = new Set(['seq', 't', 'wall', 'src', 'cat', 'sid']);
@@ -160,6 +164,7 @@ function createActivityTrace(options = {}) {
   const nowMs = options.nowMs || (() => Date.now());
   const write = typeof options.write === 'function' ? options.write : null;
   const unlink = options.unlink || fs.unlinkSync;
+  const closeTimeoutMs = options.closeTimeoutMs || DEFAULT_CLOSE_TIMEOUT_MS;
 
   const origin = process.hrtime.bigint();
   let seq = 0;
@@ -195,6 +200,33 @@ function createActivityTrace(options = {}) {
       rotationDrainWaiters = [];
       for (const w of waiters) w();
     }
+  }
+
+  // Fires `done` exactly once — through the real completion path, or, if
+  // that never comes, through a bounded fallback. Degraded but recoverable
+  // beats a caller (main.js's Diagnostics toggle) hung with no way out
+  // short of a restart. See docs/activity-trace.md.
+  function guardedDone(done) {
+    if (!done) return { settle() {} };
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      process.emitWarning(
+        'activity-trace: timed out waiting for a stream to close; continuing without it',
+        { code: 'SWITCHBOARD_TRACE_CLOSE_TIMEOUT' }
+      );
+      done();
+    }, closeTimeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    return {
+      settle() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        done();
+      },
+    };
   }
 
   function segmentPath(index) {
@@ -339,7 +371,8 @@ function createActivityTrace(options = {}) {
     stream = null;
     // currentPath outlives the stream until the fd is released — see
     // docs/activity-trace.md "Testing the async prune path".
-    const finish = () => afterRotationCloses(() => { if (done) done(); });
+    const guard = guardedDone(done);
+    const finish = () => afterRotationCloses(() => guard.settle());
     if (old) {
       old.once('close', () => { currentPath = null; finish(); });
       old.end();
@@ -372,7 +405,8 @@ function createActivityTrace(options = {}) {
     const old = stream;
     stream = null;
     // See setEnabled(false, ...) above and docs/activity-trace.md.
-    const finish = () => afterRotationCloses(() => { if (done) done(); });
+    const guard = guardedDone(done);
+    const finish = () => afterRotationCloses(() => guard.settle());
     if (old) {
       old.once('close', () => { currentPath = null; finish(); });
       old.end();
