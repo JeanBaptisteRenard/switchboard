@@ -891,6 +891,46 @@ test('close() falls back to done() if the stream never emits close', async () =>
   }
 });
 
+test('setEnabled(false, ...) falls back to done() if the stream never emits close', async () => {
+  // Mirrors the close() version above. Not redundant with it: setEnabled and
+  // close build the same guardedDone/finish shape independently (activity-trace.js),
+  // and the only production caller that ever passes a callback is the
+  // set-activity-trace-enabled IPC handler, which calls setEnabled — main.js's
+  // shutdown path calls close() with none. A fallback proven only on close()
+  // proves nothing about the path production actually uses.
+  const dir = tmpTraceDir('disable-timeout');
+  const realCreate = fs.createWriteStream;
+  const made = [];
+  const reallyClosed = new Set();
+  fs.createWriteStream = (...args) => {
+    const s = realCreate.apply(fs, args);
+    made.push(s);
+    s.on('close', () => reallyClosed.add(s));
+    interceptOnceClose(s); // held forever — never released, on purpose
+    return s;
+  };
+  const warnings = [];
+  const onWarning = (w) => { if (w && w.code === 'SWITCHBOARD_TRACE_CLOSE_TIMEOUT') warnings.push(w); };
+  process.on('warning', onWarning);
+  try {
+    const t = createActivityTrace({ enabled: true, closeTimeoutMs: 30 });
+    t.init(dir);
+
+    let done = false;
+    t.setEnabled(false, () => { done = true; });
+
+    await waitUntil(() => done === true, { tries: 100, intervalMs: 10 });
+    assert.equal(done, true, 'setEnabled(false, ...) must recover with a bounded fallback, not hang forever');
+    assert.equal(warnings.length, 1, 'the degraded path is recorded exactly once');
+  } finally {
+    process.removeListener('warning', onWarning);
+    fs.createWriteStream = realCreate;
+    // See the matching comment in the close() version of this test.
+    await waitUntil(() => made.every(s => reallyClosed.has(s)));
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
 // --- the panel's file handlers ---------------------------------------------
 
 test('resolveTraceFilePath accepts only trace segments in the trace directory', () => {

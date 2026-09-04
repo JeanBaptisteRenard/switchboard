@@ -426,7 +426,30 @@ with `code: 'SWITCHBOARD_TRACE_CLOSE_TIMEOUT'`. `main.js`'s Diagnostics
 toggle handler (`set-activity-trace-enabled`) adds its own outer 8 s bound
 around the whole call, independent of the library's — degraded (a stray
 directory entry, one possibly-missed prune) beats the toggle hanging for
-the rest of the session with no recovery short of a restart.
+the rest of the session with no recovery short of a restart. Covered for
+both `close()` and `setEnabled(false, ...)` separately — they build the
+same guardedDone/finish shape independently, and only `setEnabled` is ever
+called with a callback in production (`set-activity-trace-enabled`);
+`main.js`'s shutdown path calls `close()` with none. A fallback proven only
+on one does not prove anything about the other.
+
+Two things worth knowing about this fallback, neither changed here:
+
+- During the degraded window (fallback fired, real `close` not landed yet),
+  `currentFile()` still reports the old path even though `state.on` already
+  flipped — `activityTraceState()` hands the renderer a momentarily
+  inconsistent snapshot. Left as-is on purpose: `currentPath` only clears
+  once the real `close` confirms the fd is released, which is exactly what
+  stops the panel's delete button from removing a file that might still be
+  open. Clearing it early would trade a few seconds of stale UI for
+  reintroducing the premature-delete risk `currentPath`'s lifetime exists to
+  prevent — the wrong side of that trade.
+- `guardedDone`'s timer is `unref()`'d, so it does not keep the process
+  alive on its own. In a bare Node process with no other active handle,
+  the process can exit before the timeout fires and the fallback never
+  runs. Not a concern in the Electron main process, which always has other
+  handles open (windows, IPC) — but worth stating as the implicit
+  assumption it is, for any future caller in a shorter-lived process.
 
 Two tests in `test/activity-trace.test.js` used to bridge that async gap with
 a fixed `setTimeout(60)`. That is a duration bet, not a correctness check, and
