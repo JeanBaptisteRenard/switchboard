@@ -257,6 +257,30 @@ async function waitUntil(check, { tries = 500, intervalMs = 20 } = {}) {
   return check();
 }
 
+// Intercepts .once('close', fn) registrations on a real stream without
+// touching how the stream itself emits anything: fn is captured instead of
+// registered, and only runs when release() is called. This targets the exact
+// call activity-trace.js makes (old.once('close', ...)) rather than trying to
+// suppress the underlying stream's real 'close' event, which Node's fs
+// streams bind internally in a way an outside emit()/on() override does not
+// reliably intercept.
+function interceptOnceClose(stream) {
+  const originalOnce = stream.once.bind(stream);
+  const held = [];
+  stream.once = function (event, listener) {
+    if (event === 'close') { held.push(listener); return stream; }
+    return originalOnce(event, listener);
+  };
+  return {
+    release() {
+      stream.once = originalOnce;
+      const listeners = held.splice(0);
+      for (const l of listeners) l();
+    },
+    get pendingCount() { return held.length; },
+  };
+}
+
 function readEntries(files) {
   const out = [];
   for (const f of files) {
@@ -650,6 +674,165 @@ test('an error on a rotated-out stream does not kill the live one', async () => 
     const cats = readEntries([live]).map(e => e.cat);
     assert.ok(cats.includes('after.stale.error'), 'the trace kept writing after the stale error');
   } finally {
+    fs.createWriteStream = realCreate;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- close()/setEnabled(false, ...) must actually wait for 'close' ---------
+// See docs/activity-trace.md "Testing the async prune path". These hold back
+// the exact .once('close', ...) registration production code makes, so a
+// regression back to .end(callback) (which fires on 'finish', not 'close')
+// cannot pass by accident: with that regression, nothing here is ever held
+// in the first place, and the callback under test resolves immediately.
+
+test('close() waits for its own stream\'s close, not just finish', async () => {
+  const dir = tmpTraceDir('close-own');
+  const realCreate = fs.createWriteStream;
+  let holder;
+  fs.createWriteStream = (...args) => {
+    const s = realCreate.apply(fs, args);
+    holder = interceptOnceClose(s);
+    return s;
+  };
+  try {
+    const t = createActivityTrace({ enabled: true });
+    t.init(dir);
+
+    let done = false;
+    t.close(() => { done = true; });
+
+    await new Promise(r => setImmediate(r));
+    assert.equal(done, false, 'close() resolved before its own stream\'s close was released');
+    assert.equal(holder.pendingCount, 1, 'close() must register on the close event to hold in the first place');
+
+    holder.release();
+    assert.equal(done, true, 'close() must resolve once its own stream closes');
+  } finally {
+    fs.createWriteStream = realCreate;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('setEnabled(false, ...) waits for its own stream\'s close, not just finish', async () => {
+  const dir = tmpTraceDir('disable-own');
+  const realCreate = fs.createWriteStream;
+  let holder;
+  fs.createWriteStream = (...args) => {
+    const s = realCreate.apply(fs, args);
+    holder = interceptOnceClose(s);
+    return s;
+  };
+  try {
+    const t = createActivityTrace({ enabled: true });
+    t.init(dir);
+
+    let done = false;
+    t.setEnabled(false, () => { done = true; });
+
+    await new Promise(r => setImmediate(r));
+    assert.equal(done, false, 'setEnabled(false, ...) resolved before its own stream\'s close was released');
+
+    holder.release();
+    assert.equal(done, true, 'setEnabled(false, ...) must resolve once its own stream closes');
+  } finally {
+    fs.createWriteStream = realCreate;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('close() waits for a still-pending rotation close, not just its own stream', async () => {
+  const dir = tmpTraceDir('close-pending-rotation');
+  const realCreate = fs.createWriteStream;
+  const made = [];
+  const holders = [];
+  fs.createWriteStream = (...args) => {
+    const s = realCreate.apply(fs, args);
+    made.push(s);
+    holders.push(interceptOnceClose(s));
+    return s;
+  };
+  try {
+    const t = createActivityTrace({ enabled: true, maxSegmentBytes: 200, maxSegments: 4 });
+    t.init(dir);
+    t.trace('fill', 's1', { pad: 'x'.repeat(300) }); // forces a rotation
+    assert.equal(made.length, 2, 'the rotation opened a second segment');
+    assert.equal(holders[0].pendingCount, 1, 'rotate() must hold on the retired stream\'s close to prune it');
+
+    let done = false;
+    t.close(() => { done = true; });
+
+    // Let close()'s own (current) stream settle for real; the retired
+    // stream's close stays withheld.
+    holders[1].release();
+    await new Promise(r => setImmediate(r));
+    assert.equal(done, false,
+      'close() must not resolve while an earlier rotation\'s stream close is still pending');
+
+    holders[0].release();
+    assert.equal(done, true, 'close() must resolve once the pending rotation close lands');
+  } finally {
+    fs.createWriteStream = realCreate;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('setEnabled(false, ...) waits for a still-pending rotation close, not just its own stream', async () => {
+  const dir = tmpTraceDir('disable-pending-rotation');
+  const realCreate = fs.createWriteStream;
+  const made = [];
+  const holders = [];
+  fs.createWriteStream = (...args) => {
+    const s = realCreate.apply(fs, args);
+    made.push(s);
+    holders.push(interceptOnceClose(s));
+    return s;
+  };
+  try {
+    const t = createActivityTrace({ enabled: true, maxSegmentBytes: 200, maxSegments: 4 });
+    t.init(dir);
+    t.trace('fill', 's1', { pad: 'x'.repeat(300) }); // forces a rotation
+    assert.equal(made.length, 2, 'the rotation opened a second segment');
+
+    let done = false;
+    t.setEnabled(false, () => { done = true; });
+
+    holders[1].release();
+    await new Promise(r => setImmediate(r));
+    assert.equal(done, false,
+      'setEnabled(false, ...) must not resolve while an earlier rotation\'s close is still pending');
+
+    holders[0].release();
+    assert.equal(done, true, 'setEnabled(false, ...) must resolve once the pending rotation close lands');
+  } finally {
+    fs.createWriteStream = realCreate;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('close() falls back to done() if the stream never emits close', async () => {
+  const dir = tmpTraceDir('close-timeout');
+  const realCreate = fs.createWriteStream;
+  fs.createWriteStream = (...args) => {
+    const s = realCreate.apply(fs, args);
+    interceptOnceClose(s); // held forever — never released, on purpose
+    return s;
+  };
+  const warnings = [];
+  const onWarning = (w) => { if (w && w.code === 'SWITCHBOARD_TRACE_CLOSE_TIMEOUT') warnings.push(w); };
+  process.on('warning', onWarning);
+  try {
+    const t = createActivityTrace({ enabled: true, closeTimeoutMs: 30 });
+    t.init(dir);
+
+    let done = false;
+    t.close(() => { done = true; });
+
+    await waitUntil(() => done === true, { tries: 100, intervalMs: 10 });
+    assert.equal(done, true, 'close() must recover with a bounded fallback, not hang forever');
+    assert.equal(warnings.length, 1, 'the degraded path is recorded exactly once');
+  } finally {
+    process.removeListener('warning', onWarning);
     fs.createWriteStream = realCreate;
     fs.rmSync(dir, { recursive: true, force: true });
   }
