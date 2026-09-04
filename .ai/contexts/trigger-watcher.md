@@ -483,10 +483,13 @@ Result written to `SWITCHBOARD_TRIGGERS_DIR/processed/<uuid>.result.json`:
 ```
 
 A `chain` result also carries `steps` and `total_waited_ms` — see
-`docs/automation.md` ("Triggers") for `total_waited_ms`'s exact definition
-and the one evident gap found and fixed while writing it down (2026-09-04:
-each step's own politeness wait now counts toward that step's own
-`waited_ms`, not only toward the chain total).
+`docs/automation.md` ("Triggers") for both `waited_ms` (the single-`command`
+path) and `total_waited_ms`'s exact definitions, and the two evident gaps
+found and fixed while writing them down (2026-09-04): each chain step's own
+politeness wait now counts toward that step's own `waited_ms`, not only
+toward the chain total; and the single-`command` path's `waited_ms` now
+includes the submit-verification poll (and its retry, if one fired), which it
+previously left out entirely.
 
 Trigger file is **deleted** after processing (success or failure).
 

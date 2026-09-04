@@ -747,6 +747,9 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
       composerConfirmed = !!v.composerConfirmed;
       recoverySkipped   = !!v.recoverySkipped;
       recoveryReason    = v.recoveryReason || null;
+      // The submit-verify poll (and its retry, if any) is time this trigger
+      // spent too -- see "waited_ms" in docs/automation.md.
+      waited_ms        += v.waited_ms;
       if (v.writeError) throw v.writeError;
     } catch (err) {
       ctx.log.error('[trigger-watcher] PTY write failed:', err.message);

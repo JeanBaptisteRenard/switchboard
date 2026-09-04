@@ -71,22 +71,33 @@ Instead of a single `command`, you can send a `chain` — a sequence of up to 20
 
 `command` and `chain` are mutually exclusive.
 
-**`total_waited_ms`.** Only a `chain` result carries it. It is the sum of
-every wait this trigger spent: the initial `wait:"idle"` wait (0 if `wait` is
-`"none"` or the session was already idle), plus, for every step the chain
-attempted, that step's own politeness wait, its submit-verification poll(s),
-and — for every step but the last — its busy-fall wait. `steps[i].waited_ms`
-is the same sum scoped to step `i` alone, so `total_waited_ms` equals the
-initial wait plus the sum of every entry in `steps[]`, **except** when the
-last attempted step is abandoned before it ever writes anything (composer
-never free, the session exits, or the global deadline fires): that step's
-partial wait still counts toward `total_waited_ms`, but it has no entry in
-`steps[]` to be attributed to, since `steps[]` only lists steps that actually
-reached a write. A measured gap of roughly 158 s between `total_waited_ms` and
-the sum of `steps[*].waited_ms` on 2026-09-03 was this: each step's own
-politeness wait was folded into `total_waited_ms` but left out of that step's
-own `waited_ms` — fixed so the identity above holds exactly on every chain
-that completes.
+**`waited_ms` / `total_waited_ms`.** Both fields mean the same thing — every
+wait this trigger spent — scoped differently: a single `command` result
+carries `waited_ms` for the whole trigger; a `chain` result carries
+`total_waited_ms` for the whole chain, plus a per-step `waited_ms` inside each
+`steps[]` entry.
+
+- **`command`'s `waited_ms`** is the `wait:"idle"` wait (0 if `wait` is
+  `"none"` or the session was already idle), plus the politeness wait, plus
+  the submit-verification poll and its retry, if one fired.
+- **`chain`'s `total_waited_ms`** is the initial `wait:"idle"` wait (same rule)
+  plus, for every step the chain attempted, that step's own politeness wait,
+  its submit-verification poll(s), and — for every step but the last — its
+  busy-fall wait. `steps[i].waited_ms` is the same sum scoped to step `i`
+  alone, so `total_waited_ms` equals the initial wait plus the sum of every
+  entry in `steps[]`, **except** when the last attempted step is abandoned
+  before it ever writes anything (composer never free, the session exits, or
+  the global deadline fires): that step's partial wait still counts toward
+  `total_waited_ms`, but it has no entry in `steps[]` to be attributed to,
+  since `steps[]` only lists steps that actually reached a write.
+
+A measured gap of roughly 158 s between `total_waited_ms` and the sum of
+`steps[*].waited_ms` on 2026-09-03 was this: each step's own politeness wait
+was folded into `total_waited_ms` but left out of that step's own
+`waited_ms` — fixed so the identity above holds exactly on every chain that
+completes. The `command` path had the matching gap on its own smaller scale —
+its `waited_ms` left out the submit-verification poll entirely — fixed the
+same way, so a reader comparing the two paths finds them consistent.
 
 `wait` accepts **`idle` and `none`, and nothing else.** An absent field still
 means `none`, because existing triggers rely on that default, but any other

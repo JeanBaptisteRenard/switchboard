@@ -3660,3 +3660,88 @@ test('total_waited_ms: equals the sum of steps[*].waited_ms, including each step
     cleanup(tmp);
   }
 });
+
+test('waited_ms (single command): includes the submit-verification poll, not only the idle/politeness wait', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-waited-ms-verify-' + Date.now();
+    // Busy never rises: submitWithVerify runs its full first window, then the
+    // recovery Enter, then a second full window -- two ~400ms windows worth
+    // of polling that must show up in waited_ms.
+    const ctx = makeCtx(SESSION_ID);
+    watcher = start(ctx);
+
+    const uuid = 'waited-ms-verify-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submit_retries, 1, 'precondition: busy never observed, the retry fired');
+    assert.ok(result.waited_ms >= 700,
+      `waited_ms must include the submit-verification poll (two ~400ms windows); got ${result.waited_ms}`);
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('submitted: preBusy must be sampled before the write, not after -- a session busy only until our own write must never read as "confirmed"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-prebusy-order-' + Date.now();
+
+    // Deterministic ORDER, not a race: busy is true until the instant our own
+    // Enter write lands, flips false right there, then a genuine turn rises a
+    // little later so a turn is still observed. Sampling busy before the
+    // write (correct) reads true; sampling it after (the mutation this test
+    // exists to catch) reads false, and would wrongly call the result
+    // "confirmed" -- the overestimating direction, the one that costs.
+    let busy = true;
+    const ctx = makeCtx(SESSION_ID, () => busy);
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      if (data === '\r' && ctx._written.length === 2) {
+        busy = false;
+        setTimeout(() => { busy = true; }, 50);
+        setTimeout(() => { busy = false; }, 250);
+      }
+    };
+    watcher = start(ctx);
+
+    const uuid = 'prebusy-order-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, wait: 'none', command: '/compact' });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.submit_retries, 0, 'precondition: the turn was observed on the first poll');
+    assert.equal(result.submitted, 'activity',
+      'the session was still busy the instant we wrote -- observing a turn afterward must not upgrade this to "confirmed"');
+    assert.notEqual(result.submitted, 'confirmed');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
