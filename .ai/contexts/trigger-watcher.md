@@ -329,9 +329,27 @@ one `retained` path described above, same as for any other trigger.
 `dispatch()` still wraps the call to `processTriggerFile()` in a `.catch()`
 that logs and marks the name `retained`. With the internal `try`/`catch` now
 covering the whole function body, this outer `.catch()` should never fire in
-practice — but it stays as a last-resort backstop (a broken `ctx.log`, say)
-where genuinely nothing is known about whether a result was written, and
-`retained` is the only safe call left.
+practice — a broken `ctx.log` alone can no longer reach it, since every log
+call between it and `processTriggerFile()`'s own generic catch is now
+`safeLogError()`-guarded too. It stays as a last-resort backstop for the one
+thing genuinely outside this module's control: `retained.add(filename)`
+(a plain `Set`) itself throwing. `retained.add(filename)` runs *before* the
+logging in this `.catch()`, same ordering rule as everywhere else.
+
+Only two `ctx.log.error()` calls sit downstream of every other one in this
+file, and both are `safeLogError()`-guarded: the generic catch's own log line
+above, and `dispatch()`'s `.catch()` here. Every other `ctx.log.warn` /
+`.info` / `.error()` call inside `processTriggerFile()`'s body is deliberately
+*not* wrapped individually — each one precedes a `return` through
+`writeResult()` inside the same outer `try`, so a throw from any of them is
+already caught by the generic catch above, and (if that catch's own guarded
+log and `writeResult()` retry somehow both fail) by `dispatch()`'s catch in
+turn. Wrapping every site individually would duplicate that protection
+without closing any gap the two backstops don't already close. The four
+`ctx.log.*` calls in `start()` itself (directory creation, watcher startup,
+the `fs.watch` `error` event) are a different case: they describe the
+watcher's own lifecycle, not any one trigger's fate, and are out of scope for
+this guarantee.
 
 **Known gap, deliberately not fixed**: if writing the result file fails, the
 trigger is deleted anyway. The two invariants ("always a result", "never twice")
@@ -345,6 +363,7 @@ and nothing prunes them.
 - **Never throws out of the watcher callback** — `processTriggerFile()`'s body runs inside one `try`/`catch`; any exception, anticipated or not, lands in the result file via `writeResult()` before the function returns. `dispatch()`'s own `.catch()` is a backstop for the case that should no longer occur.
 - **Poll loops must reject, not throw** — `waitForComposerFree`, `pollForBusyRise`, `waitForBusyFall` and `waitForIdle` all share `pollLoop()`, which converts a throw from *any* tick (including the ones run from inside `setTimeout`, not just the first synchronous one) into that promise's rejection. Without this, a throw on a deferred tick has no `try`/`catch` above it — see "Removing the entry".
 - **`writeResult()` never throws** — both of its internal `try`/`catch` blocks route their own logging through `safeLogError()`, which cannot itself throw, and the unlink branch records `onEntryRetained()` before logging. A broken `ctx.log` cannot skip either guarantee.
+- **A broken `ctx.log` cannot crash the process from either backstop** — the generic catch's own log line and `dispatch()`'s own `.catch()` log line are both `safeLogError()`-guarded. An unguarded log call throwing there would otherwise become an `unhandledRejection`, which terminates the process by default under Node — see "Removing the entry".
 - **Deduplication via `inFlight` Set** — noisy `rename` events for the same file (common on Linux inotify) are coalesced; a file is processed at most once per appearance.
 - **A processed trigger never runs twice** — normally because it was deleted; when the deletion fails, because its name is in `retained`. A trigger that threw internally is not exempt from this: it still gets a result and a deletion, so it is not "retained" on that account.
 - **`accessSync` guard** — the `rename` event fires both on file creation and deletion; the existence check prevents processing a deletion event.

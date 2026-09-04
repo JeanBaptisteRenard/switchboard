@@ -934,7 +934,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
 
   } catch (err) {
     // see .ai/contexts/trigger-watcher.md, "Removing the entry"
-    ctx.log.error('[trigger-watcher] Trigger processing threw, writing a generic failure result:',
+    safeLogError(ctx, '[trigger-watcher] Trigger processing threw, writing a generic failure result:',
       name, err && err.message);
     // `internal: true` marks this as our bug, not a validation refusal — see
     // .ai/contexts/trigger-watcher.md, "Removing the entry".
@@ -992,7 +992,7 @@ function start(ctx) {
     processTriggerFile(filename, ctx, triggersDir, processedDir, () => retained.add(filename))
       .catch((err) => {
         retained.add(filename);
-        ctx.log.error('[trigger-watcher] Trigger processing threw, will not be run again:',
+        safeLogError(ctx, '[trigger-watcher] Trigger processing threw, will not be run again:',
           filename, err && err.message);
       })
       .finally(() => {

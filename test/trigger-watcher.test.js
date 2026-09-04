@@ -3086,3 +3086,156 @@ test('internal field: the generic catch marks internal:true; a validation refusa
     cleanup(tmp);
   }
 });
+
+// ── Follow-up: the two remaining unguarded ctx.log.error() call sites ─────────
+// (raised after the first pass at these fixes). Both sit downstream of every
+// other log call in this file — anything that throws upstream is caught by
+// the outer try/catch in processTriggerFile() and lands here, or (if that
+// itself throws) in dispatch()'s .catch(). A broken ctx.log at either site
+// used to end in an unhandledRejection, which terminates the process by
+// default under Node. See .ai/contexts/trigger-watcher.md, "Removing the
+// entry".
+
+test('outer generic-catch log call cannot escape even when ctx.log.error throws (result still written, trigger still deleted)', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  const uncaughtErrors = [];
+  const rejections     = [];
+  const onUncaught  = (err) => uncaughtErrors.push(err);
+  const onRejection = (err) => rejections.push(err);
+  process.on('uncaughtException', onUncaught);
+  process.on('unhandledRejection', onRejection);
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const ctx = makeCtx('any-session');
+    let logCalls = 0;
+    ctx.log = {
+      info: () => {}, warn: () => {}, debug: () => {},
+      error: (...a) => { logCalls++; throw new Error('logger is broken'); },
+    };
+    watcher = start(ctx);
+
+    // A trigger body that parses as JSON but destructures wrong -> reaches
+    // the generic catch at the end of processTriggerFile, whose own log call
+    // is the site under test.
+    const uuid        = 'outer-catch-log-throws-' + Date.now();
+    const triggerPath = path.join(tmp, uuid + '.json');
+    fs.writeFileSync(triggerPath, 'null', 'utf8');
+
+    const processedDir = path.join(tmp, 'processed');
+    const resultPath   = path.join(processedDir, uuid + '.result.json');
+    await waitForFile(resultPath, 2000);
+
+    assert.ok(logCalls > 0, 'precondition: the throwing logger was reached');
+    assert.deepEqual(uncaughtErrors, [],
+      'a broken logger in the outer catch must not surface as an uncaughtException');
+    assert.deepEqual(rejections, [],
+      'a broken logger in the outer catch must not surface as an unhandledRejection');
+
+    const result = readResult(processedDir, uuid);
+    assert.equal(result.ok, false);
+    assert.equal(result.internal, true);
+    assert.equal(fs.existsSync(triggerPath), false,
+      'trigger must still be deleted despite the broken logger');
+
+  } finally {
+    process.removeListener('uncaughtException', onUncaught);
+    process.removeListener('unhandledRejection', onRejection);
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('dispatch() backstop log call cannot escape even when ctx.log.error throws (name still ends up retained)', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  const uncaughtErrors = [];
+  const rejections     = [];
+  const onUncaught  = (err) => uncaughtErrors.push(err);
+  const onRejection = (err) => rejections.push(err);
+  process.on('uncaughtException', onUncaught);
+  process.on('unhandledRejection', onRejection);
+
+  // dispatch()'s own .catch() only fires if processTriggerFile() itself
+  // rejects -- which, with both writeResult() try/catch blocks now safe,
+  // only still happens if onEntryRetained() (== retained.add(filename), a
+  // Set the caller never sees) throws. This forces exactly that, to reach
+  // the one remaining call site without touching module internals: a
+  // directory-shaped trigger makes writeResult()'s unlink fail twice (the
+  // validation-refusal write, then the outer catch's own fallback write),
+  // so Set.prototype.add is patched to throw only for the 2nd and 3rd
+  // .add() call carrying this trigger's exact filename -- letting
+  // dispatch()'s own (4th) retained.add(filename) call go through for real,
+  // which is the guarantee under test.
+  const realSetAdd = Set.prototype.add;
+  let addCallsForFile = 0;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const ctx = makeCtx('any-session');
+    let logCalls = 0;
+    ctx.log = {
+      info: () => {}, warn: () => {}, debug: () => {},
+      error: (...a) => { logCalls++; throw new Error('logger is broken'); },
+    };
+    watcher = start(ctx);
+
+    const uuid  = 'dispatch-catch-log-throws-' + Date.now();
+    const entry = path.join(tmp, uuid + '.json'); // directory: unlink always fails
+    const filename = uuid + '.json';
+
+    Set.prototype.add = function (value) {
+      if (value === filename) {
+        addCallsForFile++;
+        if (addCallsForFile === 2 || addCallsForFile === 3) {
+          throw new Error('retained set is broken (simulated)');
+        }
+      }
+      return realSetAdd.call(this, value);
+    };
+
+    fs.mkdirSync(entry);
+
+    // No result-file poll: the write inside writeResult() races the induced
+    // throw, so poll for the trigger to stop being reprocessed instead.
+    const deadline = Date.now() + 2000;
+    while (addCallsForFile < 4 && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 20));
+    }
+    await new Promise(r => setTimeout(r, 100)); // let dispatch()'s .finally() settle
+
+    Set.prototype.add = realSetAdd;
+
+    assert.ok(addCallsForFile >= 4,
+      'precondition: retained.add(filename) was reached a 4th time, from dispatch()\'s own catch');
+    assert.ok(logCalls > 0, 'precondition: the throwing logger was reached');
+    assert.deepEqual(uncaughtErrors, [],
+      'a broken logger in dispatch()\'s backstop must not surface as an uncaughtException');
+    assert.deepEqual(rejections, [],
+      'a broken logger in dispatch()\'s backstop must not surface as an unhandledRejection');
+
+    // The name must be genuinely retained: drop a fresh, valid trigger under
+    // the same uuid and confirm it is never picked up.
+    fs.rmdirSync(entry);
+    writeTrigger(tmp, uuid, { sessionId: 'any-session', command: '/compact' });
+    await new Promise(r => setTimeout(r, 400));
+    assert.deepEqual(ctx._written, [],
+      'the name must stay retained -- dispatch()\'s own retained.add(filename) must have gone through');
+
+  } finally {
+    Set.prototype.add = realSetAdd;
+    process.removeListener('uncaughtException', onUncaught);
+    process.removeListener('unhandledRejection', onRejection);
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
