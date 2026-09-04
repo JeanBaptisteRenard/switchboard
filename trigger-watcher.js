@@ -93,6 +93,15 @@ function weakestSubmitted(a, b) {
   return SUBMITTED_RANK[a] <= SUBMITTED_RANK[b] ? a : b;
 }
 
+// Single source of truth for turning a submitWithVerify() result into one of
+// the four `submitted` values -- used for the single-command result, the
+// per-chain-step field, and the chain's own fold (weakestSubmitted over this).
+// Kept as one function so all three read the same classification instead of
+// three copies of the same ternary drifting apart.
+function classifySubmitted(composerConfirmed, sawBusy) {
+  return composerConfirmed ? SUBMITTED_CONFIRMED : (sawBusy ? SUBMITTED_ACTIVITY : SUBMITTED_ASSUMED);
+}
+
 // W7 — child-process liveness check.
 // node-pty's ptyProcess.write() is silent on a dead child: the bytes land in
 // the kernel PTY buffer and are never consumed.  Without this check the watcher
@@ -983,7 +992,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
 
     await writeResult({
       ok:             true,
-      submitted:      composerConfirmed ? SUBMITTED_CONFIRMED : (sawBusy ? SUBMITTED_ACTIVITY : SUBMITTED_ASSUMED),
+      submitted:      classifySubmitted(composerConfirmed, sawBusy),
       sessionId,
       command,
       sent_at:        new Date().toISOString(),
@@ -1079,6 +1088,13 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     totalWaitedMs += polite.waited_ms;
     if (!polite.free) {
       ctx.log.warn(`[trigger-watcher] Composer never free at chain step ${i}:`, sessionId, polite.reason);
+      // This step never reached submitToPty -- nothing was written for it, so
+      // its own submitted is unconditionally "no", never folded from
+      // chainSubmitted the way the top-level field is.
+      steps.push({
+        idx: i, command: step.command, sent_at: stepSentAt, waited_ms: polite.waited_ms,
+        submit_retries: 0, submitted: SUBMITTED_NO,
+      });
       await writeResult({
         ok: false,
         submitted: weakestSubmitted(chainSubmitted, SUBMITTED_NO),
@@ -1128,10 +1144,11 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     submitRetries = verify.submit_retries;
     stepWaitedMs += verify.waited_ms;
     totalWaitedMs += verify.waited_ms;
-    chainSubmitted = weakestSubmitted(
-      chainSubmitted,
-      verify.composerConfirmed ? SUBMITTED_CONFIRMED : (verify.sawBusy ? SUBMITTED_ACTIVITY : SUBMITTED_ASSUMED),
-    );
+    // This step's own submitted -- same classification the chain fold below
+    // uses, attached to the step itself so a consumer can ask "was THIS step
+    // (e.g. the last one) confirmed?" instead of only the chain's weakest.
+    const stepSubmitted = classifySubmitted(!!verify.composerConfirmed, !!verify.sawBusy);
+    chainSubmitted = weakestSubmitted(chainSubmitted, stepSubmitted);
 
     if (verify.recoverySkipped) {
       ctx.log.warn(`[trigger-watcher] Recovery Enter withheld at chain step ${i} for ` +
@@ -1143,13 +1160,13 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
     // Session exited / global timeout observed during verify.
     if (verify.sessionExited) {
       ctx.log.warn(`[trigger-watcher] Session exited during chain step ${i} submit verify:`, sessionId);
-      steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
+      steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries, submitted: stepSubmitted });
       await writeResult({ ok: false, submitted: chainSubmitted, error: 'session exited during wait', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
       return;
     }
     if (verify.timedOut) {
       ctx.log.warn(`[trigger-watcher] Chain timeout during step ${i} submit verify:`, sessionId);
-      steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
+      steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries, submitted: stepSubmitted });
       await writeResult({ ok: false, submitted: chainSubmitted, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
       return;
     }
@@ -1169,20 +1186,20 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
 
       if (result.sessionExited) {
         ctx.log.warn(`[trigger-watcher] Session exited during chain step ${i} turn wait:`, sessionId);
-        steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
+        steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries, submitted: stepSubmitted });
         await writeResult({ ok: false, submitted: chainSubmitted, error: 'session exited during wait', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
         return;
       }
 
       if (result.timedOut) {
         ctx.log.warn(`[trigger-watcher] Chain timeout at step ${i}:`, sessionId);
-        steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
+        steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries, submitted: stepSubmitted });
         await writeResult({ ok: false, submitted: chainSubmitted, error: 'chain timeout', partial: true, steps_completed: i, sessionId, sent_at: step0SentAt, steps, total_waited_ms: totalWaitedMs });
         return;
       }
     }
 
-    steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries });
+    steps.push({ idx: i, command: step.command, sent_at: stepSentAt, waited_ms: stepWaitedMs, submit_retries: submitRetries, submitted: stepSubmitted });
   }
 
   await writeResult({
