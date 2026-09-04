@@ -12,6 +12,10 @@ const MAX_MB_VAR = 'SWITCHBOARD_ACTIVITY_TRACE_MAX_MB';
 
 const DEFAULT_MAX_MB = 64;
 const DEFAULT_SEGMENTS = 4;
+// A stream's 'close' is not guaranteed to ever fire (a Windows AV/backup
+// lock on the file, e.g.) — close()/setEnabled(false, ...) must not hang
+// their caller forever waiting for it. See docs/activity-trace.md.
+const DEFAULT_CLOSE_TIMEOUT_MS = 5000;
 
 // Envelope keys; a payload field of the same name gets a `_` prefix instead.
 const RESERVED = new Set(['seq', 't', 'wall', 'src', 'cat', 'sid']);
@@ -160,6 +164,7 @@ function createActivityTrace(options = {}) {
   const nowMs = options.nowMs || (() => Date.now());
   const write = typeof options.write === 'function' ? options.write : null;
   const unlink = options.unlink || fs.unlinkSync;
+  const closeTimeoutMs = options.closeTimeoutMs || DEFAULT_CLOSE_TIMEOUT_MS;
 
   const origin = process.hrtime.bigint();
   let seq = 0;
@@ -175,6 +180,54 @@ function createActivityTrace(options = {}) {
   let warning = false;
   const segments = [];
   const unlinkFailures = new Set();
+  // Rotations retire a stream and wait for its own 'close' before pruning
+  // (see rotate()). close()/setEnabled(false, ...) must wait for those too,
+  // not just for the stream they retire themselves, or a still-open handle
+  // from an earlier rotation outlives the callback that promised it is safe
+  // to touch the directory now. See docs/activity-trace.md.
+  let pendingRotationCloses = 0;
+  let rotationDrainWaiters = [];
+
+  function afterRotationCloses(cb) {
+    if (pendingRotationCloses === 0) cb();
+    else rotationDrainWaiters.push(cb);
+  }
+
+  function onRotationCloseSettled() {
+    pendingRotationCloses -= 1;
+    if (pendingRotationCloses === 0 && rotationDrainWaiters.length) {
+      const waiters = rotationDrainWaiters;
+      rotationDrainWaiters = [];
+      for (const w of waiters) w();
+    }
+  }
+
+  // Fires `done` exactly once — through the real completion path, or, if
+  // that never comes, through a bounded fallback. Degraded but recoverable
+  // beats a caller (main.js's Diagnostics toggle) hung with no way out
+  // short of a restart. See docs/activity-trace.md.
+  function guardedDone(done) {
+    if (!done) return { settle() {} };
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      process.emitWarning(
+        'activity-trace: timed out waiting for a stream to close; continuing without it',
+        { code: 'SWITCHBOARD_TRACE_CLOSE_TIMEOUT' }
+      );
+      done();
+    }, closeTimeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    return {
+      settle() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        done();
+      },
+    };
+  }
 
   function segmentPath(index) {
     return path.join(dir, index === 0 ? baseName + '.jsonl' : baseName + '.' + String(index + 1).padStart(3, '0') + '.jsonl');
@@ -251,8 +304,16 @@ function createActivityTrace(options = {}) {
     currentPath = null;
     segment += 1;
     try { openSegment(); } catch { stream = null; currentPath = null; }
-    // Windows refuses to unlink a handle that is still open.
-    if (old) old.end(pruneSegments); else pruneSegments();
+    // Windows refuses to unlink an open handle — wait for 'close', not
+    // .end(callback)'s 'finish'. See docs/activity-trace.md "Testing the
+    // async prune path".
+    if (old) {
+      pendingRotationCloses += 1;
+      old.once('close', () => { pruneSegments(); onRotationCloseSettled(); });
+      old.end();
+    } else {
+      pruneSegments();
+    }
   }
 
   // see docs/activity-trace.md "Turning it off, and on again"
@@ -308,13 +369,16 @@ function createActivityTrace(options = {}) {
     state.on = false;
     const old = stream;
     stream = null;
-    // currentPath outlives the stream until the flush completes: it is what
-    // stops the panel deleting a file that is still being written out.
+    // currentPath outlives the stream until the fd is released — see
+    // docs/activity-trace.md "Testing the async prune path".
+    const guard = guardedDone(done);
+    const finish = () => afterRotationCloses(() => guard.settle());
     if (old) {
-      old.end(() => { currentPath = null; if (done) done(); });
+      old.once('close', () => { currentPath = null; finish(); });
+      old.end();
     } else {
       currentPath = null;
-      if (done) done();
+      finish();
     }
     return null;
   }
@@ -340,11 +404,15 @@ function createActivityTrace(options = {}) {
   function close(done) {
     const old = stream;
     stream = null;
+    // See setEnabled(false, ...) above and docs/activity-trace.md.
+    const guard = guardedDone(done);
+    const finish = () => afterRotationCloses(() => guard.settle());
     if (old) {
-      old.end(() => { currentPath = null; if (done) done(); });
+      old.once('close', () => { currentPath = null; finish(); });
+      old.end();
     } else {
       currentPath = null;
-      if (done) done();
+      finish();
     }
   }
 

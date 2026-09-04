@@ -376,12 +376,80 @@ flushes and closes (`app.quit` is the last line).
 ## Testing the async prune path
 
 `rotate()` runs `openSegment()` synchronously but hands the retired stream's
-cleanup (`pruneSegments`) to its `end()` callback, because Windows refuses to
-unlink a handle that is still open — the callback only fires once the OS has
-actually closed the file. Under `node --test`'s default concurrency (one
-process per test file, dozens running at once), that callback can take far
-longer than it does in isolation: CPU and disk contention from the sibling
-processes delays the event loop turn it needs.
+cleanup (`pruneSegments`) to its `close()`, because Windows refuses to unlink
+a handle that is still open. `close()`, `setEnabled(false, ...)` and the
+module's own `close()` used to pass that continuation straight to `.end()`
+instead: `.end(callback)`'s callback fires on the stream's `finish` event,
+which only means the data was handed off — `autoClose`'s own internal
+`fs.close()` runs after that, and only the stream's separate `close` event
+means the fd is actually released. That gap was invisible on Linux/macOS
+(POSIX lets you unlink or remove a directory entry with an open handle on
+it) and surfaced as Windows-only CI failures (`ENOTEMPTY` on the test
+temp-dir cleanup right after `close()`) once the Windows leg of the test
+matrix existed to see it. Fixed by listening for `close` before running the
+continuation, instead of relying on `.end()`'s own callback.
+
+Under `node --test`'s default concurrency (one process per test file, dozens
+running at once), that `close` event can still take far longer than it does
+in isolation: CPU and disk contention from the sibling processes delays the
+event loop turn it needs.
+
+That first fix waits for the stream `close()`/`setEnabled(false, ...)`
+retires *itself* — not for streams retired by earlier `rotate()` calls
+still in flight. A run with several rapid rotations can have more than one
+old stream mid-close at once; `close()` returning as soon as its own
+stream is done left those still open, the same `ENOTEMPTY` on the
+directory. `pendingRotationCloses` tracks every in-flight rotation close;
+`close()`/`setEnabled(false, ...)` wait for that count to reach zero too,
+not just for their own stream.
+
+Both fixes are covered directly, not just by absence-of-flake: the tests
+intercept the exact `.once('close', ...)` registration production code
+makes (`interceptOnceClose` in the test file) and hold it back deliberately,
+then assert the callback under test has *not* resolved yet, release it, and
+assert it now has. A regression back to `.end(callback)` (waiting on
+`finish`) skips that registration entirely, so the held callback is never
+even captured — the callback under test resolves immediately instead of
+waiting, and the assertion catches it. This is deliberately not a race
+against real OS timing in either direction: unlike the `ENOTEMPTY` failure
+itself (genuinely intermittent, load-dependent, unreproducible on demand),
+whether the code *asks* to wait for `close` at all is a fact about the
+code, checkable without needing the underlying stream to misbehave.
+
+**The wait is bounded.** `fs.WriteStream`'s `close` is not guaranteed to
+fire in bounded time — an AV/backup lock on Windows can hold the handle
+indefinitely, which is the same class of behavior this whole page is about.
+`close()`/`setEnabled(false, ...)` fall back to calling `done()` anyway
+after `closeTimeoutMs` (default 5 s, overridable via `options.closeTimeoutMs`
+for tests) if the real completion never lands, via `process.emitWarning`
+with `code: 'SWITCHBOARD_TRACE_CLOSE_TIMEOUT'`. `main.js`'s Diagnostics
+toggle handler (`set-activity-trace-enabled`) adds its own outer 8 s bound
+around the whole call, independent of the library's — degraded (a stray
+directory entry, one possibly-missed prune) beats the toggle hanging for
+the rest of the session with no recovery short of a restart. Covered for
+both `close()` and `setEnabled(false, ...)` separately — they build the
+same guardedDone/finish shape independently, and only `setEnabled` is ever
+called with a callback in production (`set-activity-trace-enabled`);
+`main.js`'s shutdown path calls `close()` with none. A fallback proven only
+on one does not prove anything about the other.
+
+Two things worth knowing about this fallback, neither changed here:
+
+- During the degraded window (fallback fired, real `close` not landed yet),
+  `currentFile()` still reports the old path even though `state.on` already
+  flipped — `activityTraceState()` hands the renderer a momentarily
+  inconsistent snapshot. Left as-is on purpose: `currentPath` only clears
+  once the real `close` confirms the fd is released, which is exactly what
+  stops the panel's delete button from removing a file that might still be
+  open. Clearing it early would trade a few seconds of stale UI for
+  reintroducing the premature-delete risk `currentPath`'s lifetime exists to
+  prevent — the wrong side of that trade.
+- `guardedDone`'s timer is `unref()`'d, so it does not keep the process
+  alive on its own. In a bare Node process with no other active handle,
+  the process can exit before the timeout fires and the fallback never
+  runs. Not a concern in the Electron main process, which always has other
+  handles open (windows, IPC) — but worth stating as the implicit
+  assumption it is, for any future caller in a shorter-lived process.
 
 Two tests in `test/activity-trace.test.js` used to bridge that async gap with
 a fixed `setTimeout(60)`. That is a duration bet, not a correctness check, and

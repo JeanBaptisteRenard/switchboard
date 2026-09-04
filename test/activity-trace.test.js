@@ -257,6 +257,30 @@ async function waitUntil(check, { tries = 500, intervalMs = 20 } = {}) {
   return check();
 }
 
+// Intercepts .once('close', fn) registrations on a real stream without
+// touching how the stream itself emits anything: fn is captured instead of
+// registered, and only runs when release() is called. This targets the exact
+// call activity-trace.js makes (old.once('close', ...)) rather than trying to
+// suppress the underlying stream's real 'close' event, which Node's fs
+// streams bind internally in a way an outside emit()/on() override does not
+// reliably intercept.
+function interceptOnceClose(stream) {
+  const originalOnce = stream.once.bind(stream);
+  const held = [];
+  stream.once = function (event, listener) {
+    if (event === 'close') { held.push(listener); return stream; }
+    return originalOnce(event, listener);
+  };
+  return {
+    release() {
+      stream.once = originalOnce;
+      const listeners = held.splice(0);
+      for (const l of listeners) l();
+    },
+    get pendingCount() { return held.length; },
+  };
+}
+
 function readEntries(files) {
   const out = [];
   for (const f of files) {
@@ -278,7 +302,7 @@ test('the trace rotates segments and retains a bounded number of them', async ()
   t.init(dir);
   for (let i = 0; i < 60; i++) t.trace('fill', 's1', { i, pad: 'xxxxxxxxxxxxxxxxxxxx' });
   assert.ok(t.files.length > 2, 'the run produced more segments than it retains');
-  t.close();
+  await new Promise(r => t.close(r));
 
   let files = [];
   await waitUntil(() => {
@@ -317,7 +341,7 @@ test('a segment that cannot be unlinked stays queued and is retried, not forgott
   await waitUntil(() => t.files.length === 2);
   assert.equal(t.files.length, 2, 'the backlog drains back to the ceiling once the lock clears');
   assert.equal(t.files.includes(stale), false);
-  t.close();
+  await new Promise(r => t.close(r));
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -337,7 +361,7 @@ test('a failed prune is reported in the trace itself, once per file', async () =
     warnings = readEntries(files).filter(e => e.cat === 'trace.prune-failed');
     return warnings.length >= 1;
   });
-  t.close();
+  await new Promise(r => t.close(r));
 
   assert.ok(warnings.length >= 1, 'exceeding the announced ceiling is not silent');
   assert.equal(warnings[0].error, 'EBUSY');
@@ -609,7 +633,7 @@ test('setEnabled calls back on every path, including the no-ops', { timeout: 100
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('an enable whose open failed is retried instead of latching on', () => {
+test('an enable whose open failed is retried instead of latching on', async () => {
   const base = tmpTraceDir('failed-open');
   const blocked = path.join(base, 'not-a-directory');
   fs.writeFileSync(blocked, 'x');
@@ -626,7 +650,7 @@ test('an enable whose open failed is retried instead of latching on', () => {
   assert.ok(file, 'a second enable retried rather than short-circuiting as a no-op');
   t.trace('recovered', null, {});
   assert.equal(t.sequence, 1);
-  t.close();
+  await new Promise(r => t.close(r));
   fs.rmSync(base, { recursive: true, force: true });
 });
 
@@ -652,6 +676,258 @@ test('an error on a rotated-out stream does not kill the live one', async () => 
   } finally {
     fs.createWriteStream = realCreate;
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- close()/setEnabled(false, ...) must actually wait for 'close' ---------
+// See docs/activity-trace.md "Testing the async prune path". These hold back
+// the exact .once('close', ...) registration production code makes, so a
+// regression back to .end(callback) (which fires on 'finish', not 'close')
+// cannot pass by accident: with that regression, nothing here is ever held
+// in the first place, and the callback under test resolves immediately.
+
+test('close() waits for its own stream\'s close, not just finish', async () => {
+  const dir = tmpTraceDir('close-own');
+  const realCreate = fs.createWriteStream;
+  const made = [];
+  const reallyClosed = new Set();
+  let holder;
+  fs.createWriteStream = (...args) => {
+    const s = realCreate.apply(fs, args);
+    made.push(s);
+    s.on('close', () => reallyClosed.add(s)); // real event, not intercepted — see below
+    holder = interceptOnceClose(s);
+    return s;
+  };
+  try {
+    const t = createActivityTrace({ enabled: true });
+    t.init(dir);
+
+    let done = false;
+    t.close(() => { done = true; });
+
+    await new Promise(r => setImmediate(r));
+    assert.equal(done, false, 'close() resolved before its own stream\'s close was released');
+    assert.equal(holder.pendingCount, 1, 'close() must register on the close event to hold in the first place');
+
+    holder.release();
+    assert.equal(done, true, 'close() must resolve once its own stream closes');
+  } finally {
+    fs.createWriteStream = realCreate;
+    // Releasing the intercepted .once('close', ...) callback settles
+    // activity-trace's own bookkeeping, but the real stream closes
+    // independently via Node's autoClose — wait for that real event too
+    // (not .fd, which can read as "not yet opened" and "already closed" the
+    // same way — undefined either way — and falsely look settled before the
+    // stream has even opened), or the rmSync below races the exact same
+    // handle-still-open condition this whole suite is about.
+    await waitUntil(() => made.every(s => reallyClosed.has(s)));
+    // Windows can still hold a just-closed file for a moment after the real
+    // close event fires (a real-time AV scan on close, e.g.) — the wait
+    // above catches the case this PR is about, this catches the OS's own
+    // documented aftermath of a close that already completed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test('setEnabled(false, ...) waits for its own stream\'s close, not just finish', async () => {
+  const dir = tmpTraceDir('disable-own');
+  const realCreate = fs.createWriteStream;
+  const made = [];
+  const reallyClosed = new Set();
+  let holder;
+  fs.createWriteStream = (...args) => {
+    const s = realCreate.apply(fs, args);
+    made.push(s);
+    s.on('close', () => reallyClosed.add(s));
+    holder = interceptOnceClose(s);
+    return s;
+  };
+  try {
+    const t = createActivityTrace({ enabled: true });
+    t.init(dir);
+
+    let done = false;
+    t.setEnabled(false, () => { done = true; });
+
+    await new Promise(r => setImmediate(r));
+    assert.equal(done, false, 'setEnabled(false, ...) resolved before its own stream\'s close was released');
+
+    holder.release();
+    assert.equal(done, true, 'setEnabled(false, ...) must resolve once its own stream closes');
+  } finally {
+    fs.createWriteStream = realCreate;
+    // See the matching comment in the close() version of this test.
+    await waitUntil(() => made.every(s => reallyClosed.has(s)));
+    // Windows can still hold a just-closed file for a moment after the real
+    // close event fires (a real-time AV scan on close, e.g.) — the wait
+    // above catches the case this PR is about, this catches the OS's own
+    // documented aftermath of a close that already completed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test('close() waits for a still-pending rotation close, not just its own stream', async () => {
+  const dir = tmpTraceDir('close-pending-rotation');
+  const realCreate = fs.createWriteStream;
+  const made = [];
+  const holders = [];
+  const reallyClosed = new Set();
+  fs.createWriteStream = (...args) => {
+    const s = realCreate.apply(fs, args);
+    made.push(s);
+    s.on('close', () => reallyClosed.add(s));
+    holders.push(interceptOnceClose(s));
+    return s;
+  };
+  try {
+    const t = createActivityTrace({ enabled: true, maxSegmentBytes: 200, maxSegments: 4 });
+    t.init(dir);
+    t.trace('fill', 's1', { pad: 'x'.repeat(300) }); // forces a rotation
+    assert.equal(made.length, 2, 'the rotation opened a second segment');
+    assert.equal(holders[0].pendingCount, 1, 'rotate() must hold on the retired stream\'s close to prune it');
+
+    let done = false;
+    t.close(() => { done = true; });
+
+    // Let close()'s own (current) stream settle for real; the retired
+    // stream's close stays withheld.
+    holders[1].release();
+    await new Promise(r => setImmediate(r));
+    assert.equal(done, false,
+      'close() must not resolve while an earlier rotation\'s stream close is still pending');
+
+    holders[0].release();
+    assert.equal(done, true, 'close() must resolve once the pending rotation close lands');
+  } finally {
+    fs.createWriteStream = realCreate;
+    // See the comment in "close() waits for its own stream's close" above.
+    await waitUntil(() => made.every(s => reallyClosed.has(s)));
+    // Windows can still hold a just-closed file for a moment after the real
+    // close event fires (a real-time AV scan on close, e.g.) — the wait
+    // above catches the case this PR is about, this catches the OS's own
+    // documented aftermath of a close that already completed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test('setEnabled(false, ...) waits for a still-pending rotation close, not just its own stream', async () => {
+  const dir = tmpTraceDir('disable-pending-rotation');
+  const realCreate = fs.createWriteStream;
+  const made = [];
+  const holders = [];
+  const reallyClosed = new Set();
+  fs.createWriteStream = (...args) => {
+    const s = realCreate.apply(fs, args);
+    made.push(s);
+    s.on('close', () => reallyClosed.add(s));
+    holders.push(interceptOnceClose(s));
+    return s;
+  };
+  try {
+    const t = createActivityTrace({ enabled: true, maxSegmentBytes: 200, maxSegments: 4 });
+    t.init(dir);
+    t.trace('fill', 's1', { pad: 'x'.repeat(300) }); // forces a rotation
+    assert.equal(made.length, 2, 'the rotation opened a second segment');
+
+    let done = false;
+    t.setEnabled(false, () => { done = true; });
+
+    holders[1].release();
+    await new Promise(r => setImmediate(r));
+    assert.equal(done, false,
+      'setEnabled(false, ...) must not resolve while an earlier rotation\'s close is still pending');
+
+    holders[0].release();
+    assert.equal(done, true, 'setEnabled(false, ...) must resolve once the pending rotation close lands');
+  } finally {
+    fs.createWriteStream = realCreate;
+    // See the comment in "close() waits for its own stream's close" above.
+    await waitUntil(() => made.every(s => reallyClosed.has(s)));
+    // Windows can still hold a just-closed file for a moment after the real
+    // close event fires (a real-time AV scan on close, e.g.) — the wait
+    // above catches the case this PR is about, this catches the OS's own
+    // documented aftermath of a close that already completed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test('close() falls back to done() if the stream never emits close', async () => {
+  const dir = tmpTraceDir('close-timeout');
+  const realCreate = fs.createWriteStream;
+  const made = [];
+  const reallyClosed = new Set();
+  fs.createWriteStream = (...args) => {
+    const s = realCreate.apply(fs, args);
+    made.push(s);
+    s.on('close', () => reallyClosed.add(s));
+    interceptOnceClose(s); // held forever — never released, on purpose
+    return s;
+  };
+  const warnings = [];
+  const onWarning = (w) => { if (w && w.code === 'SWITCHBOARD_TRACE_CLOSE_TIMEOUT') warnings.push(w); };
+  process.on('warning', onWarning);
+  try {
+    const t = createActivityTrace({ enabled: true, closeTimeoutMs: 30 });
+    t.init(dir);
+
+    let done = false;
+    t.close(() => { done = true; });
+
+    await waitUntil(() => done === true, { tries: 100, intervalMs: 10 });
+    assert.equal(done, true, 'close() must recover with a bounded fallback, not hang forever');
+    assert.equal(warnings.length, 1, 'the degraded path is recorded exactly once');
+  } finally {
+    process.removeListener('warning', onWarning);
+    fs.createWriteStream = realCreate;
+    // The intercepted close is held forever by design, but the real stream
+    // still closes on its own via autoClose — wait for that before rmSync.
+    await waitUntil(() => made.every(s => reallyClosed.has(s)));
+    // Windows can still hold a just-closed file for a moment after the real
+    // close event fires (a real-time AV scan on close, e.g.) — the wait
+    // above catches the case this PR is about, this catches the OS's own
+    // documented aftermath of a close that already completed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test('setEnabled(false, ...) falls back to done() if the stream never emits close', async () => {
+  // Mirrors the close() version above. Not redundant with it: setEnabled and
+  // close build the same guardedDone/finish shape independently (activity-trace.js),
+  // and the only production caller that ever passes a callback is the
+  // set-activity-trace-enabled IPC handler, which calls setEnabled — main.js's
+  // shutdown path calls close() with none. A fallback proven only on close()
+  // proves nothing about the path production actually uses.
+  const dir = tmpTraceDir('disable-timeout');
+  const realCreate = fs.createWriteStream;
+  const made = [];
+  const reallyClosed = new Set();
+  fs.createWriteStream = (...args) => {
+    const s = realCreate.apply(fs, args);
+    made.push(s);
+    s.on('close', () => reallyClosed.add(s));
+    interceptOnceClose(s); // held forever — never released, on purpose
+    return s;
+  };
+  const warnings = [];
+  const onWarning = (w) => { if (w && w.code === 'SWITCHBOARD_TRACE_CLOSE_TIMEOUT') warnings.push(w); };
+  process.on('warning', onWarning);
+  try {
+    const t = createActivityTrace({ enabled: true, closeTimeoutMs: 30 });
+    t.init(dir);
+
+    let done = false;
+    t.setEnabled(false, () => { done = true; });
+
+    await waitUntil(() => done === true, { tries: 100, intervalMs: 10 });
+    assert.equal(done, true, 'setEnabled(false, ...) must recover with a bounded fallback, not hang forever');
+    assert.equal(warnings.length, 1, 'the degraded path is recorded exactly once');
+  } finally {
+    process.removeListener('warning', onWarning);
+    fs.createWriteStream = realCreate;
+    // See the matching comment in the close() version of this test.
+    await waitUntil(() => made.every(s => reallyClosed.has(s)));
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
