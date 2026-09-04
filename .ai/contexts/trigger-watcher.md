@@ -213,6 +213,36 @@ content. Verified by reading the switch, not by a runtime test: once
 `reportLength` claims `R`, `applyCsi` never sees it, so nothing post-fix can
 exercise that unreachable case (see `test/composer-state.test.js`).
 
+**"The same way" is an analogy, not the safety argument — the two exemptions
+rest on different properties.** What makes `SGR_MOUSE_PARAMS_RE` safe is that
+its final bytes (`M`/`m`) only reach `reportLength` on a chunk starting with
+`CSI <`, and no keyboard on this machine's key-event handler
+(`public/terminal-manager.js`, `attachCustomKeyEventHandler`) or xterm.js's own
+`onData` emits `<` as the third byte of a CSI sequence — the prefix is
+terminal-report-only by construction, so bounding the numeric fields is
+enough. Final `R` has no such prefix to lean on: xterm.js emits bare
+`CSI n ; m R` for a *modified F3 keypress* (`xterm.js`, `case 114`:
+`ESC+"[1;"+(mod+1)+"R"`, `1;2` through `1;8` for Shift/Alt/Ctrl combinations).
+An earlier version of `CPR_PARAMS_RE` made the `?` optional (`\??`), so it
+matched that shape too — a real keystroke silently exempted from the quiet
+clock, the direction this whole guard exists to prevent, and strictly worse
+than the CPR flood it was fixing. Caught before merge by checking a keyboard
+source (xterm.js) rather than reasoning by analogy from the mouse case.
+
+The actual safety argument for `CPR_PARAMS_RE`, mandatory `?` included: DECXCPR
+(`CSI ? row ; col [; page] R`) is what this terminal answers with, and it is
+the *only* shape observed — 24,795 CPR chunks in the 2026-09-04 trace, `?`
+present in all 24,795, present in zero of the responses this codebase has ever
+seen without it. Requiring the `?` excludes exactly the modified-F3 shape
+above and nothing measured. **Residual**: this is a measurement on one
+CLI/terminal pairing, not a proof that no terminal ever answers CPR without
+`?` (plain DSR-6, `CSI row ; col R`, is a legal *bare* CPR in the DEC standard
+— just not one this xterm.js/ConPTY combination has been observed to send).
+If a future terminal or `xterm.js` config starts answering bare CPR, this
+regex will — correctly, per the "doubt resolves to busy" principle — count
+that as a keystroke rather than false-exempt it; the failure mode of being
+wrong here is a spurious wait, not a swallowed keypress.
+
 The end-to-end proof — a CPR flood no longer blocking `waitForComposerFree`'s
 free condition — lives in `test/composer-state-quiet-window.test.js`, which
 reimplements the one-line predicate against fake time rather than importing

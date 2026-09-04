@@ -158,8 +158,8 @@ function matchEscape(buf, i) {
 
 const SGR_MOUSE_PARAMS_RE = /^<\d{1,10};\d{1,10};\d{1,10}$/;
 
-// CPR / DECXCPR: `CSI [?] row ; col [; page] R` — see .ai/contexts/trigger-watcher.md.
-const CPR_PARAMS_RE = /^\??\d{1,4};\d{1,4}(?:;\d{1,4})?$/;
+// DECXCPR only, `?` mandatory: `CSI ? row ; col [; page] R` — see .ai/contexts/trigger-watcher.md.
+const CPR_PARAMS_RE = /^\?\d{1,4};\d{1,4}(?:;\d{1,4})?$/;
 
 /**
  * How many bytes of terminal report start at the sequence `seq` just matched.

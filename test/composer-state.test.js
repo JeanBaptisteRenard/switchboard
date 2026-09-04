@@ -202,6 +202,11 @@ test('composer-state: an unrecognised sequence still counts as input', () => {
     ['\x1b[1;2O',        'a modified CSI O'],
     ['\x1bOM',           'SS3 M, not CSI M'],
     ['\x1b[<0;42;13X',   'the right shape with the wrong final byte'],
+    // Empty numeric fields: the near-miss a `\d*` mutant would let through
+    // silently, since `*` accepts zero digits where `{1,10}` requires one.
+    ['\x1b[<;42;13M',   'SGR report with an empty button field'],
+    ['\x1b[<0;;13M',    'SGR report with an empty x field'],
+    ['\x1b[<0;42;M',    'SGR report with an empty y field'],
   ];
   for (const [seq, why] of cases) {
     const state = createComposerState();
@@ -241,16 +246,40 @@ test('composer-state: a typed ESC [ M is input, not a mouse report', () => {
 // real idle-session trace and, left unhandled, kept the quiet clock from ever
 // opening. See .ai/contexts/trigger-watcher.md ("Found it — CPR") for the numbers.
 
-const CPR_PLAIN = '\x1b[24;80R';       // bare CPR: no page, no `?`
 const CPR_DECX  = '\x1b[?59;3R';       // DECXCPR, as measured
 const CPR_PAGE  = '\x1b[?59;3;1R';     // DECXCPR with a page field
 
 test('composer-state: a cursor position report is neither text nor activity', () => {
-  assertInert([CPR_PLAIN]);
   assertInert([CPR_DECX]);
   assertInert([CPR_PAGE]);
   // The measured cadence: back-to-back queries as the column advances.
   assertInert(['\x1b[?59;3R', '\x1b[?59;4R', '\x1b[?59;6R', '\x1b[?59;8R']);
+});
+
+// A bare `CSI n;m R` with no `?` is not a report at all on this CLI/terminal
+// pairing: it is what xterm.js sends for a modified F3 keypress (`case 114`
+// in xterm.js, `ESC[1;<mod+1>R`). 24,795/24,795 CPR chunks measured in the
+// 2026-09-04 trace carried the `?`; zero did not — see
+// .ai/contexts/trigger-watcher.md ("Found it — CPR"). The `?` is therefore
+// mandatory in CPR_PARAMS_RE, not optional: a bare `n;m R` must count as
+// input, exactly like any other unrecognised sequence.
+test('composer-state: a bare (non-DECXCPR) CPR-shaped sequence is a keystroke, not a report', () => {
+  const bareCases = [
+    ['\x1b[24;80R', 'bare CPR: no `?`, plausible-looking but never measured'],
+    ['\x1b[1;2R',   'Shift+F3'],
+    ['\x1b[1;3R',   'Alt+F3'],
+    ['\x1b[1;4R',   'Alt+Shift+F3'],
+    ['\x1b[1;5R',   'Ctrl+F3'],
+    ['\x1b[1;6R',   'Ctrl+Shift+F3'],
+    ['\x1b[1;7R',   'Ctrl+Alt+F3'],
+    ['\x1b[1;8R',   'Ctrl+Alt+Shift+F3'],
+  ];
+  for (const [seq, why] of bareCases) {
+    const state = createComposerState();
+    noteUserInput(state, 'hi', 1000);
+    noteUserInput(state, seq, 9000);
+    assert.equal(state.lastInputAt, 9000, `${why} (${JSON.stringify(seq)}) must push the quiet clock`);
+  }
 });
 
 test('composer-state: a CPR mixing with a keystroke counts only the keystroke', () => {
@@ -286,6 +315,11 @@ test('composer-state: a near-miss CPR still counts as input', () => {
     ['\x1b[a;bR',          'non-numeric CPR parameters'],
     ['\x1b[24;80;1;R',     'a dangling separator'],
     ['\x1b[5R',            'CSI 5 R — not a position report at all'],
+    // Empty numeric fields on an otherwise well-formed DECXCPR: the near-miss
+    // a `\d*` mutant would let through silently, since `*` accepts zero
+    // digits where `{1,4}` requires one.
+    ['\x1b[?;3R',          'DECXCPR with an empty row field'],
+    ['\x1b[?59;R',         'DECXCPR with an empty column field'],
   ];
   for (const [seq, why] of cases) {
     const state = createComposerState();
