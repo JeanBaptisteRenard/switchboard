@@ -101,7 +101,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      # Full history + tags: the release notes are derived from the commit range
+      # between the previous tag and this one.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -136,3 +140,36 @@ jobs:
             if [ "$ok" != 1 ]; then echo "::error::failed to upload $(basename "$f") after retries"; rc=1; fi
           done
           exit $rc
+
+      # v0.0.63 to v0.0.65 all shipped with an empty body: the step above creates
+      # the draft with --notes "" and nothing ever filled it in. Derive the body
+      # from the tag range instead, and fail loudly rather than write an empty one.
+      - name: Fill in release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # The tag that precedes this one on this tag's own history, not the
+          # repository's newest tag.
+          PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          if [ -n "$PREV_TAG" ]; then RANGE="${PREV_TAG}..${TAG}"; else RANGE="$TAG"; fi
+          # main is a chain of PR squash-merges, one subject per PR. The version
+          # bump commit ("v0.0.65 (#189)") is release plumbing, not a change.
+          git log --no-merges --format='%s' "$RANGE" \
+            | grep -Ev '^v[0-9]+\.[0-9]+\.[0-9]+([^0-9].*)?$' > subjects.txt || true
+          if [ ! -s subjects.txt ]; then
+            echo "::error::no release-worthy commits in ${RANGE}; refusing to write an empty release body"
+            exit 1
+          fi
+          {
+            echo "## What's changed"
+            echo
+            sed 's/^/- /' subjects.txt
+            if [ -n "$PREV_TAG" ]; then
+              echo
+              echo "**Full changelog**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${TAG}"
+            fi
+          } > release-notes.md
+          # Stays a draft: edit only replaces the body.
+          gh release edit "$TAG" --notes-file release-notes.md
