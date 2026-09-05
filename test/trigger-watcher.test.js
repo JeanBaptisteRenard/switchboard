@@ -2366,6 +2366,135 @@ test('submitted: a chain reports the weakest of its steps, and a blocked later s
   }
 });
 
+// ── Per-step `submitted` ──────────────────────────────────────────────────
+//
+// See .ai/contexts/trigger-watcher.md, "submitted" -- the transport-level
+// contract this section proves: every steps[] entry now carries its own
+// `submitted`, classified from the same submitWithVerify() result the
+// top-level fold already uses, and the top-level field keeps meaning exactly
+// what it meant before this section existed (the weakest of the chain).
+
+test('chain per-step submitted: a confirmed step and a non-confirmed step in the same chain each keep their own value', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-perstep-mixed-' + Date.now();
+    // noAutoTurn: full manual control over busy, so step 0 can be driven to
+    // "confirmed" and step 1 (the final step) can be driven to "assumed"
+    // without one contaminating the other's verify window.
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    let busy = false;
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      writeCount++;
+      // writeCount 2 is step 0's own discrete Enter: rise quickly, fall in
+      // time for the settle window, so step 0's verify observes exactly one
+      // clean busy-rise on its first attempt (-> composerConfirmed).
+      if (writeCount === 2) {
+        setTimeout(() => { busy = true; }, 20);
+        setTimeout(() => { busy = false; }, 120);
+      }
+      // Step 1 (writeCount 4 = its own Enter, and 5 = its verify-retry Enter):
+      // busy never rises -- deliberately -- so this step can only reach
+      // "assumed", the case the top-level fold must expose as the chain's
+      // weakest even though step 0 was genuinely confirmed.
+    };
+    ctx.isSessionBusy = (id) => (id === SESSION_ID ? busy : false);
+
+    watcher = start(ctx);
+
+    const uuid = 'perstep-mixed-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume and finish' }],
+      timeout_ms: 3000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps.length, 2);
+
+    assert.equal(result.steps[0].submitted, 'confirmed',
+      'step 0: idle before the write, read back clean, and a turn observed on the first attempt');
+    assert.equal(result.steps[1].submitted, 'assumed',
+      'step 1: written, no failure, but busy never observed even after the verify-retry');
+
+    // The one thing an aggregate-only reader could see, and the reason this
+    // section exists: it cannot tell "everything was weak" apart from "the
+    // last step alone was weak". Both fold to the same top-level value.
+    assert.equal(result.submitted, 'assumed',
+      'top-level field is unchanged: still the weakest of the chain (weakestSubmitted), ' +
+      'never the per-step detail that steps[] now exposes');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('chain per-step submitted: a step refused before writing (composer never free) is recorded as "no", not omitted', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '4000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-perstep-refused-' + Date.now();
+    const ctx       = makeChainCtx(SESSION_ID);
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      // Step 0 lands; the user then starts typing, so step 1 must never leave
+      // the trigger-watcher and never reach submitWithVerify at all.
+      if (ctx._written.length === 2) ctx._composer.pending = 7;
+    };
+    watcher = start(ctx);
+
+    const uuid = 'perstep-refused-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume and finish' }],
+      timeout_ms: 1500,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 8000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.deepEqual(ctx._written, ['/compact', '\r'], 'step 1 must not reach the PTY');
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'chain timeout');
+
+    assert.equal(result.steps.length, 2,
+      'the refused step must still get a steps[] entry -- it is not silently absent');
+    assert.equal(result.steps[1].idx, 1);
+    assert.equal(result.steps[1].command, 'resume and finish');
+    assert.equal(result.steps[1].submit_retries, 0, 'nothing was ever attempted for this step');
+    assert.equal(result.steps[1].submitted, 'no',
+      'refused before submitToPty was ever called: nothing was written, so this can only be "no"');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
 test('wait: an unrecognised value is refused loudly, before any write', async () => {
   const tmp = mkTmp();
   let watcher;

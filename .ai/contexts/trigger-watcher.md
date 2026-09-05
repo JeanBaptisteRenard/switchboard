@@ -435,7 +435,16 @@ discarding a whole DCS sequence), not a `reportLength` addition — a
 different, larger piece of work than this PR's scope.
 
 **`submitted`.** Every result carries it, compared by strict equality, in this
-order (`no` < `assumed` < `activity` < `confirmed`):
+total order — `SUBMITTED_RANK` in `trigger-watcher.js`, exported for any
+caller that needs to fold or compare values itself rather than duplicate the
+ranking:
+
+| Rank | Value | `SUBMITTED_RANK` |
+|---|---|---|
+| weakest | `no` | 0 |
+| | `assumed` | 1 |
+| | `activity` | 2 |
+| strongest | `confirmed` | 3 |
 
 - `no` — nothing was written, or it was written and never submitted.
 - `assumed` — written, no failure seen, nothing observed afterward.
@@ -447,8 +456,56 @@ order (`no` < `assumed` < `activity` < `confirmed`):
   independently observed in the same verify window. All three, checked on the
   first attempt only — a retry never yields `confirmed`.
 
+`weakestSubmitted(a, b)` returns whichever of `a`/`b` has the lower
+`SUBMITTED_RANK` (`<=`, so it is stable when both sides tie). Anyone adding a
+fifth value must give it a rank in this same table before touching the
+constant — every fold in this file (`chainSubmitted`, the per-step
+classification below) goes through `SUBMITTED_RANK`, not through hand-written
+`if`/`else` on the string values, specifically so this table is the one place
+that has to change.
+
 A chain reports the **weakest** of its steps (`weakestSubmitted`), because the
-field exists to stop a transport overstating what it saw.
+field exists to stop a transport overstating what it saw. This is the
+top-level field's whole job, unchanged by the per-step field below: it existed
+first, a production consumer (the harness) already reads it, and nothing here
+alters what it means or how it is computed — only what else is now available
+alongside it.
+
+### Per-step `submitted` (2026-09-05)
+
+Every entry in a chain result's `steps[]` now carries its own `submitted`,
+classified by `classifySubmitted(composerConfirmed, sawBusy)` — the same
+function `chainSubmitted`'s fold uses, so a step's own field and its
+contribution to the chain-level fold can never read the classification
+differently. **The motivating gap**: a chain whose last step is the one that
+matters (a `/compact` → resume chain, where the resume prompt is the payload
+a caller actually needs delivered) reports only the chain's weakest value at
+the top level. A caller asking "was the *last* step confirmed?" could not
+previously distinguish "the last step was weak" from "an earlier step was
+weak and the last one was fine" — both fold to the same top-level value. See
+`test/trigger-watcher.test.js`, "chain per-step submitted: a confirmed step
+and a non-confirmed step in the same chain each keep their own value", for
+the case this closes: step 0 genuinely `confirmed`, step 1 only `assumed`,
+top level (correctly, unchanged) `assumed` — invisible at the top level, and
+now explicit in `steps[1].submitted`.
+
+**A step refused before it ever reached `submitToPty`** — today, that means a
+composer that never frees within the step's own deadline — still gets a
+`steps[]` entry, with `submitted: "no"` and `submit_retries: 0`: nothing was
+written, so no other value would be honest. This is a **narrowing**, not a new
+category: before this, such a step had no `steps[]` entry at all (see
+`docs/automation.md`, "`waited_ms` / `total_waited_ms`" for the exception list
+this moves one item out of). Two related refusal shapes inside the same loop
+— the session having exited, and the global deadline firing — are deliberately
+**not** given a `steps[]` entry: both are checked before `stepSentAt` is even
+assigned for that step (`trigger-watcher.js`, top of the chain loop body), so
+there is no per-step wait or per-step anything yet to attribute; adding an
+entry there would mean inventing a `sent_at`/`waited_ms` for a step the code
+never actually started working on, which is a different, larger claim than
+"this step was refused a write." Not extended to the single-`command` path's
+own analogous refusals (target guard, composer never free, session not found)
+either — that path has no `steps[]` to begin with; its own `submitted: "no"`
+at the top level already says exactly this.
 
 ### Why the top value used to be `activity`, and no longer is
 

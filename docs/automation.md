@@ -87,10 +87,17 @@ carries `waited_ms` for the whole trigger; a `chain` result carries
   busy-fall wait. `steps[i].waited_ms` is the same sum scoped to step `i`
   alone, so `total_waited_ms` equals the initial wait plus the sum of every
   entry in `steps[]`, **except** when the last attempted step is abandoned
-  before it ever writes anything (composer never free, the session exits, or
-  the global deadline fires): that step's partial wait still counts toward
-  `total_waited_ms`, but it has no entry in `steps[]` to be attributed to,
-  since `steps[]` only lists steps that actually reached a write.
+  before it ever writes anything because the session exits or the global
+  deadline fires: that step's partial wait still counts toward
+  `total_waited_ms`, but it has no entry in `steps[]` to be attributed to. A
+  step refused for a composer that never frees is **not** this exception
+  (narrowed 2026-09-05, was previously grouped with the other two): it now
+  gets its own `steps[]` entry too — `submitted: "no"`, `submit_retries: 0` —
+  so its politeness wait is attributed exactly like a step that did write.
+  The remaining exception (session exit, global deadline, both checked before
+  a step's own politeness wait even starts) was left alone: unlike the
+  composer case, neither has a `stepSentAt`-scoped wait of its own worth
+  attributing to a step that was never even reached.
 
 A measured gap of roughly 158 s between `total_waited_ms` and the sum of
 `steps[*].waited_ms` on 2026-09-03 was this: each step's own politeness wait
@@ -268,7 +275,17 @@ in this order (`no` < `assumed` < `activity` < `confirmed`):
 | `assumed` | written, no failure seen, nothing observed afterwards |
 | `no` | nothing was written, or it was written and not submitted |
 
-A `chain` reports the **weakest** value any of its steps reached.
+A `chain` reports the **weakest** value any of its steps reached — this is the
+field's meaning unchanged from before per-step values existed, kept for
+compatibility with readers written against it. Since 2026-09-05, every entry
+in `steps[]` also carries its own `submitted`, classified the same way and
+compared on the same four-value order. Read it when you need to know whether
+one specific step — most often the *last* one, e.g. a resume prompt at the end
+of a `/compact` chain — was itself confirmed, rather than whether the chain as
+a whole cleared some bar: a chain reporting `"assumed"` overall says nothing
+about which step dragged it down; `steps[i].submitted` does. A step refused
+before it ever reached a write (composer never free) still gets an entry, with
+`submitted: "no"` — see the `steps[]` exception below, narrowed the same day.
 
 **What `activity` refuses to claim, and what a bare composer reading cannot
 prove on its own.** Busy is sampled, not compared against a baseline taken
