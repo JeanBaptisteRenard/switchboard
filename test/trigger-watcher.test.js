@@ -5223,3 +5223,300 @@ test('startup scan respects MAX_INFLIGHT: only 8 of 12 pre-existing triggers sta
     cleanup(tmp);
   }
 });
+
+// ── waitForBusyFall waits for the rise too (2026-09-05) ───────────────────────
+//
+// Field incident: a `/compact` chain step whose compaction genuinely ran for
+// 137s had its next chain step written ~260ms after the compaction started --
+// `waitForBusyFall` never confirmed a rise, it only ever watched for a fall,
+// so `isSessionBusy()` still reading false (the compaction hadn't yet flipped
+// the flag) for one settle window was read as "the previous turn is already
+// over". See .ai/contexts/trigger-watcher.md, "waitForBusyFall waits for the
+// rise too".
+//
+// This suite's SWITCHBOARD_SUBMIT_VERIFY_MS override (400ms, top of file)
+// governs both submitWithVerify's own busy-observe window AND, by default,
+// getBusyRiseWaitMs() (which falls back to it) -- so a schedule where busy
+// stays false for longer than 2x that window (800ms: initial attempt + one
+// Enter retry, both inside submitWithVerify) reliably exhausts Phase 1
+// without a rise, exactly like the field incident's timing shape.
+
+test('waitForBusyFall waits for the rise: a busy flag that lags a genuine multi-second turn must not be read as "already over"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '8000';
+    // Generous, explicit rise-wait bound so the rise (at RISE_AT below) has
+    // ample margin on both sides of the window it must be caught in --
+    // avoids coupling this test's reliability to submitWithVerify's own
+    // (suite-wide, 400ms) verify-window timing.
+    process.env.SWITCHBOARD_BUSY_RISE_WAIT_MS       = '1000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-busyfall-late-rise-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+
+    // Busy stays false for 1300ms after step 0 is written -- long enough that
+    // submitWithVerify's own two ~400ms windows (initial + Enter-retry, ~800ms
+    // total) both elapse without ever seeing it, so waitForBusyFall itself
+    // must catch the rise -- then genuinely busy for 2400ms (the "137 second
+    // compaction", compressed for test speed), then false for good. The
+    // pre-fix `waitForBusyFall` only watches for a fall and starts with
+    // idleSince=null, so it settles on the initial false run (by ~850ms) and
+    // declares the turn over before the real busy period (1300-3700ms) ever
+    // begins.
+    let scheduleStart = null;
+    const RISE_AT = 1300;
+    const FALL_AT = 3700;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      if (scheduleStart === null) scheduleStart = Date.now();
+    };
+    ctx.isSessionBusy = (id) => {
+      if (id !== SESSION_ID || scheduleStart === null) return false;
+      const t = Date.now() - scheduleStart;
+      return t >= RISE_AT && t < FALL_AT;
+    };
+
+    watcher = start(ctx);
+
+    const uuid = 'busyfall-late-rise-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume the task' }],
+      timeout_ms: 7000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 7500);
+
+    // Step 1's text must never land on the PTY before the genuine busy period
+    // for step 0 even begins -- the exact shape of the field incident (step 1
+    // written while step 0's real turn was still to come, or already under
+    // way).
+    const step1WriteAt = ctx._written.findIndex((d) => d === 'resume the task');
+    assert.notEqual(step1WriteAt, -1, 'step 1 must eventually be written');
+    // ctx._written has no timestamps; re-derive by re-running isSessionBusy's
+    // clock is not meaningful post hoc, so assert on the outcome instead: a
+    // correct implementation only writes step 1 once busy has fallen for
+    // good, i.e. at/after FALL_AT plus the settle window -- well past RISE_AT.
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true, 'the chain should still complete once the real turn is honoured');
+    assert.ok(result.steps[0].waited_ms >= (FALL_AT - RISE_AT),
+      `step 0's own wait must span the genuine busy period (>= ${FALL_AT - RISE_AT}ms); ` +
+      `got ${result.steps[0].waited_ms}ms -- a smaller value means the previous turn's rise was never awaited`);
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    delete process.env.SWITCHBOARD_BUSY_RISE_WAIT_MS;
+    cleanup(tmp);
+  }
+});
+
+// Mutation to confirm this test is load-bearing: delete the `hasRisen`
+// tracking in `waitForBusyFall` (revert to the pre-fix body) -- step 0's
+// waited_ms drops to ~settleMs (tens of ms), the assertion above fails red.
+
+test('waitForBusyFall rise-wait bound: a command with no observable turn is not an error, just "never observed"', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '8000';
+    // Keep the bound short and explicit for this test rather than relying on
+    // the suite-wide SWITCHBOARD_SUBMIT_VERIFY_MS default.
+    process.env.SWITCHBOARD_BUSY_RISE_WAIT_MS       = '150';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-busyfall-never-rises-' + Date.now();
+    // Busy never rises, for either step, ever -- a legitimate case (a step
+    // whose command produces nothing this transport can observe).
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    ctx.isSessionBusy = () => false;
+
+    watcher = start(ctx);
+
+    const uuid = 'busyfall-never-rises-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume the task' }],
+      timeout_ms: 5000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6000);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true,
+      'a rise that never comes within the bound must not fail the chain -- the command may legitimately produce nothing observable');
+    assert.equal(result.steps.length, 2);
+    assert.deepEqual(ctx._written, ['/compact', '\r', '\r', 'resume the task', '\r', '\r'],
+      'both steps reach the PTY, each with its own verify-retry Enter');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    delete process.env.SWITCHBOARD_BUSY_RISE_WAIT_MS;
+    cleanup(tmp);
+  }
+});
+
+// Mutation to confirm this test is load-bearing: delete the
+// `else if (now >= riseDeadline) { return resolve(...) }` branch in
+// `waitForBusyFall` -- with busy never rising, the poll loop then runs until
+// the step's own deadlineMs (5000ms `timeout_ms` here), and the chain fails
+// with `chain timeout` instead of `ok:true`; this test goes red.
+
+test('waitForBusyFall regression: a session already busy when the call begins must still wait for the eventual fall', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '8000';
+    // A short, explicit bound: if the rise-wait bound (rather than the
+    // already-busy fast path) governed this session, step 1 would land at
+    // ~200ms -- well before the genuine fall at ~800ms -- and the assertion
+    // below would catch it.
+    process.env.SWITCHBOARD_BUSY_RISE_WAIT_MS       = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-busyfall-already-busy-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+
+    // Busy is true from the moment step 0's Enter lands (submitWithVerify
+    // observes it immediately, sawBusy:true, no retry) and stays true for
+    // 800ms -- comfortably past the 200ms rise-wait bound above -- before
+    // falling for good.
+    let scheduleStart = null;
+    const FALL_AT = 800;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      if (data === '\r' && scheduleStart === null) scheduleStart = Date.now();
+    };
+    ctx.isSessionBusy = (id) => {
+      if (id !== SESSION_ID || scheduleStart === null) return false;
+      return (Date.now() - scheduleStart) < FALL_AT;
+    };
+
+    watcher = start(ctx);
+
+    const uuid = 'busyfall-already-busy-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume the task' }],
+      timeout_ms: 6000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 6500);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    assert.equal(result.steps[0].submit_retries, 0, 'precondition: step 0 was observed rising on the first poll');
+    assert.ok(result.steps[0].waited_ms >= FALL_AT - 50,
+      `step 0's wait must span the genuine busy period (>= ~${FALL_AT}ms), not just the ${process.env.SWITCHBOARD_BUSY_RISE_WAIT_MS}ms rise-wait bound; got ${result.steps[0].waited_ms}ms`);
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    delete process.env.SWITCHBOARD_BUSY_RISE_WAIT_MS;
+    cleanup(tmp);
+  }
+});
+
+// Mutation to confirm this test is load-bearing: change the `hasRisen = true`
+// assignment inside `if (ctx.isSessionBusy(sessionId))` to only fire when
+// `hasRisen` was already true (i.e. `if (ctx.isSessionBusy(sessionId) &&
+// hasRisen)`) -- a session busy from the very first tick can then never
+// bootstrap `hasRisen`, so once the 200ms rise-wait bound elapses (still
+// mid-turn), `waitForBusyFall` wrongly resolves "done" at ~200ms instead of
+// waiting for the real fall at ~800ms; this test goes red.
+
+test('waitForBusyFall settle window still applies once a rise is observed (unchanged by the rise-wait bound)', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '8000';
+    process.env.SWITCHBOARD_BUSY_FALL_SETTLE_MS     = '300';
+    process.env.SWITCHBOARD_BUSY_RISE_WAIT_MS       = '2000'; // generous -- not what's under test here
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-busyfall-settle-after-rise-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+
+    // Busy rises quickly (well inside the rise-wait bound), then oscillates
+    // true/false with no gap ever reaching the 300ms settle window, then
+    // falls for good. If the settle invariant (idleSince reset on every
+    // re-assertion) still holds after the rise-wait change, this can only
+    // resolve on the FINAL, sustained fall -- never on one of the oscillation
+    // gaps.
+    let scheduleStart = null;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function (data) {
+      origWrite(data);
+      if (scheduleStart === null) scheduleStart = Date.now();
+    };
+    // [0,50) false (pre-rise), [50,250) busy, [250,400) false (150ms gap,
+    // under the 300ms settle), [400,600) busy, then false for good from 600.
+    ctx.isSessionBusy = (id) => {
+      if (id !== SESSION_ID || scheduleStart === null) return false;
+      const t = Date.now() - scheduleStart;
+      if (t < 50) return false;
+      if (t < 250) return true;
+      if (t < 400) return false;
+      if (t < 600) return true;
+      return false;
+    };
+
+    watcher = start(ctx);
+
+    const uuid = 'busyfall-settle-after-rise-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [{ command: '/compact' }, { command: 'resume the task' }],
+      timeout_ms: 4000,
+    });
+
+    const resultPath = path.join(tmp, 'processed', uuid + '.result.json');
+    await waitForFile(resultPath, 4500);
+
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+    assert.equal(result.ok, true);
+    // Correct behavior resolves only after the FINAL fall at 600ms plus a
+    // full 300ms settle (~900ms total, submit-verify included). A settle
+    // window that fails to reset idleSince on the 400ms re-assertion instead
+    // reaches 300ms of (wrongly accumulated) idle at ~600ms -- ~300ms early.
+    // The 850ms floor sits strictly between the two so it catches that
+    // regression without being tight enough to flake on scheduling jitter.
+    assert.ok(result.steps[0].waited_ms >= 850,
+      `step 0 must resolve on the final sustained fall (~900ms), not the 150ms oscillation gap; got waited_ms=${result.steps[0].waited_ms}`);
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    delete process.env.SWITCHBOARD_BUSY_FALL_SETTLE_MS;
+    delete process.env.SWITCHBOARD_BUSY_RISE_WAIT_MS;
+    cleanup(tmp);
+  }
+});
+
+// Mutation to confirm this test is load-bearing: remove the `idleSince =
+// null;` reset in the `if (ctx.isSessionBusy(sessionId)) { hasRisen = true;
+// idleSince = null; }` branch of `waitForBusyFall` -- idleSince then stays
+// set from the FIRST false sample at t=250 and never resets on the
+// re-assertion at t=400, so by t=550 (250+300ms settle) the function
+// wrongly resolves on the 150ms gap instead of the real fall; this test goes
+// red.

@@ -299,6 +299,12 @@ function getBusyFallSettleMs() {
   return v !== undefined ? v : DEFAULT_BUSY_FALL_SETTLE_MS;
 }
 
+// see .ai/contexts/trigger-watcher.md, "waitForBusyFall waits for the rise too"
+function getBusyRiseWaitMs() {
+  const v = envNumber('SWITCHBOARD_BUSY_RISE_WAIT_MS');
+  return v !== undefined ? v : getSubmitVerifyMs();
+}
+
 /**
  * Poll ctx.isSessionBusy(sessionId) for busy=true up to `windowMs`, bounded
  * by the absolute `deadlineMs`. Stops early if the PTY disappears.
@@ -443,27 +449,28 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
 }
 
 /**
- * Wait only for the busy FALLING edge (busy → false), i.e. the turn finishing.
- * Used after submitWithVerify has already observed (or assumed) the turn.
+ * Wait for the busy RISING edge, then the FALLING edge (busy → true → false):
+ * the turn actually starting, then finishing. Used after submitWithVerify has
+ * already tried (and possibly failed) to observe the turn starting.
  *
- * The deadline check runs BEFORE the settle check, deliberately: a settle
- * window in progress when `deadlineMs` arrives resolves as `timedOut`, never
- * as success, even if the turn it was waiting on had genuinely already
- * finished. A turn ending with less than `settleMs` of margin before its own
- * `timeout_ms` now fails where the old single-sample check would have
- * succeeded. Documented trade-off (2026-09-04), not a bug: making the settle
- * window additive to the deadline would silently change what `timeout_ms`
- * means for every caller, including ones already calibrated against the old
- * behavior; see .ai/contexts/trigger-watcher.md ("submitted") for the caller
- * this was weighed against. Proven in `test/trigger-watcher.test.js`, "a turn
- * finishing with too little margin before its own deadline now times out".
+ * Checks run in priority order — deadline, rise-wait bound, settle window — so
+ * a wait in progress when `deadlineMs` arrives resolves as `timedOut`, never
+ * as success. A rise that never arrives within `getBusyRiseWaitMs()` is not an
+ * error but a turn never observed; a session already busy on the first tick
+ * satisfies the rise immediately.
+ *
+ * see .ai/contexts/trigger-watcher.md, "waitForBusyFall waits for the rise too"
  *
  * Returns { timedOut, sessionExited, waited_ms }.
  */
 function waitForBusyFall(sessionId, ctx, deadlineMs) {
   const start = Date.now();
   const settleMs = getBusyFallSettleMs();
-  // Set the instant busy first reads false; reset to null on every re-assertion.
+  const riseDeadline = start + getBusyRiseWaitMs();
+  // Until busy has read true once, a run of `false` proves nothing.
+  let hasRisen = false;
+  // Set the instant busy first reads false (after having risen); reset to
+  // null on every re-assertion.
   let idleSince = null;
 
   return pollLoop((resolve, scheduleNext) => {
@@ -474,13 +481,17 @@ function waitForBusyFall(sessionId, ctx, deadlineMs) {
     if (!ctx.getPtyForSession(sessionId)) {
       return resolve({ timedOut: false, sessionExited: true, waited_ms: now - start });
     }
-    if (!ctx.isSessionBusy(sessionId)) {
+    if (ctx.isSessionBusy(sessionId)) {
+      hasRisen = true;
+      idleSince = null;
+    } else if (hasRisen) {
       if (idleSince === null) idleSince = now;
       if (now - idleSince >= settleMs) {
         return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
       }
-    } else {
-      idleSince = null;
+    } else if (now >= riseDeadline) {
+      // Never rose within the bound: turn never observed, not an error.
+      return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
     }
     scheduleNext();
   });
