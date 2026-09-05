@@ -693,6 +693,95 @@ typed" and "typed, not submitted" produce the identical transcript (nothing),
 so transcript absence cannot distinguish them and was never a valid basis for
 either hypothesis.
 
+### `waitForBusyFall` waits for the rise too (2026-09-05)
+
+The settle window above (`SWITCHBOARD_BUSY_FALL_SETTLE_MS`) closed the gap
+where a `false` sample right after a real fall could be a tail-activity
+flicker rather than the genuine end of a turn. It did not close a distinct,
+earlier gap: `waitForBusyFall` started with `idleSince = null` and no memory
+of ever having seen `busy = true` at all. If `ctx.isSessionBusy()` was still
+`false` at the moment `waitForBusyFall` began polling — because
+`submitWithVerify`'s own busy-observe window (and its one Enter retry, up to
+`2 x SWITCHBOARD_SUBMIT_VERIFY_MS` together) had already elapsed without the
+CLI's busy flag flipping — a single settle window of continuous `false` was
+enough to declare "the previous turn is over", when it had never started.
+The next chain step then got written into a session that was mid-turn or
+about to become one.
+
+**Field incident**: a `/compact` chain step whose `compactMetadata` recorded
+137s of real compaction work had its next chain step written ~260ms after
+compaction started — nowhere near enough time for that work to have finished,
+because it never had to: the busy flag simply hadn't flipped true yet when
+`waitForBusyFall`'s settle window elapsed. A second, independently-observed
+instance (0.0.64) showed the same shape from the other side: `/compact`'s own
+step recorded `waited_ms: 91450` (a genuine 91s turn, correctly awaited), but
+the very next step recorded `submit_retries: 1` and its Enter — including the
+retry's own bare `\r` — was absorbed as a newline rather than a submit; a
+human found the composer holding the text plus two newlines, unsubmitted,
+~3h40 later. Both incidents are consistent with the same root cause:
+`waitForBusyFall` treating "busy has not yet been observed for this turn" as
+indistinguishable from "the turn already ended".
+
+**Fix**: `waitForBusyFall` now tracks `hasRisen`, set the first time
+`ctx.isSessionBusy()` reads `true` since the call began. The settle-based
+fall detection (unchanged) only runs once `hasRisen` is true. Before that, a
+new bound — `getBusyRiseWaitMs()`, `SWITCHBOARD_BUSY_RISE_WAIT_MS`, defaulting
+to `getSubmitVerifyMs()` (itself `SWITCHBOARD_SUBMIT_VERIFY_MS` /
+`BUSY_OBSERVE_TIMEOUT_MS`, 2000ms) — governs how long to wait for a rise
+before giving up. A session already busy when `waitForBusyFall` is called
+satisfies the rise on the very first tick, so that path (the overwhelming
+majority of chain steps, whose auto-turn rises within tens of ms) is
+unchanged.
+
+**Why the bound reuses `getSubmitVerifyMs()` rather than a new number**:
+`submitWithVerify` already spends up to two of these windows (initial attempt
++ one Enter retry) looking for the exact same signal — busy flipping true
+after a write — before giving up and letting the chain proceed regardless.
+Extending the same, already-calibrated tolerance by one more window-length,
+once, before `waitForBusyFall` gives up in turn, is the smallest change
+consistent with what the code already asserts about how long this signal can
+legitimately take to appear. No field measurement pins down exactly how long
+a `/compact`'s busy flag can lag its own start, so this is a reasoned choice,
+not a measured one — kept independently configurable
+(`SWITCHBOARD_BUSY_RISE_WAIT_MS`) for a caller that needs the two windows to
+diverge, read live at call time like every other threshold in this file, not
+captured at import.
+
+**Not an error**: a rise that never arrives within the bound resolves exactly
+as `waitForBusyFall` always has when a turn is never observed — success, "turn
+never observed", not `timedOut` and not `chain timeout`. A step's command can
+legitimately produce nothing this transport can see (see the existing
+"instant-reply" path in `submitWithVerify`); the bound exists so a genuinely
+silent step does not hang the chain until its own `timeout_ms`, not to turn
+silence into a failure.
+
+**Interaction with `deadlineMs`, unchanged**: the deadline check still runs
+first in `waitForBusyFall`'s poll loop, strictly before both the rise-wait
+bound and the settle check — the same priority order documented above for the
+settle window alone. The rise-wait bound therefore cannot itself convert a
+step that previously succeeded into a `chain timeout` by outliving the
+deadline check; a step whose deadline arrives while still waiting for a rise
+times out exactly as it would have waiting for a fall. It *can*, in principle,
+make a step that used to resolve near-instantly (the old "never rose, settle
+straight away" path) now cost up to the rise-wait bound before resolving —
+a real, if small (default: at most one `SWITCHBOARD_SUBMIT_VERIFY_MS` window),
+cost increase for that specific case, worth knowing if a caller's per-step
+`timeout_ms` was calibrated tightly against the old, faster "never observed"
+latency.
+
+Proven in `test/trigger-watcher.test.js`: `waitForBusyFall waits for the
+rise: a busy flag that lags a genuine multi-second turn must not be read as
+"already over"` (the field incident's shape, confirmed red against the
+pre-fix code before the fix landed); `waitForBusyFall rise-wait bound: a
+command with no observable turn is not an error, just "never observed"`
+(the bound is not a failure mode); `waitForBusyFall regression: a session
+already busy when the call begins must still wait for the eventual fall`
+(the already-busy fast path is unchanged); and `waitForBusyFall settle window
+still applies once a rise is observed (unchanged by the rise-wait bound)`
+(the pre-existing settle/`idleSince` invariant still holds once `hasRisen`
+is true). The two pre-existing settle-window spec tests above — including
+the documented deadline-vs-settle trade-off — remain green unmodified.
+
 ### Why `composerEmptyAfterWrite` cannot be made to prove submission, even by feeding it our own writes
 
 A proposal, considered and rejected 2026-09-04: since `submitToPty` writes

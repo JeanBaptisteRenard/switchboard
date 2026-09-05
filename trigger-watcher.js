@@ -299,6 +299,23 @@ function getBusyFallSettleMs() {
   return v !== undefined ? v : DEFAULT_BUSY_FALL_SETTLE_MS;
 }
 
+// Bound (ms) `waitForBusyFall` will wait for busy to RISE before concluding a
+// turn already ended without ever having been observed. Without this bound,
+// a step whose command produces nothing observable (a legitimate case) would
+// hang `waitForBusyFall` until the caller's own deadlineMs, turning silent
+// commands into chain timeouts. See .ai/contexts/trigger-watcher.md,
+// "waitForBusyFall waits for the rise too" for the incident this closes.
+// No new default is invented: this reuses getSubmitVerifyMs() (itself
+// SWITCHBOARD_SUBMIT_VERIFY_MS / BUSY_OBSERVE_TIMEOUT_MS), the window already
+// calibrated and already spent, twice over (initial attempt + Enter retry),
+// by submitWithVerify looking for the exact same signal. Independently
+// configurable via SWITCHBOARD_BUSY_RISE_WAIT_MS for a caller that needs the
+// two windows to diverge.
+function getBusyRiseWaitMs() {
+  const v = envNumber('SWITCHBOARD_BUSY_RISE_WAIT_MS');
+  return v !== undefined ? v : getSubmitVerifyMs();
+}
+
 /**
  * Poll ctx.isSessionBusy(sessionId) for busy=true up to `windowMs`, bounded
  * by the absolute `deadlineMs`. Stops early if the PTY disappears.
@@ -443,27 +460,58 @@ async function submitWithVerify(ptyProcess, sessionId, command, ctx, deadlineMs)
 }
 
 /**
- * Wait only for the busy FALLING edge (busy → false), i.e. the turn finishing.
- * Used after submitWithVerify has already observed (or assumed) the turn.
+ * Wait for the busy RISING edge, then the FALLING edge (busy → true → false),
+ * i.e. the turn actually starting and then finishing. Used after
+ * submitWithVerify has already tried (and possibly failed) to observe the
+ * turn starting.
  *
- * The deadline check runs BEFORE the settle check, deliberately: a settle
- * window in progress when `deadlineMs` arrives resolves as `timedOut`, never
- * as success, even if the turn it was waiting on had genuinely already
- * finished. A turn ending with less than `settleMs` of margin before its own
- * `timeout_ms` now fails where the old single-sample check would have
- * succeeded. Documented trade-off (2026-09-04), not a bug: making the settle
- * window additive to the deadline would silently change what `timeout_ms`
- * means for every caller, including ones already calibrated against the old
- * behavior; see .ai/contexts/trigger-watcher.md ("submitted") for the caller
- * this was weighed against. Proven in `test/trigger-watcher.test.js`, "a turn
- * finishing with too little margin before its own deadline now times out".
+ * Waiting for the rise first is not optional: `ctx.isSessionBusy()` can still
+ * read false the instant this is called — submitWithVerify's own busy-observe
+ * window (and its one Enter retry) can both elapse before the CLI's busy flag
+ * actually flips, e.g. a `/compact` whose visible compaction work starts well
+ * after the command is submitted. Without waiting for a rise first, a plain
+ * false-settle check cannot tell "the turn already ended" apart from "the
+ * turn has not started yet" — both read as a continuous run of `false` — and
+ * concludes the previous turn is over before it began, so the caller writes
+ * the next chain step into a session that is mid-turn or about to become so.
+ * See .ai/contexts/trigger-watcher.md, "waitForBusyFall waits for the rise
+ * too" for the field incident this closes (a /compact chain step written
+ * ~260ms after the compaction it was supposed to wait out).
+ *
+ * A rise that never comes within `getBusyRiseWaitMs()` is NOT an error — a
+ * step's command can legitimately produce nothing observable — so once that
+ * bound elapses without ever seeing busy=true, this resolves exactly as it
+ * did before this rise-wait existed (turn treated as already over). A
+ * session already busy when this is called satisfies the rise on the very
+ * first tick, so that path is unchanged.
+ *
+ * The deadline check runs BEFORE both the rise-wait bound and the settle
+ * check, deliberately: a wait in progress when `deadlineMs` arrives resolves
+ * as `timedOut`, never as success, even if the turn it was waiting on had
+ * genuinely already finished. A turn ending with less than `settleMs` of
+ * margin before its own `timeout_ms` now fails where the old single-sample
+ * check would have succeeded. Documented trade-off (2026-09-04), not a bug:
+ * making the settle window additive to the deadline would silently change
+ * what `timeout_ms` means for every caller, including ones already
+ * calibrated against the old behavior; see .ai/contexts/trigger-watcher.md
+ * ("submitted") for the caller this was weighed against. Proven in
+ * `test/trigger-watcher.test.js`, "a turn finishing with too little margin
+ * before its own deadline now times out". The rise-wait bound does not
+ * change this priority order — it is checked strictly after the deadline,
+ * same as the settle window it precedes.
  *
  * Returns { timedOut, sessionExited, waited_ms }.
  */
 function waitForBusyFall(sessionId, ctx, deadlineMs) {
   const start = Date.now();
   const settleMs = getBusyFallSettleMs();
-  // Set the instant busy first reads false; reset to null on every re-assertion.
+  const riseDeadline = start + getBusyRiseWaitMs();
+  // Set true the first time busy reads true since this call started. Until
+  // then, a continuous run of `false` proves nothing about whether the turn
+  // is over — see the function doc above.
+  let hasRisen = false;
+  // Set the instant busy first reads false (after having risen); reset to
+  // null on every re-assertion.
   let idleSince = null;
 
   return pollLoop((resolve, scheduleNext) => {
@@ -474,13 +522,18 @@ function waitForBusyFall(sessionId, ctx, deadlineMs) {
     if (!ctx.getPtyForSession(sessionId)) {
       return resolve({ timedOut: false, sessionExited: true, waited_ms: now - start });
     }
-    if (!ctx.isSessionBusy(sessionId)) {
+    if (ctx.isSessionBusy(sessionId)) {
+      hasRisen = true;
+      idleSince = null;
+    } else if (hasRisen) {
       if (idleSince === null) idleSince = now;
       if (now - idleSince >= settleMs) {
         return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
       }
-    } else {
-      idleSince = null;
+    } else if (now >= riseDeadline) {
+      // Rise-wait bound elapsed without ever observing busy=true: not an
+      // error, just a turn never observed (see function doc above).
+      return resolve({ timedOut: false, sessionExited: false, waited_ms: now - start });
     }
     scheduleNext();
   });
