@@ -9,8 +9,8 @@
  * permissionMode's "Default (none)" option as `value || null`, so `null` there
  * means "pass no --permission-mode flag", not "unset".
  *
- * Extracted from main.js's get-effective-settings handler so this rule can be
- * unit-tested without booting Electron.
+ * Used by main.js's shared effectiveSettings helper so the settings IPC and
+ * task setup resolve the same values, without needing Electron in unit tests.
  */
 function resolveEffectiveSettings(defaults, global = {}, project = {}) {
   const effective = { ...defaults };

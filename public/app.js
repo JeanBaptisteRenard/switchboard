@@ -100,7 +100,8 @@ let searchMatchProjectPaths = null; // Set<string> of project paths matched by n
 // --- Activity tracking ---
 //
 // Activity is determined by two signals:
-//   1. OSC 0 braille spinner (authoritative: Claude CLI sets title to spinner chars)
+//   1. OSC 0 spinner (authoritative: Claude CLI prefixes the title with a
+//      braille or half-circle spinner frame)
 //   2. Noise-filtered terminal output (fallback: non-noise, non-TUI-repaint data)
 //
 // Both feed into setActivity(sessionId, active):
@@ -109,11 +110,37 @@ let searchMatchProjectPaths = null; // Set<string> of project paths matched by n
 // OSC 0 idle signal is the authoritative source for marking sessions as idle.
 //
 const attentionSessions = new Set(); // sessions needing user action (OSC 9)
-const responseReadySessions = new Set(); // Claude finished, user hasn't looked (terminal state)
+const responseReadySessions = new Set(); // CLI finished, user hasn't looked (terminal state)
 const sessionBusyState = new Map(); // sessionId → boolean (currently active)
+
+// Some CLIs (notably Codex) start under a temporary ID and are re-keyed once
+// their transcript appears. Activity often begins before that detection, so it
+// must move with the rest of the session or the eventual idle event will have
+// no matching busy state to transition from.
+function rekeySessionActivity(oldId, newId) {
+  if (oldId === newId) return;
+
+  if (attentionSessions.delete(oldId)) attentionSessions.add(newId);
+  if (responseReadySessions.delete(oldId)) responseReadySessions.add(newId);
+  if (sessionBusyState.has(oldId)) {
+    sessionBusyState.set(newId, sessionBusyState.get(oldId));
+    sessionBusyState.delete(oldId);
+  }
+  if (activePtyIds.delete(oldId)) activePtyIds.add(newId);
+}
 
 // Central activity dispatcher
 function setActivity(sessionId, active) {
+  // response-ready normally stays latched until the user looks at the session.
+  // A fresh busy signal is stronger evidence, though: OSC progress clear can
+  // briefly report idle between progress runs, and the next title frame or
+  // progress start must be able to put the session straight back into running.
+  if (active && responseReadySessions.has(sessionId)) {
+    responseReadySessions.delete(sessionId);
+    const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
+    if (item) item.classList.remove('response-ready');
+  }
+
   if (responseReadySessions.has(sessionId)) {
     return;
   }
@@ -145,6 +172,20 @@ function clearUnread(sessionId) {
   const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
   if (item) {
     item.classList.remove('response-ready');
+  }
+}
+
+// User-initiated: put a session back into the response-ready state, as if
+// Claude had just finished a turn the user hasn't looked at yet. Mirrors the
+// busy→idle transition in setActivity so the sidebar re-renders consistently.
+function markUnread(sessionId) {
+  if (responseReadySessions.has(sessionId)) return;
+  responseReadySessions.add(sessionId);
+  sessionBusyState.set(sessionId, false);
+  const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
+  if (item) {
+    item.classList.remove('cli-busy');
+    item.classList.add('response-ready');
   }
 }
 
@@ -197,13 +238,28 @@ window.api.onSessionDetected((tempId, realId) => {
 
   entry.session.sessionId = realId;
   if (activeSessionId === tempId) setActiveSession(realId);
+  rekeySessionActivity(tempId, realId);
 
   // Re-key in openSessions
   openSessions.delete(tempId);
   openSessions.set(realId, entry);
 
+  // Re-key file panel state for the new session ID
+  if (typeof rekeyFilePanelState === 'function') rekeyFilePanelState(tempId, realId);
+
+  // Re-key the pending entry so the sidebar row survives until the DB has real
+  // data. Without this the temp id keeps being re-injected by loadProjects and
+  // the session appears twice.
+  const pendingEntry = pendingSessions.get(tempId);
+  pendingSessions.delete(tempId);
+  if (pendingEntry) {
+    pendingEntry.sessionId = realId;
+    pendingSessions.set(realId, pendingEntry);
+  }
+  sessionMap.delete(tempId);
+  sessionMap.set(realId, entry.session);
+
   terminalHeaderId.textContent = realId;
-  terminalHeaderName.textContent = 'New session';
 
   // Refresh sidebar to show the new session, then select it
   loadProjects().then(() => {
@@ -222,6 +278,7 @@ window.api.onSessionForked((oldId, newId) => {
 
   entry.session.sessionId = newId;
   if (activeSessionId === oldId) setActiveSession(newId);
+  rekeySessionActivity(oldId, newId);
 
   openSessions.delete(oldId);
   openSessions.set(newId, entry);
@@ -253,35 +310,52 @@ window.api.onSessionForked((oldId, newId) => {
   pollActiveSessions();
 });
 
-window.api.onProcessExited((sessionId, exitCode) => {
+window.api.onProcessExited((sessionId, exitCode, signal, userStopped) => {
   const entry = openSessions.get(sessionId);
   const session = sessionMap.get(sessionId);
-  if (entry) {
-    entry.closed = true;
-    // Write a visible exit banner so the user can see when the process ended
-    // and read any error output it printed (claude / devbox / shell stderr).
-    // Without this, a fast-failing pre-launch command would tear down the
-    // terminal before the user could read the error.
-    try {
-      const colour = exitCode === 0 ? '\x1b[2m' : '\x1b[33m';
-      entry.terminal.write(
-        `\r\n${colour}── session exited (code ${exitCode}) ──\x1b[0m\r\n`
-      );
-    } catch {}
-  }
+  if (entry) entry.closed = true;
 
-  // Plain terminal sessions are ephemeral — destroy immediately and remove from
-  // the sidebar. Claude sessions stay mounted (see below) so the user can read
-  // the exit reason.
-  if (session?.type === 'terminal') {
-    if (entry) destroySession(sessionId);
+  const intentional = wasIntentionalExit({ exitCode, signal, userStopped });
+
+  // A Claude session that died stays mounted behind an exit banner so the user
+  // can read the error it printed (claude / devbox / shell stderr) — without
+  // this, a fast-failing pre-launch command tears the terminal down before the
+  // error is readable. Cleanup is deferred to openSession, which destroys the
+  // closed entry when the user re-clicks the session. The sidebar row stays
+  // put too, so there's somewhere to relaunch from.
+  if (session?.type !== 'terminal' && !intentional) {
+    if (entry) {
+      try {
+        const reason = signal ? `signal ${signal}` : `code ${exitCode}`;
+        entry.terminal.write(`\r\n\x1b[33m── session exited (${reason}) ──\x1b[0m\r\n`);
+      } catch {}
+    }
+    // A pending session that died never wrote a .jsonl, so loadProjects keeps
+    // re-injecting it. Mark it dead so it stops sorting as a running session.
+    const pending = pendingSessions.get(sessionId);
+    if (pending) pending.exited = true;
     if (gridViewActive) {
       gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
-    } else if (activeSessionId === sessionId) {
-      setActiveSession(null);
-      terminalHeader.style.display = 'none';
-      placeholder.style.display = '';
     }
+    pollActiveSessions();
+    return;
+  }
+
+  // Everything else — plain terminals (always ephemeral) and Claude sessions
+  // the user ended themselves — goes away.
+  if (entry) destroySession(sessionId);
+  if (gridViewActive) {
+    gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
+  } else if (activeSessionId === sessionId) {
+    setActiveSession(null);
+    terminalHeader.style.display = 'none';
+    placeholder.style.display = '';
+  }
+
+  // Drop the sidebar row for sessions with nothing to reopen: plain terminals,
+  // and Claude sessions still pending (no .jsonl was ever written). A session
+  // that produced real data keeps its row and reloads from the DB.
+  if (session?.type === 'terminal' || pendingSessions.has(sessionId)) {
     pendingSessions.delete(sessionId);
     for (const projList of [cachedProjects, cachedAllProjects]) {
       for (const proj of projList) {
@@ -290,40 +364,30 @@ window.api.onProcessExited((sessionId, exitCode) => {
     }
     sessionMap.delete(sessionId);
     refreshSidebar();
-    pollActiveSessions();
-    return;
-  }
-
-  // Claude sessions: keep the terminal mounted with the exit banner visible so
-  // the user can read what happened. Cleanup is deferred — openSession destroys
-  // the closed entry when the user re-clicks the session (existing behavior).
-  // If the session was pending (no .jsonl was written), leave the sidebar
-  // entry in place too so the user has somewhere to relaunch from; it'll be
-  // tidied up by the regular pending-reconciliation pass once it's clear no
-  // real session file is coming.
-
-  if (gridViewActive) {
-    gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
+    // The pending marker can outlive the .jsonl by a beat (reconciliation only
+    // runs in loadProjects), so re-sync: a session that did write real data
+    // gets its row back from the DB rather than vanishing until the next watch.
+    if (session?.type !== 'terminal') loadProjects();
   }
 
   pollActiveSessions();
 });
 
 // --- Terminal notifications (iTerm2 OSC 9 — "needs attention") ---
-window.api.onTerminalNotification((sessionId, message) => {
-  // Only mark as needing attention for "attention" messages, not "waiting for input"
-  // Matches all four CLI notification types:
-  // 1. "Claude Code needs your attention"         → attention
-  // 2. "Claude Code needs your approval for the plan" → approval, needs your
-  // 3. "Claude needs your permission to use {tool}"   → permission, needs your
-  // 4. "Claude Code wants to enter plan mode"         → wants to enter
-  if (/attention|approval|permission|needs your|wants to enter/i.test(message) && sessionId !== activeSessionId) {
+window.api.onTerminalNotification((sessionId, message, kind) => {
+  // `kind` is classified by the session's harness in main, since the wording is
+  // per-CLI: Claude says "needs your permission to use {tool}", codex says
+  // "Approval requested: <command>".
+  if (kind === 'attention' && sessionId !== activeSessionId) {
     attentionSessions.add(sessionId);
     const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
     if (item) item.classList.add('needs-attention');
-  } else if (/waiting for your input/i.test(message)) {
-    // "Claude is waiting for your input" — delayed idle notification, mark response-ready
-    setActivity(sessionId, false);
+  } else if (kind === 'idle') {
+    // A completion notification is authoritative even if a quick turn never
+    // produced a busy frame, or its busy state arrived under a temporary ID.
+    // Active sessions are already being viewed, so they only need to go idle.
+    if (sessionId === activeSessionId) setActivity(sessionId, false);
+    else markUnread(sessionId);
   }
 
   // Show in header if active
@@ -333,7 +397,7 @@ window.api.onTerminalNotification((sessionId, message) => {
   }
 });
 
-// --- CLI busy state (OSC 0 title spinner detection) ---
+// --- CLI busy state (OSC 0 title spinner and OSC 9;4 progress detection) ---
 window.api.onCliBusyState((sessionId, busy) => {
   setActivity(sessionId, busy);
 });
@@ -507,6 +571,37 @@ searchInput.addEventListener('input', () => {
 });
 
 // --- Stop session helper ---
+/**
+ * A row for a session that never produced a transcript, and is not running.
+ *
+ * These exist so a session that died on launch can be relaunched or read, but
+ * nothing on disk backs them — so nothing else can ever clear them, and without
+ * a way out they sit in the sidebar for good.
+ */
+function isDismissibleSession(sessionId) {
+  return pendingSessions.has(sessionId) && !activePtyIds.has(sessionId);
+}
+
+/** Drop such a row. Purely renderer state, so it cannot come back. */
+function dismissSession(sessionId) {
+  pendingSessions.delete(sessionId);
+  sessionMap.delete(sessionId);
+  for (const projList of [cachedProjects, cachedAllProjects]) {
+    for (const proj of projList) {
+      proj.sessions = proj.sessions.filter(s => s.sessionId !== sessionId);
+    }
+  }
+  if (openSessions.has(sessionId)) destroySession(sessionId);
+  if (activeSessionId === sessionId) {
+    setActiveSession(null);
+    terminalHeader.style.display = 'none';
+    placeholder.style.display = '';
+  }
+  attentionSessions.delete(sessionId);
+  responseReadySessions.delete(sessionId);
+  refreshSidebar();
+}
+
 async function confirmAndStopSession(sessionId) {
   if (!confirm('Stop this session?')) return;
   await window.api.stopSession(sessionId);
@@ -521,6 +616,7 @@ async function confirmAndStopSession(sessionId) {
 
 // --- Terminal header controls ---
 terminalStopBtn.addEventListener('click', () => {
+  if (activeTaskView) return;
   if (activeSessionId) confirmAndStopSession(activeSessionId);
 });
 
@@ -695,6 +791,7 @@ async function loadProjects({ resort = false } = {}) {
     }
   } catch {}
 
+  await hydrateProjectTasks([cachedProjects, cachedAllProjects]);
   await pollActiveSessions();
   refreshSidebar({ resort });
   renderDefaultStatus();
@@ -705,13 +802,18 @@ async function loadProjects({ resort = false } = {}) {
 
 
 async function launchNewSession(project, sessionOptions) {
+  // A temporary id. Claude is told to use it (--session-id); codex cannot be,
+  // so main watches for its transcript and sends session-detected with the real
+  // one, which re-keys everything below.
   const sessionId = crypto.randomUUID();
   const projectPath = project.projectPath;
+  const runtime = sessionOptions?.runtime || 'claude';
   const session = {
     sessionId,
     summary: 'New session',
     firstPrompt: '',
     projectPath,
+    runtime,
     name: null,
     starred: 0,
     archived: 0,
@@ -804,7 +906,10 @@ async function openSession(session, customOptions) {
   const entry = createTerminalEntry(session);
 
   // Open terminal in main process
-  const resumeOptions = customOptions || await resolveDefaultSessionOptions({ projectPath });
+  const resumeOptions = { ...(customOptions || await resolveDefaultSessionOptions({ projectPath })) };
+  // Which CLI to resume with. Main re-reads this from the cached row and only
+  // trusts the hint for sessions it has never indexed.
+  if (session.runtime) resumeOptions.runtime = session.runtime;
   const result = await window.api.openTerminal(sessionId, projectPath, false, resumeOptions);
   if (!result.ok) {
     entry.terminal.write(`\r\nError: ${result.error}\r\n`);
@@ -812,6 +917,10 @@ async function openSession(session, customOptions) {
     return;
   }
   if (typeof setSessionMcpActive === 'function') setSessionMcpActive(sessionId, !!result.mcpActive);
+
+  // Relaunching a session that had died clears the dead marker on its pending entry
+  const pending = pendingSessions.get(sessionId);
+  if (pending) pending.exited = false;
 
   showSession(sessionId);
   pollActiveSessions();
@@ -1037,9 +1146,10 @@ setTimeout(() => {
   }
 })();
 
-loadProjects().then(() => {
+loadProjects().then(async () => {
+  await restoreActiveTaskView();
   // Restore grid view preference before opening sessions so they enter grid mode
-  if (localStorage.getItem('gridViewActive') === '1') {
+  if (!activeTaskView && localStorage.getItem('gridViewActive') === '1') {
     showGridView();
   }
   // Restore active session after reload
@@ -1150,6 +1260,9 @@ const quotaGaugeEl = document.getElementById('status-bar-quota');
 // Full labels ("Week (all models)") are too long for a status bar; the tooltip
 // carries them in full.
 function shortQuotaLabel(row) {
+  // codex names its own windows by length, since it reports a duration in
+  // seconds rather than a named bucket like Claude does.
+  if (row.short) return row.short;
   if (row.kind === 'session') return '5h';
   if (row.kind === 'weekly_all') return 'Week';
   return row.model || 'Week';
@@ -1158,6 +1271,8 @@ function shortQuotaLabel(row) {
 function buildQuotaBar(row) {
   const wrap = document.createElement('span');
   wrap.className = 'quota-item';
+
+  if (row.runtime) wrap.classList.add('quota-item-' + row.runtime);
 
   const label = document.createElement('span');
   label.className = 'quota-label';
@@ -1178,27 +1293,69 @@ function buildQuotaBar(row) {
   pctEl.textContent = pct + '%';
   wrap.appendChild(pctEl);
 
-  wrap.title = `${row.label}: ${pct}%` + (row.reset ? ` \u2014 resets ${row.reset}` : '');
+  const who = row.runtime === 'codex' ? 'Codex' : 'Claude';
+  wrap.title = `${who} \u2014 ${row.label}: ${pct}%` + (row.reset ? ` \u2014 resets ${row.reset}` : '');
   return wrap;
+}
+
+function quotaRowsFor(usage, runtime) {
+  // Prefer the API's self-describing rows; fall back to the flat 5-hour keys.
+  const rows = Array.isArray(usage?.limits) && usage.limits.length
+    ? usage.limits
+    : (usage?.session !== undefined
+      ? [{ kind: 'session', label: 'Current session', percent: usage.session, reset: usage.sessionReset }]
+      : []);
+  return rows.map(r => ({ runtime, ...r }));
+}
+
+/**
+ * One CLI's bars behind its logo.
+ *
+ * The logo goes on the group rather than each bar: with two CLIs on the bar a
+ * label like "Week" is ambiguous, but repeating the mark per bar is noise.
+ */
+function buildQuotaGroup(runtime, rows) {
+  const group = document.createElement('span');
+  group.className = 'quota-group quota-group-' + runtime;
+
+  const icon = document.createElement('span');
+  icon.className = 'quota-runtime-icon';
+  icon.innerHTML = runtime === 'codex' ? ICONS.codex(12) : ICONS.claude(12);
+  icon.title = runtime === 'codex' ? 'Codex' : 'Claude';
+  group.appendChild(icon);
+
+  for (const row of rows) group.appendChild(buildQuotaBar(row));
+  return group;
 }
 
 async function refreshQuotaGauge() {
   try {
-    const usage = await window.api.getUsage();
-    // Prefer the API's self-describing rows; fall back to the flat 5-hour keys.
-    const rows = Array.isArray(usage?.limits) && usage.limits.length
-      ? usage.limits
-      : (usage?.session !== undefined
-        ? [{ kind: 'session', label: 'Current session', percent: usage.session, reset: usage.sessionReset }]
-        : []);
-    if (!rows.length) { quotaGaugeEl.style.display = 'none'; return; }
+    // Both CLIs, in parallel and independently: one being signed out or
+    // switched off must not cost the other its bars.
+    const [claudeUsage, codexUsage] = await Promise.all([
+      window.api.getUsage().catch(() => ({})),
+      window.api.getCodexUsage?.().catch(() => ({})) ?? {},
+    ]);
+    const groups = [];
+    for (const [runtime, usage] of [['claude', claudeUsage], ['codex', codexUsage]]) {
+      const rows = quotaRowsFor(usage, runtime);
+      if (rows.length) groups.push(buildQuotaGroup(runtime, rows));
+    }
+    if (!groups.length) { quotaGaugeEl.style.display = 'none'; return; }
 
-    quotaGaugeEl.replaceChildren(...rows.map(buildQuotaBar));
+    quotaGaugeEl.replaceChildren(...groups);
     quotaGaugeEl.style.display = '';
   } catch {}
 }
 refreshQuotaGauge();
 setInterval(refreshQuotaGauge, 5 * 60 * 1000);
+
+// Switching a CLI on or off changes which bars belong on the gauge and which
+// sessions belong in the sidebar. Both are otherwise only refreshed on a timer.
+window.api.onHarnessesChanged?.(() => {
+  refreshQuotaGauge();
+  loadProjects({ resort: true });
+});
 quotaGaugeEl.addEventListener('click', () => {
   document.querySelector('.sidebar-tab[data-tab="stats"]')?.click();
 });

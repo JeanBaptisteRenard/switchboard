@@ -2,6 +2,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { resolveEffectiveSettings } = require('../resolve-effective-settings');
+const claude = require('../harnesses/claude');
+const codex = require('../harnesses/codex');
 
 // Mirrors the shape of main.js's SETTING_DEFAULTS for the keys that matter here.
 const DEFAULTS = {
@@ -29,8 +31,8 @@ test('project scope overrides global, which overrides defaults', () => {
 
 test('a project can narrow permissionMode back to Default over a global mode', () => {
   // The settings panel saves the "Default (none)" option as `value || null`, so
-  // an explicit null is how a user says "prompt for every action, pass no
-  // --permission-mode flag". It must beat a broader-scope mode.
+  // an explicit null means "pass no --permission-mode flag". Claude's own
+  // configuration still applies. It must beat a broader-scope mode.
   const effective = resolveEffectiveSettings(
     DEFAULTS,
     { permissionMode: 'bypassPermissions' },
@@ -99,4 +101,45 @@ test('the inputs are not mutated', () => {
 
 test('global and project default to empty when omitted', () => {
   assert.deepEqual(resolveEffectiveSettings(DEFAULTS), DEFAULTS);
+});
+
+test('project Default removes the inherited Claude permission flag on launch and resume', () => {
+  const global = { permissionMode: 'bypassPermissions' };
+  for (const isNew of [true, false]) {
+    const inherited = claude.buildLaunchArgs({
+      sessionId: 'session', isNew,
+      options: resolveEffectiveSettings(DEFAULTS, global),
+    });
+    assert.ok(inherited.includes('--permission-mode'));
+    assert.ok(inherited.includes('bypassPermissions'));
+
+    const overridden = claude.buildLaunchArgs({
+      sessionId: 'session', isNew,
+      options: resolveEffectiveSettings(DEFAULTS, global, { permissionMode: null }),
+    });
+    assert.ok(!overridden.includes('--permission-mode'));
+    assert.ok(!overridden.includes('bypassPermissions'));
+    assert.ok(!overridden.includes('--dangerously-skip-permissions'));
+  }
+});
+
+test('Claude Default preserves independently configured Codex and task shell settings', () => {
+  const options = resolveEffectiveSettings(
+    { ...DEFAULTS, codexSandbox: '', codexApproval: '', codexModel: '' },
+    {
+      permissionMode: 'bypassPermissions',
+      codexSandbox: 'workspace-write',
+      codexApproval: 'never',
+      shellProfile: 'custom-shell',
+    },
+    { permissionMode: null, codexSandbox: 'read-only', codexApproval: 'on-request' },
+  );
+  const args = codex.buildLaunchArgs({ sessionId: 'session', isNew: true, options });
+  assert.equal(options.permissionMode, null);
+  assert.equal(options.shellProfile, 'custom-shell');
+  assert.ok(args.includes('read-only'));
+  assert.ok(args.includes('on-request'));
+  assert.ok(!args.includes('workspace-write'));
+  assert.ok(!args.includes('never'));
+  assert.ok(!args.includes('--permission-mode'));
 });
