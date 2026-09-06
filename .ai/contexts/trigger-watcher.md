@@ -1257,6 +1257,56 @@ Tests: `test/trigger-watcher.test.js` ("Target guard" section) and
 session literal with `cwd: spawnCwd` (source-only, proves nothing at
 runtime).
 
+### midBusy gate test precondition
+
+**Symptom (issue #195)**: `test/trigger-watcher.test.js` — "submitted: busy
+observed between a step's text write and its own Enter must not confirm it
+(midBusy gate)" — failed intermittently on a loaded machine, always on its own
+precondition assertion (`steps[1].waited_ms === 0`), never on the gate
+behaviour it exists to test. Green on CI and on an idle machine every time.
+
+**Root cause**: `pollForBusyObserved()` samples `Date.now()` twice —
+`start` before the poll loop begins, `now` on the loop's first tick — with no
+`await` between them (the whole span is a handful of synchronous statements).
+The old test asserted `now - start === 0` as proof that step 1's busy state
+was already true on its very first poll. That arithmetic is not guaranteed:
+under real thread preemption or a GC pause landing between those two
+statements, the delta can read `1` (or more) even though zero meaningful
+"waiting" occurred — a measurement artefact of wall-clock precision, not a
+logic race in `trigger-watcher.js`. Confirmed by directly injecting a 2-3ms
+spin between the two `Date.now()` calls in a scratch copy of
+`pollForBusyObserved`: reproduces the exact reported assertion, same message,
+same line, only the numeric delta differs (`2 !== 0` / `3 !== 0` vs the
+reported `1 !== 0`). Reverted after confirming; not part of the shipped fix.
+Deliberate CPU oversubscription on sibling processes (up to 52 busy-loops on
+an 8-core machine, 100 runs total) did **not** reproduce it — this class of
+jitter needs a pause landing in a specific few-statement window, which
+external CPU contention alone does not reliably produce.
+
+**Fix**: stopped inferring the precondition from a clock delta. The test's
+`isSessionBusy` fake now records the boolean it returns on the first call
+made after step 1's text is written (`firstBusyReadAfterStep1Text`), and the
+precondition assertion checks that value directly. This relies only on JS's
+single-threaded, synchronous call ordering — write-then-poll is guaranteed to
+happen in that order by the language, never by timing — so no amount of
+scheduler jitter can change what gets recorded, only how long it takes to get
+there. `steps[1].waited_ms` was dropped from the precondition assertions,
+`steps[1].submit_retries === 0` was kept (it depends only on the `sawBusy`
+boolean, never flaky).
+
+**Gate coverage gap found and closed in the same pass**: the existing
+`assert.notEqual(result.submitted, 'confirmed', ...)` checks the whole
+chain's folded value (`weakestSubmitted` takes the minimum rank across
+steps). Mutating `submitWithVerify`'s `midBusy === false` to `midBusy ===
+true` flips step 1's `composerConfirmed` to `true` as expected, but it also
+flips step 0's (whose own `midBusy` is legitimately `false`) to `false` — and
+the fold's minimum reports `'activity'` for the whole chain regardless,
+silently passing. Added `assert.notEqual(result.steps[1].submitted,
+'confirmed', ...)` on the step's own field, which the fold cannot mask.
+Verified both mutations turn the test red: negating the comparison
+(`midBusy === true`) and deleting the clause entirely — both fail on the new
+step-level assertion with `actual: 'confirmed'`.
+
 ## Change-also checklist
 
 - If you rename `_cliBusy` on `session` in `main.js`, update `isSessionBusy` in `trigger-context.js`.
