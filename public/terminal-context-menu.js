@@ -27,7 +27,9 @@ let terminalRightClickMode = 'menu';
 function fileUriToPath(uri) {
   if (typeof uri !== 'string' || !uri.startsWith('file://')) return null;
   try {
-    return decodeURIComponent(new URL(uri).pathname);
+    const pathname = decodeURIComponent(new URL(uri).pathname);
+    // see docs/ide-emulation.md, "Windows drive letters"
+    return /^\/[A-Za-z]:\//.test(pathname) ? pathname.slice(1) : pathname;
   } catch {
     return null;
   }

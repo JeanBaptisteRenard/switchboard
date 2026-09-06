@@ -7,6 +7,7 @@
 // Depends on: toggleGridView, isSessionNavKey, handleSessionNavKey, focusGridCard,
 // wrapInGridCard, showGridView (grid-view.js)
 // Depends on: shellEscape (utils.js)
+// Depends on: fileUriToPath (terminal-context-menu.js)
 
 // --- Terminal key bindings ---
 // Shift+Enter → kitty protocol (CSI 13;2u) so Claude Code treats it as newline, not submit.
@@ -855,7 +856,8 @@ function createTerminalEntry(session, opts = {}) {
         // re-opening the link.
         if (event && typeof event.button === 'number' && event.button !== 0) return;
         if (uri.startsWith('file://') && typeof openFileInPanel === 'function') {
-          try { openFileInPanel(sessionId, decodeURIComponent(new URL(uri).pathname)); } catch {}
+          const p = fileUriToPath(uri);
+          if (p) openFileInPanel(sessionId, p);
         } else {
           window.api.openExternal(uri);
         }
@@ -889,7 +891,8 @@ function createTerminalEntry(session, opts = {}) {
   terminal.loadAddon(new WebLinksAddon.WebLinksAddon((event, url) => {
     if (event && typeof event.button === 'number' && event.button !== 0) return;
     if (url.startsWith('file://') && typeof openFileInPanel === 'function') {
-      try { openFileInPanel(sessionId, decodeURIComponent(new URL(url).pathname)); } catch {}
+      const p = fileUriToPath(url);
+      if (p) openFileInPanel(sessionId, p);
     } else {
       window.api.openExternal(url);
     }

@@ -35,6 +35,11 @@ test('fileUriToPath returns null for non-file URIs', () => {
   assert.strictEqual(fileUriToPath(null), null);
 });
 
+test('fileUriToPath strips the leading slash from a Windows drive-letter URI', () => {
+  // see docs/ide-emulation.md, "Windows drive letters"
+  assert.strictEqual(fileUriToPath('file:///C:/Serveur/switchboard/trigger-watcher.js'), 'C:/Serveur/switchboard/trigger-watcher.js');
+});
+
 test('classifyLinkUri distinguishes file, url, and neither', () => {
   assert.deepStrictEqual(classifyLinkUri('file:///etc/hosts'), { kind: 'file', path: '/etc/hosts' });
   assert.deepStrictEqual(classifyLinkUri('https://x.dev/p'), { kind: 'url', url: 'https://x.dev/p' });
