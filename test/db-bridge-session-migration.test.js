@@ -1,11 +1,11 @@
 /**
- * session_cache.bridgeSessionId (issue #197 -- see .ai/contexts/session-cache.md).
- * Added via the schema-reconciliation pass (not a numbered migration): that
- * pass is version-independent, so it also covers a DB migrated past ours by
- * a parallel branch that never shipped this column. Existing databases
- * already carry the duplicated rows the bug produced; the reconciliation's
- * cache wipe is what repairs them, by forcing every folder through the
- * now-deduping indexer on the next scan.
+ * session_cache.bridgeSessionId and .mergedIntoSessionId (issue #197 -- see
+ * .ai/contexts/session-cache.md). Added via the schema-reconciliation pass
+ * (not a numbered migration): that pass is version-independent, so it also
+ * covers a DB migrated past ours by a parallel branch that never shipped
+ * these columns. Existing databases already carry the duplicated rows the
+ * bug produced; the reconciliation's cache wipe is what repairs them, by
+ * forcing every folder through the now-merging indexer on the next scan.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -43,12 +43,14 @@ function inspectDb(dataDir) {
   return JSON.parse(r.stdout.trim().split('\n').pop());
 }
 
-test('fresh database gets the bridgeSessionId column', () => {
+test('fresh database gets the bridgeSessionId and mergedIntoSessionId columns', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-bridge-fresh-'));
   try {
     const r = loadDbModule(dir);
     assert.equal(r.status, 0, r.stderr);
-    assert.ok(inspectDb(dir).cols.includes('bridgeSessionId'));
+    const cols = inspectDb(dir).cols;
+    assert.ok(cols.includes('bridgeSessionId'));
+    assert.ok(cols.includes('mergedIntoSessionId'));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -63,9 +65,10 @@ test('an existing database with already-duplicated mirror rows is wiped for re-i
     const seed = runInElectronNode(`
       const Database = require('better-sqlite3');
       const db = new Database(require('path').join(process.env.SWITCHBOARD_DATA_DIR, 'switchboard.db'));
-      // Simulate the pre-fix schema (no bridgeSessionId column) with the bug's
-      // exact symptom already present: parent and mirror indexed as two rows.
+      // Simulate the pre-fix schema (neither column) with the bug's exact
+      // symptom already present: parent and mirror indexed as two rows.
       db.exec('ALTER TABLE session_cache DROP COLUMN bridgeSessionId');
+      db.exec('ALTER TABLE session_cache DROP COLUMN mergedIntoSessionId');
       const ins = db.prepare('INSERT INTO session_cache (sessionId, folder, projectPath, summary, modified) VALUES (?, ?, ?, ?, ?)');
       ins.run('e4b389ac', 'f1', '/tmp/p1', 'New project', '2026-09-06T18:13:27.000Z');
       ins.run('1b1def07', 'f1', '/tmp/p1', 'New project', '2026-09-06T18:13:34.000Z');
@@ -77,7 +80,8 @@ test('an existing database with already-duplicated mirror rows is wiped for re-i
     assert.equal(r.status, 0, r.stderr);
 
     const state = inspectDb(dir);
-    assert.ok(state.cols.includes('bridgeSessionId'), 'column added');
+    assert.ok(state.cols.includes('bridgeSessionId'), 'bridgeSessionId column added');
+    assert.ok(state.cols.includes('mergedIntoSessionId'), 'mergedIntoSessionId column added');
     assert.equal(state.cacheCount, 0, 'stale duplicated rows cleared -- repaired by re-index, not patched in place');
     assert.equal(state.metaCount, 0, 'folder index gate cleared so the next scan actually re-reads f1');
   } finally {
@@ -115,9 +119,49 @@ test('foreign higher-version database without bridgeSessionId is reconciled, not
 
     const state = inspectDb(dir);
     assert.ok(state.cols.includes('bridgeSessionId'), 'bridgeSessionId column added despite the higher foreign version');
+    assert.ok(state.cols.includes('mergedIntoSessionId'), 'mergedIntoSessionId column added despite the higher foreign version');
     assert.equal(state.cacheCount, 0, 'stale cache cleared for re-index');
     assert.equal(state.metaCount, 0, 'folder index gate cleared for re-index');
     assert.ok(state.cols.includes('futureColumn'), 'foreign column preserved');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Real SQL, not the pure-JS mirror in db-session-metrics.test.js: a
+// compaction mirror row (mergedIntoSessionId set) must not inflate
+// getTotalCounts().totalSessions -- it is the same session as the row it
+// merged into, not a second one.
+test('getTotalCounts excludes a compaction mirror row from totalSessions but still sums its metrics', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'switchboard-bridge-totals-'));
+  try {
+    const init = loadDbModule(dir);
+    assert.equal(init.status, 0, init.stderr);
+
+    const seed = runInElectronNode(`
+      const Database = require('better-sqlite3');
+      const db = new Database(require('path').join(process.env.SWITCHBOARD_DATA_DIR, 'switchboard.db'));
+      const ins = db.prepare('INSERT INTO session_cache (sessionId, folder, projectPath, summary, modified, mergedIntoSessionId) VALUES (?, ?, ?, ?, ?, ?)');
+      ins.run('parent', 'f1', '/tmp/p1', 'New project', '2026-09-03T21:16:00.000Z', null);
+      ins.run('mirror', 'f1', '/tmp/p1', 'New project', '2026-09-05T22:15:05.000Z', 'parent');
+      ins.run('independent', 'f1', '/tmp/p1', 'unrelated work', '2026-09-06T18:03:00.000Z', null);
+      const insMetrics = db.prepare('INSERT INTO session_metrics (sessionId, date, model, messageCount, toolCallCount, inputTokens, outputTokens) VALUES (?, ?, ?, ?, ?, ?, ?)');
+      insMetrics.run('parent', '2026-09-03', 'claude-sonnet-4-6', 2, 0, 100, 50);
+      insMetrics.run('mirror', '2026-09-05', 'claude-sonnet-4-6', 1, 0, 9, 4);
+      insMetrics.run('independent', '2026-09-06', 'claude-sonnet-4-6', 1, 0, 7, 3);
+    `, dir);
+    assert.equal(seed.status, 0, seed.stderr);
+
+    const inspect = runInElectronNode(`
+      const db = require(${JSON.stringify(path.join(APP_DIR, 'db.js'))});
+      console.log(JSON.stringify(db.getTotalCounts()));
+    `, dir);
+    assert.equal(inspect.status, 0, inspect.stderr);
+    const totals = JSON.parse(inspect.stdout.trim().split('\n').pop());
+
+    assert.equal(totals.totalSessions, 2, 'parent + independent -- the mirror is not a third session');
+    assert.equal(totals.totalMessages, 4, '2 + 1 + 1, both files\' non-overlapping messages counted');
+    assert.equal(totals.totalTokens, 173, '150 + 13 + 10, both files\' non-overlapping tokens summed');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

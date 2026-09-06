@@ -310,7 +310,7 @@ if (migrations.length > currentDbVersion) {
   // Fork columns (shipped in our v4): a foreign-version DB may have skipped
   // that migration the same way. Their absence means subagent rows were never
   // indexed, so a re-index is needed too.
-  for (const col of ['parentSessionId', 'agentId', 'subagentType', 'description', 'bridgeSessionId']) {
+  for (const col of ['parentSessionId', 'agentId', 'subagentType', 'description', 'bridgeSessionId', 'mergedIntoSessionId']) {
     if (!cols.has(col)) {
       db.exec(`ALTER TABLE session_cache ADD COLUMN ${col} TEXT`);
       mustReindex = true;
@@ -418,8 +418,8 @@ const stmts = {
   cacheCount: db.prepare('SELECT COUNT(*) as cnt FROM session_cache'),
   cacheGetAll: db.prepare('SELECT * FROM session_cache'),
   cacheUpsert: db.prepare(`
-    INSERT INTO session_cache (sessionId, folder, projectPath, summary, firstPrompt, created, modified, messageCount, slug, aiTitle, parentSessionId, agentId, subagentType, description, fileMtime, bridgeSessionId)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO session_cache (sessionId, folder, projectPath, summary, firstPrompt, created, modified, messageCount, slug, aiTitle, parentSessionId, agentId, subagentType, description, fileMtime, bridgeSessionId, mergedIntoSessionId)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(sessionId) DO UPDATE SET
       folder = excluded.folder, projectPath = excluded.projectPath,
       summary = excluded.summary, firstPrompt = excluded.firstPrompt,
@@ -428,7 +428,8 @@ const stmts = {
       aiTitle = excluded.aiTitle, fileMtime = excluded.fileMtime,
       parentSessionId = excluded.parentSessionId, agentId = excluded.agentId,
       subagentType = excluded.subagentType, description = excluded.description,
-      bridgeSessionId = excluded.bridgeSessionId
+      bridgeSessionId = excluded.bridgeSessionId,
+      mergedIntoSessionId = excluded.mergedIntoSessionId
   `),
   cacheGetByParent: db.prepare('SELECT * FROM session_cache WHERE parentSessionId = ? ORDER BY created ASC'),
   // Kept as SELECT * (upstream narrowed this to sessionId+fileMtime): our
@@ -554,7 +555,7 @@ const upsertCachedSessionsBatch = db.transaction((sessions) => {
       s.slug || null, s.aiTitle || null,
       s.parentSessionId || null, s.agentId || null,
       s.subagentType || null, s.description || null,
-      s.fileMtime || null, s.bridgeSessionId || null
+      s.fileMtime || null, s.bridgeSessionId || null, s.mergedIntoSessionId || null
     );
   }
 });
@@ -843,12 +844,14 @@ function getModelUsage() {
 }
 
 // {totalSessions, totalMessages, totalToolCalls, totalTokens}. totalSessions
-// counts ONLY parent (human) sessions — subagents would otherwise inflate it.
+// counts ONLY parent (human) sessions — subagents would otherwise inflate it,
+// and so would a compaction mirror row (mergedIntoSessionId set): it is the
+// same session as the row it merged into, not a second one.
 let totalSessionsStmt;
 let totalMetricsStmt;
 function getTotalCounts() {
   totalSessionsStmt ??= db.prepare(
-    'SELECT COUNT(*) AS cnt FROM session_cache WHERE parentSessionId IS NULL'
+    'SELECT COUNT(*) AS cnt FROM session_cache WHERE parentSessionId IS NULL AND mergedIntoSessionId IS NULL'
   );
   totalMetricsStmt ??= db.prepare(`
     SELECT

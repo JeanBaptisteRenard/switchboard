@@ -50,8 +50,12 @@ function isToolResultOnly(content) {
  *  model-less assistant lines bucket under model '' (counted as a message but
  *  with zero tokens). User turns that are purely tool_result aren't counted as
  *  messages. Non-message line types are ignored entirely.
+ *
+ *  sinceTimestampExclusive (optional): skip any entry whose own `timestamp` is
+ *  <= this ISO8601 string. Used to dedupe a compaction mirror's recopied
+ *  prefix -- see .ai/contexts/session-cache.md.
  */
-function extractDailyMetrics(lines, fallbackDate) {
+function extractDailyMetrics(lines, fallbackDate, sinceTimestampExclusive) {
   const map = new Map();
   const bucket = (date, model) => {
     const key = `${date}|${model}`;
@@ -72,6 +76,8 @@ function extractDailyMetrics(lines, fallbackDate) {
     if (!line) continue;
     let entry;
     try { entry = JSON.parse(line); } catch { continue; }
+
+    if (sinceTimestampExclusive && (!entry.timestamp || entry.timestamp <= sinceTimestampExclusive)) continue;
 
     const ts = typeof entry.timestamp === 'string' && entry.timestamp.length >= 10
       ? entry.timestamp.slice(0, 10)
@@ -147,10 +153,16 @@ function classifyUserText(text) {
 /** Parse a single .jsonl file into a session object (or null if invalid).
  *  opts.parentSessionId — if set, treat as a subagent transcript and stamp the
  *  parent reference into the returned row.
+ *  opts.dedupeSinceTimestamp — if set (ISO8601), entries at or before this
+ *  timestamp are excluded from messageCount/textContent/summary-candidate/
+ *  dailyMetrics (but NOT from created/modified/slug/etc, which reflect the
+ *  file's true span). Used to dedupe a compaction mirror's recopied prefix
+ *  against the transcript it continues from -- see .ai/contexts/session-cache.md.
  */
 function readSessionFile(filePath, folder, projectPath, opts = {}) {
   const fileBase = path.basename(filePath, '.jsonl');
   const isSubagent = Boolean(opts.parentSessionId);
+  const cutoff = opts.dedupeSinceTimestamp || null;
   try {
     const stat = fs.statSync(filePath);
     const content = fs.readFileSync(filePath, 'utf8');
@@ -198,6 +210,9 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
       if (entry.type === 'ai-title' && entry.aiTitle) {
         aiTitle = entry.aiTitle;
       }
+      // Everything below this line double-counts a compaction mirror's
+      // recopied prefix if not gated: skip entries at/before the cutoff.
+      if (cutoff && (!entry.timestamp || entry.timestamp <= cutoff)) continue;
       if (entry.type === 'user' || entry.type === 'assistant' ||
           (entry.type === 'message' && (entry.role === 'user' || entry.role === 'assistant'))) {
         messageCount++;
@@ -225,7 +240,7 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
     if (!summary || messageCount < 1) return null;
 
     const fallbackDate = stat.mtime.toISOString().slice(0, 10);
-    const dailyMetrics = extractDailyMetrics(lines, fallbackDate);
+    const dailyMetrics = extractDailyMetrics(lines, fallbackDate, cutoff);
 
     if (isSubagent) {
       // Sidechain marker must be present — otherwise the file lives under a
@@ -274,37 +289,66 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
   }
 }
 
-/** Decide, within a project folder, which top-level sessions sharing a
- *  bridgeSessionId survive as a single session_cache row. See
- *  .ai/contexts/session-cache.md for the compaction-mirror rationale.
+/** Merge top-level sessions sharing a bridgeSessionId within a project folder
+ *  (issue #197) -- see .ai/contexts/session-cache.md for the measurement this
+ *  is built on.
  *
- *  existingRows: rows already in session_cache for this folder (DB shape --
- *    sessionId/created/bridgeSessionId/parentSessionId).
- *  freshRows: sessions just produced by readSessionFile() for this pass,
- *    about to be upserted.
+ *  A compaction mirror duplicates its parent's tail verbatim -- same
+ *  timestamps -- up to the compaction point, then keeps receiving genuinely
+ *  new content afterward (the CLI writes to the mirror, not the parent, once
+ *  compaction happens). Every member of a bridgeSessionId group keeps its OWN
+ *  session_cache row (own fileMtime, own incremental refresh -- unchanged),
+ *  but every member except the earliest (`created`) gets `mergedIntoSessionId`
+ *  set to the earliest member's sessionId, and has its own
+ *  messageCount/textContent/dailyMetrics recomputed excluding anything at or
+ *  before its immediate predecessor's `modified` -- exactly the recopied
+ *  overlap, no more. This way nothing is dropped on either side of a
+ *  compaction, and nothing is counted twice. Callers exclude
+ *  `mergedIntoSessionId`-tagged rows from sidebar/session-count listings;
+ *  session_metrics aggregates need no such exclusion, since parent and mirror
+ *  contribute under distinct sessionIds with non-overlapping timestamp
+ *  ranges.
  *
  *  Sessions with no bridgeSessionId, and subagents (parentSessionId set), are
  *  left untouched -- absence must never collapse unrelated sessions into one.
- *  Within a group, the earliest `created` (ISO8601, lexicographically
- *  comparable) wins; ties break on sessionId for determinism. Returns
- *  { toUpsert, toEvict }: toUpsert is freshRows with losing duplicates
- *  dropped, toEvict lists sessionIds of already-cached rows that lost to a
- *  freshly-discovered earlier file and must be deleted.
+ *
+ *  existingRows: rows already in session_cache for this folder (DB shape).
+ *  freshRows: sessions just produced by readSessionFile() this pass.
+ *  reread(sessionId, dedupeSinceTimestamp): re-parses the named fresh
+ *    session's own file with a cutoff, returning a new session object (or
+ *    null if nothing survives the cutoff). Only ever called for members
+ *    present in freshRows -- never for an unchanged, already-cached file, so
+ *    a compaction's frozen parent is never re-read on the mirror's account.
+ *
+ *  Returns { toUpsert, toTouch }:
+ *  - toUpsert: freshRows with every non-winner member replaced by its
+ *    cutoff-filtered re-derivation (dropped entirely if that comes back
+ *    null -- nothing new since its predecessor).
+ *  - toTouch: already-cached rows whose mergedIntoSessionId must change this
+ *    pass (out-of-order discovery: a genuinely earlier file surfaced after
+ *    this one was cached) without being re-read; their stored metrics keep
+ *    whatever cutoff was correct at their last full read until the next
+ *    cold-start rebuild recomputes them -- a narrow, disclosed gap limited to
+ *    that reordering case.
  */
-function resolveBridgeSessionWinners(existingRows, freshRows) {
+function mergeBridgeGroups(existingRows, freshRows, reread) {
   const bySessionId = new Map();
   for (const row of existingRows || []) {
     if (row.parentSessionId) continue;
     bySessionId.set(row.sessionId, {
-      sessionId: row.sessionId, created: row.created,
-      bridgeSessionId: row.bridgeSessionId || null, isFresh: false,
+      sessionId: row.sessionId, created: row.created, modified: row.modified,
+      bridgeSessionId: row.bridgeSessionId || null,
+      mergedIntoSessionId: row.mergedIntoSessionId || null,
+      isFresh: false, row,
     });
   }
   for (const row of freshRows || []) {
     if (row.parentSessionId) continue;
     bySessionId.set(row.sessionId, {
-      sessionId: row.sessionId, created: row.created,
-      bridgeSessionId: row.bridgeSessionId || null, isFresh: true,
+      sessionId: row.sessionId, created: row.created, modified: row.modified,
+      bridgeSessionId: row.bridgeSessionId || null,
+      mergedIntoSessionId: row.mergedIntoSessionId || null,
+      isFresh: true, row,
     });
   }
 
@@ -315,8 +359,9 @@ function resolveBridgeSessionWinners(existingRows, freshRows) {
     groups.get(entry.bridgeSessionId).push(entry);
   }
 
-  const dropSessionIds = new Set();
-  const evictSessionIds = new Set();
+  const replacements = new Map(); // sessionId -> new fresh row object, or null to drop
+  const toTouch = [];
+
   for (const members of groups.values()) {
     if (members.length < 2) continue;
     members.sort((a, b) => {
@@ -324,16 +369,38 @@ function resolveBridgeSessionWinners(existingRows, freshRows) {
       if (a.created > b.created) return 1;
       return a.sessionId < b.sessionId ? -1 : 1;
     });
-    for (const loser of members.slice(1)) {
-      if (loser.isFresh) dropSessionIds.add(loser.sessionId);
-      else evictSessionIds.add(loser.sessionId);
+    const winnerId = members[0].sessionId;
+    for (let i = 1; i < members.length; i++) {
+      const member = members[i];
+      const cutoff = members[i - 1].modified;
+      if (member.isFresh) {
+        const rederived = reread(member.sessionId, cutoff);
+        if (rederived) rederived.mergedIntoSessionId = winnerId;
+        replacements.set(member.sessionId, rederived);
+      } else if (member.mergedIntoSessionId !== winnerId) {
+        toTouch.push({ ...member.row, mergedIntoSessionId: winnerId });
+      }
+    }
+    // The winner must never carry a stale mergedIntoSessionId from a prior
+    // pass where it used to be merged into someone else (out-of-order fix-up).
+    const winner = members[0];
+    if (!winner.isFresh && winner.mergedIntoSessionId) {
+      toTouch.push({ ...winner.row, mergedIntoSessionId: null });
     }
   }
 
-  return {
-    toUpsert: (freshRows || []).filter(r => !dropSessionIds.has(r.sessionId)),
-    toEvict: Array.from(evictSessionIds),
-  };
+  const toUpsert = [];
+  for (const row of freshRows || []) {
+    if (replacements.has(row.sessionId)) {
+      const replacement = replacements.get(row.sessionId);
+      if (replacement) toUpsert.push(replacement);
+      // else: nothing new since its predecessor -- drop silently, no row to show.
+    } else {
+      toUpsert.push(row);
+    }
+  }
+
+  return { toUpsert, toTouch };
 }
 
 /** Enumerate every jsonl in a project folder: top-level sessions plus any
@@ -487,4 +554,4 @@ function readSessionDisplayHeader(filePath, opts = {}) {
   }
 }
 
-module.exports = { readSessionFile, readSessionDisplayHeader, classifyUserText, subagentSessionId, resolveJsonlPath, readSubagentMeta, enumerateSessionFiles, extractDailyMetrics, isToolResultOnly, resolveBridgeSessionWinners };
+module.exports = { readSessionFile, readSessionDisplayHeader, classifyUserText, subagentSessionId, resolveJsonlPath, readSubagentMeta, enumerateSessionFiles, extractDailyMetrics, isToolResultOnly, mergeBridgeGroups };

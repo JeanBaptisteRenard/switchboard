@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { getFolderIndexMtimeMs } = require('../folder-index-state');
 const { deriveProjectPath } = require('../derive-project-path');
-const { readSessionFile, enumerateSessionFiles, resolveBridgeSessionWinners } = require('../read-session-file');
+const { readSessionFile, enumerateSessionFiles, mergeBridgeGroups } = require('../read-session-file');
 
 const PROJECTS_DIR = workerData.projectsDir;
 
@@ -21,8 +21,14 @@ function readFolderFromFilesystem(folder) {
     } catch {}
   }
 
-  // Collapse compaction mirrors sharing a bridgeSessionId -- see resolveBridgeSessionWinners.
-  const { toUpsert } = resolveBridgeSessionWinners([], sessions);
+  // Merge compaction mirrors sharing a bridgeSessionId -- see mergeBridgeGroups.
+  // existingRows=[] (fresh scan): every group member is re-derived from scratch.
+  const reread = (sessionId, cutoff) => {
+    try {
+      return readSessionFile(path.join(folderPath, sessionId + '.jsonl'), folder, projectPath, { dedupeSinceTimestamp: cutoff });
+    } catch { return null; }
+  };
+  const { toUpsert } = mergeBridgeGroups([], sessions, reread);
   return { folder, projectPath, sessions: toUpsert, indexMtimeMs };
 }
 
