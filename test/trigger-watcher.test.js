@@ -4022,6 +4022,9 @@ test('submitted: busy observed between a step\'s text write and its own Enter mu
     const STEP1_TEXT = 'resume the task';
     let busy = false;
     let sawStep0Enter = false;
+    // see .ai/contexts/trigger-watcher.md, "midBusy gate test precondition"
+    let step1TextWritten = false;
+    let firstBusyReadAfterStep1Text = null;
 
     const ptyProcess = {
       pid: process.pid,
@@ -4040,6 +4043,7 @@ test('submitted: busy observed between a step\'s text write and its own Enter mu
           // Busy flips true HERE, synchronously -- structurally not caused by
           // an Enter that does not exist yet.
           busy = true;
+          step1TextWritten = true;
           return;
         }
         // Step 1's own Enter ('\r' the second time): absorbed, no-op. Busy
@@ -4050,7 +4054,13 @@ test('submitted: busy observed between a step\'s text write and its own Enter mu
     const ctx = {
       log: silentLog,
       getPtyForSession: (id) => (id === SESSION_ID ? { ptyProcess } : null),
-      isSessionBusy: (id) => (id === SESSION_ID ? busy : false),
+      isSessionBusy: (id) => {
+        const v = (id === SESSION_ID ? busy : false);
+        if (step1TextWritten && firstBusyReadAfterStep1Text === null) {
+          firstBusyReadAfterStep1Text = v;
+        }
+        return v;
+      },
       isPtyAlive: () => true,
       getComposerState: (id) => (id === SESSION_ID ? { pending: 0, lastInputAt: 0 } : null),
     };
@@ -4071,11 +4081,14 @@ test('submitted: busy observed between a step\'s text write and its own Enter mu
     assert.equal(result.ok, true);
     assert.equal(result.steps.length, 2);
     assert.equal(result.steps[1].submit_retries, 0,
-      'precondition: step 1 read busy on its very first poll tick (waited_ms 0), the exact shape reported 2026-09-04');
-    assert.equal(result.steps[1].waited_ms, 0,
+      'precondition: step 1 read busy on its very first poll tick, the exact shape reported 2026-09-04');
+    assert.equal(firstBusyReadAfterStep1Text, true,
       'precondition: busy was already true before step 1\'s own first poll ever ran');
     assert.notEqual(result.submitted, 'confirmed',
       'busy present before this step\'s own Enter was sent must never confirm that Enter');
+    // see .ai/contexts/trigger-watcher.md, "midBusy gate test precondition"
+    assert.notEqual(result.steps[1].submitted, 'confirmed',
+      'busy present before step 1\'s own Enter was sent must never confirm step 1 itself');
 
   } finally {
     if (watcher) watcher.close();
