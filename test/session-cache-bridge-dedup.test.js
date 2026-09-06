@@ -139,6 +139,98 @@ test('refreshFolder: a compaction mirror keeps its own row (mergedIntoSessionId 
   }
 });
 
+test('refreshFolder: a mirror indexed alone before its parent is known is corrected (not merely re-labelled) once the parent is discovered by a later pass', () => {
+  // Reachable via the incremental (targeted) path: a watcher flush names only
+  // the mirror as dirty (e.g. a brand-new project folder whose cold-start
+  // scan has not reached it yet), so mergeBridgeGroups sees a group of one
+  // and never applies a cutoff -- the mirror's row goes in with its full,
+  // undeduplicated messageCount. A LATER pass discovers the parent for the
+  // first time; the already-cached mirror must be corrected then, not merely
+  // stamped with mergedIntoSessionId (see coordinator review on issue #197).
+  const projectsDir = mkTmp();
+  try {
+    const folder = 'proj-order';
+    const folderPath = path.join(projectsDir, folder);
+    const projectPath = projectsDir;
+
+    const parentPath = path.join(folderPath, 'parent.jsonl');
+    const mirrorPath = path.join(folderPath, 'mirror.jsonl');
+    writeJsonl(parentPath, [
+      { type: 'bridge-session', sessionId: 'parent', bridgeSessionId: 'cse_1', lastSequenceNum: 0 },
+      { type: 'user', cwd: projectPath, timestamp: '2026-09-03T21:15:40.535Z', message: { role: 'user', content: 'New project' } },
+      { type: 'assistant', timestamp: '2026-09-03T21:16:00.000Z', message: { model: 'claude-sonnet-4-6', usage: PARENT_USAGE } },
+    ]);
+    writeJsonl(mirrorPath, [
+      { type: 'assistant', timestamp: '2026-09-03T21:16:00.000Z', message: { model: 'claude-sonnet-4-6', usage: PARENT_USAGE } },
+      { type: 'user', cwd: projectPath, timestamp: '2026-09-05T22:15:00.000Z', message: { role: 'user', content: 'continue please' } },
+      { type: 'assistant', timestamp: '2026-09-05T22:15:05.000Z', message: { model: 'claude-sonnet-4-6', usage: MIRROR_NEW_USAGE } },
+      { type: 'bridge-session', sessionId: 'mirror', bridgeSessionId: 'cse_1', lastSequenceNum: 7481 },
+    ]);
+
+    const { db, store } = makeFakeDb();
+    sessionCache.init({ PROJECTS_DIR: projectsDir, activeSessions: new Map(), getMainWindow: () => null, log: console, db });
+
+    // Pass 1: only the mirror is dirty. Its sibling is nowhere in the cache,
+    // so mergeBridgeGroups sees a group of exactly one -- no cutoff applied.
+    sessionCache.refreshFolder(folder, { files: new Set(['mirror.jsonl']) });
+    assert.ok(store.has('mirror'));
+    assert.equal(store.get('mirror').mergedIntoSessionId, undefined, 'not yet grouped -- its sibling is unknown');
+    assert.equal(store.get('mirror').messageCount, 3, 'read with no cutoff: includes the turn that will later turn out to be a duplicate');
+
+    // Pass 2: the parent is discovered for the first time.
+    sessionCache.refreshFolder(folder, { files: new Set(['parent.jsonl']) });
+
+    assert.equal(store.get('mirror').mergedIntoSessionId, 'parent', 'now correctly grouped');
+    assert.equal(store.get('mirror').messageCount, 2,
+      'corrected to its cutoff-filtered contribution (2) -- a mere mergedIntoSessionId patch would have left the pre-fix count (3) in place, reproducing the double-count this fix exists to close');
+  } finally {
+    cleanup(projectsDir);
+  }
+});
+
+test('refreshFolder: a mirror indexed alone whose entire content turns out to be a duplicate is deleted once its parent is discovered, end to end', () => {
+  const projectsDir = mkTmp();
+  try {
+    const folder = 'proj-order-2';
+    const folderPath = path.join(projectsDir, folder);
+    const projectPath = projectsDir;
+
+    const parentPath = path.join(folderPath, 'parent.jsonl');
+    const mirrorPath = path.join(folderPath, 'mirror.jsonl');
+    writeJsonl(parentPath, [
+      { type: 'bridge-session', sessionId: 'parent', bridgeSessionId: 'cse_1', lastSequenceNum: 0 },
+      { type: 'user', cwd: projectPath, timestamp: '2026-09-03T21:15:40.535Z', message: { role: 'user', content: 'New project' } },
+      { type: 'assistant', timestamp: '2026-09-03T21:16:00.000Z', message: { model: 'claude-sonnet-4-6', usage: PARENT_USAGE } },
+    ]);
+    // Mirror's ENTIRE content is a recopy of the parent's tail -- nothing new
+    // at all (e.g. a compaction immediately followed by a second one, or a
+    // scan racing the mirror's very first append). Both entries carry the
+    // exact same timestamps as the parent's own turns.
+    writeJsonl(mirrorPath, [
+      { type: 'user', cwd: projectPath, timestamp: '2026-09-03T21:15:50.000Z', message: { role: 'user', content: 'New project' } },
+      { type: 'assistant', timestamp: '2026-09-03T21:16:00.000Z', message: { model: 'claude-sonnet-4-6', usage: PARENT_USAGE } },
+      { type: 'bridge-session', sessionId: 'mirror', bridgeSessionId: 'cse_1', lastSequenceNum: 7481 },
+    ]);
+
+    const { db, store, deleted } = makeFakeDb();
+    sessionCache.init({ PROJECTS_DIR: projectsDir, activeSessions: new Map(), getMainWindow: () => null, log: console, db });
+
+    // Pass 1: mirror alone, no sibling known -- its (only) turn stands on its
+    // own, so it gets a real row with no cutoff, same as any normal session.
+    sessionCache.refreshFolder(folder, { files: new Set(['mirror.jsonl']) });
+    assert.ok(store.has('mirror'));
+
+    // Pass 2: parent discovered -- the mirror's sole turn turns out to be
+    // entirely the recopied duplicate; nothing survives the new cutoff.
+    sessionCache.refreshFolder(folder, { files: new Set(['parent.jsonl']) });
+
+    assert.ok(!store.has('mirror'), 'the stale row is removed, not left with its pre-cutoff content');
+    assert.ok(deleted.includes('mirror'), 'deleteCachedSession is actually invoked, not just omitted from the next upsert');
+  } finally {
+    cleanup(projectsDir);
+  }
+});
+
 test('buildProjectsFromCache: the mirror does not appear as its own sidebar entry; its messageCount and modified roll up onto the parent', () => {
   const projectsDir = mkTmp();
   try {
@@ -177,7 +269,7 @@ test('buildProjectsFromCache: the mirror does not appear as its own sidebar entr
   }
 });
 
-test('refreshFolder: an existing row misidentified as parent is re-parented (not deleted) once a genuinely earlier file is discovered', () => {
+test('refreshFolder: an existing row misidentified as parent is re-parented AND re-derived (not merely re-labelled) once a genuinely earlier file is discovered', () => {
   const projectsDir = mkTmp();
   try {
     const folder = 'proj2';
@@ -191,20 +283,34 @@ test('refreshFolder: an existing row misidentified as parent is re-parented (not
       { type: 'assistant', timestamp: '2026-09-03T21:16:00.000Z', message: { model: 'claude-sonnet-4-6', usage: PARENT_USAGE } },
     ]);
 
+    // was-cached-first.jsonl was indexed BEFORE true-parent.jsonl was ever
+    // known, so it was read with no cutoff at all: its stored messageCount
+    // (4) includes a duplicated pair matching true-parent's own turns.
+    const wasCachedFirstPath = path.join(folderPath, 'was-cached-first.jsonl');
+    writeJsonl(wasCachedFirstPath, [
+      { type: 'bridge-session', sessionId: 'was-cached-first', bridgeSessionId: 'cse_1', lastSequenceNum: 1 },
+      { type: 'user', cwd: projectPath, timestamp: '2026-09-03T21:15:40.535Z', message: { role: 'user', content: 'New project' } },
+      { type: 'assistant', timestamp: '2026-09-03T21:16:00.000Z', message: { model: 'claude-sonnet-4-6', usage: PARENT_USAGE } },
+      { type: 'user', cwd: projectPath, timestamp: '2026-09-05T22:15:00.000Z', message: { role: 'user', content: 'continue please' } },
+      { type: 'assistant', timestamp: '2026-09-05T22:15:05.000Z', message: { model: 'claude-sonnet-4-6', usage: MIRROR_NEW_USAGE } },
+    ]);
+
     // Already cached under a LATER created -- as if it had been indexed first
     // (e.g. discovered by an earlier watcher flush) before true-parent.jsonl
-    // was ever read.
+    // was ever read. fileMtime matches the real file so it is NOT treated as
+    // dirty by the main per-file loop -- it only surfaces via mergeBridgeGroups.
+    const wasCachedFirstMtime = fs.statSync(wasCachedFirstPath).mtime.toISOString();
     const cachedRows = [
       {
-        sessionId: 'was-cached-first', folder, projectPath, fileMtime: '2026-09-05T22:14:52.000Z',
-        created: '2026-09-05T22:14:52.000Z', modified: '2026-09-05T22:14:52.000Z', messageCount: 3,
+        sessionId: 'was-cached-first', folder, projectPath, fileMtime: wasCachedFirstMtime,
+        created: '2026-09-03T21:15:40.535Z', modified: '2026-09-05T22:15:05.000Z', messageCount: 4,
         bridgeSessionId: 'cse_1', mergedIntoSessionId: null,
-        filePath: path.join(folderPath, 'was-cached-first.jsonl'),
+        filePath: wasCachedFirstPath,
         parentSessionId: null, agentId: null,
       },
     ];
 
-    const { db, store, deleted } = makeFakeDb({ cachedRows });
+    const { db, store, deleted, metricsReplaced } = makeFakeDb({ cachedRows });
     sessionCache.init({ PROJECTS_DIR: projectsDir, activeSessions: new Map(), getMainWindow: () => null, log: console, db });
 
     sessionCache.refreshFolder(folder, { files: new Set(['true-parent.jsonl']) });
@@ -213,7 +319,10 @@ test('refreshFolder: an existing row misidentified as parent is re-parented (not
     assert.equal(store.get('true-parent').mergedIntoSessionId, undefined);
     assert.ok(store.has('was-cached-first'), 'the previously-cached row is NOT deleted');
     assert.equal(store.get('was-cached-first').mergedIntoSessionId, 'true-parent', 're-parented onto the genuinely earlier file');
-    assert.equal(store.get('was-cached-first').messageCount, 3, 'its stored contribution is untouched (re-parented without a re-read)');
+    assert.equal(store.get('was-cached-first').messageCount, 2,
+      'its stale, never-deduplicated messageCount (4) is replaced by a fresh cutoff-filtered re-derivation (2) -- a mere mergedIntoSessionId patch would have left the double-count in place');
+    const rederivedMetrics = metricsReplaced.find(m => m.sessionId === 'was-cached-first');
+    assert.ok(rederivedMetrics, 'its session_metrics are refreshed too, not just its display row');
     assert.deepEqual(deleted, []);
   } finally {
     cleanup(projectsDir);

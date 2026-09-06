@@ -275,12 +275,13 @@ function refreshFolder(folder, opts = {}) {
   const reread = (sessionId, cutoff) => readSessionFile(
     resolveJsonlPath(PROJECTS_DIR, { folder, sessionId }), folder, projectPath, { dedupeSinceTimestamp: cutoff }
   );
-  const { toUpsert: mergedNewFileReads, toTouch } = mergeBridgeGroups(cachedSessions, newFileReads, reread);
+  const { toUpsert: mergedRows, toDelete: mergeDeletes } = mergeBridgeGroups(cachedSessions, newFileReads, reread);
 
   // Now that merge resolution is final, build the search entry / metrics /
-  // name-set for each surviving full read from the object that actually
-  // survives (its cutoff-filtered re-derivation, if it was a mirror).
-  for (const s of mergedNewFileReads) {
+  // name-set for each surviving row -- a plain fresh read, OR an
+  // already-cached member re-derived because its recorded mergedIntoSessionId
+  // disagreed with the winner just computed (see mergeBridgeGroups).
+  for (const s of mergedRows) {
     sessionsToUpsert.push(s);
     metricsToReplace.push({ sessionId: s.sessionId, dailyMetrics: s.dailyMetrics });
     const name = getMeta(s.sessionId)?.name || s.customTitle || s.aiTitle || '';
@@ -290,10 +291,11 @@ function refreshFolder(folder, opts = {}) {
     });
     if (s.customTitle) namesToSet.push({ id: s.sessionId, name: s.customTitle });
   }
-  // toTouch: already-cached rows needing only mergedIntoSessionId patched
-  // (out-of-order discovery) -- no search/metrics change, their stored
-  // contribution is still correct from their own last full read.
-  sessionsToUpsert.push(...toTouch);
+  // An already-cached member whose re-derivation found nothing surviving the
+  // newly-applicable cutoff must be removed outright -- leaving its old,
+  // pre-cutoff row in place would keep the exact double-count this fix exists
+  // to close.
+  sessionsToDelete.push(...mergeDeletes);
 
   // Batch all DB writes to reduce lock contention
   if (sessionsToUpsert.length > 0) {

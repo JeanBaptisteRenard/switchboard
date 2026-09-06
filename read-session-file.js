@@ -314,41 +314,55 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
  *
  *  existingRows: rows already in session_cache for this folder (DB shape).
  *  freshRows: sessions just produced by readSessionFile() this pass.
- *  reread(sessionId, dedupeSinceTimestamp): re-parses the named fresh
- *    session's own file with a cutoff, returning a new session object (or
- *    null if nothing survives the cutoff). Only ever called for members
- *    present in freshRows -- never for an unchanged, already-cached file, so
- *    a compaction's frozen parent is never re-read on the mirror's account.
+ *  reread(sessionId, dedupeSinceTimestamp): re-parses the named session's own
+ *    file with a cutoff (null means a full, uncut read), returning a new
+ *    session object (or null if nothing survives). Called for ANY group
+ *    member -- fresh or already-cached, winner or not -- whose recorded
+ *    mergedIntoSessionId disagrees with the role just computed for it here.
+ *    That disagreement is the only signal a stored row's
+ *    messageCount/session_metrics can be trusted by: a mirror indexed before
+ *    its parent was known has mergedIntoSessionId=null and a cutoff that was
+ *    never applied, so caching a row is never on its own proof that its
+ *    contribution is already correctly deduplicated -- and the reverse case
+ *    is just as real: if a group's earliest file is deleted (a real path --
+ *    session deletion), its former child is promoted to winner on the next
+ *    pass, but its stored contribution is still cutoff-filtered against a
+ *    predecessor that no longer exists, under-counting until it is re-read in
+ *    full. A member whose mergedIntoSessionId already matches its computed
+ *    role (child of the current winner, or winner with no mergedIntoSessionId
+ *    at all) is left untouched -- its stored contribution was already
+ *    computed against this exact cutoff, so the frozen parent in the common
+ *    case is never re-read on a routine pass.
  *
- *  Returns { toUpsert, toTouch }:
- *  - toUpsert: freshRows with every non-winner member replaced by its
- *    cutoff-filtered re-derivation (dropped entirely if that comes back
- *    null -- nothing new since its predecessor).
- *  - toTouch: already-cached rows whose mergedIntoSessionId must change this
- *    pass (out-of-order discovery: a genuinely earlier file surfaced after
- *    this one was cached) without being re-read; their stored metrics keep
- *    whatever cutoff was correct at their last full read until the next
- *    cold-start rebuild recomputes them -- a narrow, disclosed gap limited to
- *    that reordering case.
+ *  Returns { toUpsert, toDelete }:
+ *  - toUpsert: every row that must be written this pass -- unchanged fresh
+ *    reads, and any group member (fresh or already-cached) whose
+ *    re-derivation produced new content.
+ *  - toDelete: sessionIds of already-cached rows whose re-derivation came
+ *    back null (nothing survives the newly-applicable cutoff) -- these must
+ *    be actively removed, not left with their pre-cutoff stale content.
  */
 function mergeBridgeGroups(existingRows, freshRows, reread) {
   const bySessionId = new Map();
+  const freshSessionIds = new Set();
   for (const row of existingRows || []) {
     if (row.parentSessionId) continue;
     bySessionId.set(row.sessionId, {
       sessionId: row.sessionId, created: row.created, modified: row.modified,
       bridgeSessionId: row.bridgeSessionId || null,
       mergedIntoSessionId: row.mergedIntoSessionId || null,
-      isFresh: false, row,
     });
   }
   for (const row of freshRows || []) {
     if (row.parentSessionId) continue;
+    freshSessionIds.add(row.sessionId);
     bySessionId.set(row.sessionId, {
       sessionId: row.sessionId, created: row.created, modified: row.modified,
       bridgeSessionId: row.bridgeSessionId || null,
+      // readSessionFile() never sets this field, so a fresh row's value here
+      // is always null -- a fresh non-winner is therefore always re-derived,
+      // same as before this field-based check existed.
       mergedIntoSessionId: row.mergedIntoSessionId || null,
-      isFresh: true, row,
     });
   }
 
@@ -359,48 +373,65 @@ function mergeBridgeGroups(existingRows, freshRows, reread) {
     groups.get(entry.bridgeSessionId).push(entry);
   }
 
-  const replacements = new Map(); // sessionId -> new fresh row object, or null to drop
-  const toTouch = [];
+  const replacements = new Map(); // sessionId -> new row object, or null (nothing survives the cutoff)
 
   for (const members of groups.values()) {
-    if (members.length < 2) continue;
     members.sort((a, b) => {
       if (a.created < b.created) return -1;
       if (a.created > b.created) return 1;
       return a.sessionId < b.sessionId ? -1 : 1;
     });
     const winnerId = members[0].sessionId;
+    // The winner can itself carry a stale mergedIntoSessionId: if its former
+    // earlier sibling's file was deleted (a real path -- session deletion),
+    // this member is promoted from child to winner on this pass -- including
+    // down to a group of one, once every other member is gone. Its stored
+    // contribution was cutoff-filtered against a predecessor that no longer
+    // exists, so -- unlike an already-settled winner -- it must be re-read in
+    // full (no cutoff) rather than left as first-among-equals untouched. This
+    // check must run even for a size-1 group, so it sits before the
+    // `members.length < 2` guard below (which only concerns the non-winner
+    // loop, meaningless with a single member).
+    if (members[0].mergedIntoSessionId) {
+      const rederivedWinner = reread(winnerId, null);
+      if (rederivedWinner) rederivedWinner.mergedIntoSessionId = null;
+      replacements.set(winnerId, rederivedWinner);
+    }
+    if (members.length < 2) continue;
     for (let i = 1; i < members.length; i++) {
       const member = members[i];
+      if (member.mergedIntoSessionId === winnerId) continue; // already correctly derived against this exact cutoff
       const cutoff = members[i - 1].modified;
-      if (member.isFresh) {
-        const rederived = reread(member.sessionId, cutoff);
-        if (rederived) rederived.mergedIntoSessionId = winnerId;
-        replacements.set(member.sessionId, rederived);
-      } else if (member.mergedIntoSessionId !== winnerId) {
-        toTouch.push({ ...member.row, mergedIntoSessionId: winnerId });
-      }
-    }
-    // The winner must never carry a stale mergedIntoSessionId from a prior
-    // pass where it used to be merged into someone else (out-of-order fix-up).
-    const winner = members[0];
-    if (!winner.isFresh && winner.mergedIntoSessionId) {
-      toTouch.push({ ...winner.row, mergedIntoSessionId: null });
+      const rederived = reread(member.sessionId, cutoff);
+      if (rederived) rederived.mergedIntoSessionId = winnerId;
+      replacements.set(member.sessionId, rederived);
     }
   }
 
   const toUpsert = [];
+  const toDelete = [];
+
   for (const row of freshRows || []) {
+    if (row.parentSessionId) { toUpsert.push(row); continue; }
     if (replacements.has(row.sessionId)) {
       const replacement = replacements.get(row.sessionId);
       if (replacement) toUpsert.push(replacement);
-      // else: nothing new since its predecessor -- drop silently, no row to show.
+      // else: nothing new since its predecessor -- never inserted at all.
     } else {
       toUpsert.push(row);
     }
   }
 
-  return { toUpsert, toTouch };
+  for (const row of existingRows || []) {
+    if (row.parentSessionId) continue;
+    if (freshSessionIds.has(row.sessionId)) continue; // already handled above
+    if (!replacements.has(row.sessionId)) continue; // winner, or already correctly derived -- no change
+    const replacement = replacements.get(row.sessionId);
+    if (replacement) toUpsert.push(replacement);
+    else toDelete.push(row.sessionId);
+  }
+
+  return { toUpsert, toDelete };
 }
 
 /** Enumerate every jsonl in a project folder: top-level sessions plus any
