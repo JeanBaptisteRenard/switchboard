@@ -627,6 +627,8 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
   async function writeResult(result) {
     // Every result carries `submitted`; an unstated one is the safe value.
     if (result.submitted === undefined) result.submitted = SUBMITTED_NO;
+    // see .ai/contexts/trigger-watcher.md, "steps_total"
+    if (result.steps_total === undefined) result.steps_total = stepsTotal;
     try {
       fs.writeFileSync(resultTmp, JSON.stringify(result) + '\n', 'utf8');
       fs.renameSync(resultTmp, resultPath);
@@ -647,6 +649,7 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
   }
 
   let releaseSessionLock;
+  let stepsTotal = 0;
 
   try {
 
@@ -769,6 +772,8 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
       return;
     }
 
+    stepsTotal = 1;
+
     // W2: command length cap
     if (command.length > MAX_COMMAND_LEN) {
       await writeResult({ ok: false, error: 'command too long (max 4 KB)', sessionId });
@@ -789,6 +794,9 @@ async function processTriggerFile(name, ctx, triggersDir, processedDir, onEntryR
       await writeResult({ ok: false, error: 'chain must be a non-empty array', sessionId });
       return;
     }
+
+    stepsTotal = chain.length;
+
     if (chain.length > MAX_CHAIN_LENGTH) {
       await writeResult({ ok: false, error: `chain too long (max ${MAX_CHAIN_LENGTH} steps)`, sessionId });
       return;
