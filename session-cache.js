@@ -3,7 +3,7 @@ const fs = require('fs');
 const { Worker } = require('worker_threads');
 const { getFolderIndexMtimeMs } = require('./folder-index-state');
 const { deriveProjectPath } = require('./derive-project-path');
-const { readSessionFile, readSessionDisplayHeader, enumerateSessionFiles, resolveJsonlPath } = require('./read-session-file');
+const { readSessionFile, readSessionDisplayHeader, enumerateSessionFiles, resolveJsonlPath, resolveBridgeSessionWinners } = require('./read-session-file');
 const { encodeProjectPath, decodeProjectFolderBestEffort } = require('./encode-project-path');
 
 /**
@@ -57,7 +57,9 @@ function readFolderFromFilesystem(folder) {
     if (s) sessions.push(s);
   }
 
-  return { projectPath, sessions };
+  // Collapse compaction mirrors sharing a bridgeSessionId -- see resolveBridgeSessionWinners.
+  const { toUpsert } = resolveBridgeSessionWinners([], sessions);
+  return { projectPath, sessions: toUpsert };
 }
 
 /** Refresh a single folder incrementally: only re-read changed/new .jsonl files.
@@ -145,6 +147,7 @@ function refreshFolder(folder, opts = {}) {
   const searchEntriesToUpsert = [];
   const namesToSet = [];
   const sessionsToDelete = [];
+  const metricsToReplace = [];
 
   // Refresh strategy:
   //   - NEW file (no cache row): full readSessionFile -- small at first turn,
@@ -224,10 +227,11 @@ function refreshFolder(folder, opts = {}) {
       currentIds.add(s.sessionId);
       sessionsToUpsert.push(s);
       // Per-(date,model) metrics only exist on the full-read path. The header-only
-      // refresh branch above doesn't produce dailyMetrics, so this is the sole
-      // write point for an incremental refresh -- short transaction, fine to run
-      // outside the upsert batch.
-      replaceSessionMetrics(s.sessionId, s.dailyMetrics);
+      // refresh branch above doesn't produce dailyMetrics. Deferred to the batch
+      // section below (not written immediately) so a compaction mirror discovered
+      // here can still be dropped by resolveBridgeSessionWinners before its
+      // metrics ever land in the DB.
+      metricsToReplace.push({ sessionId: s.sessionId, dailyMetrics: s.dailyMetrics });
       // Title precedence: user rename (session_meta.name) > JSONL custom-title > JSONL ai-title.
       // Only customTitle (Claude /title) promotes to session_meta.name -- AI titles must NEVER
       // be written there or they'd overwrite the user's UI rename on the next index pass.
@@ -267,17 +271,37 @@ function refreshFolder(folder, opts = {}) {
     }
   }
 
-  // Batch all DB writes to reduce lock contention
-  if (sessionsToUpsert.length > 0) {
-    upsertCachedSessions(sessionsToUpsert);
+  // Collapse compaction mirrors sharing a bridgeSessionId with an already-cached
+  // (or a sibling, freshly-read) top-level session -- see resolveBridgeSessionWinners.
+  // cachedSessions is the folder's full pre-refresh state, independent of `targeted`.
+  const { toUpsert: dedupedUpsert, toEvict } = resolveBridgeSessionWinners(cachedSessions, sessionsToUpsert);
+  let finalSessionsToUpsert = sessionsToUpsert;
+  let finalSearchEntries = searchEntriesToUpsert;
+  let finalMetrics = metricsToReplace;
+  let finalNamesToSet = namesToSet;
+  if (dedupedUpsert.length !== sessionsToUpsert.length || toEvict.length > 0) {
+    const survivingIds = new Set(dedupedUpsert.map(s => s.sessionId));
+    finalSessionsToUpsert = dedupedUpsert;
+    finalSearchEntries = searchEntriesToUpsert.filter(e => survivingIds.has(e.id));
+    finalMetrics = metricsToReplace.filter(m => survivingIds.has(m.sessionId));
+    finalNamesToSet = namesToSet.filter(n => survivingIds.has(n.id));
+    sessionsToDelete.push(...toEvict);
   }
-  for (const entry of searchEntriesToUpsert) {
+
+  // Batch all DB writes to reduce lock contention
+  if (finalSessionsToUpsert.length > 0) {
+    upsertCachedSessions(finalSessionsToUpsert);
+  }
+  for (const { sessionId, dailyMetrics } of finalMetrics) {
+    replaceSessionMetrics(sessionId, dailyMetrics);
+  }
+  for (const entry of finalSearchEntries) {
     deleteSearchSession(entry.id);
   }
-  if (searchEntriesToUpsert.length > 0) {
-    upsertSearchEntries(searchEntriesToUpsert);
+  if (finalSearchEntries.length > 0) {
+    upsertSearchEntries(finalSearchEntries);
   }
-  for (const { id, name } of namesToSet) {
+  for (const { id, name } of finalNamesToSet) {
     setName(id, name);
   }
   for (const sessionId of sessionsToDelete) {

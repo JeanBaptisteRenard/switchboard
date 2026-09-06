@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { getFolderIndexMtimeMs } = require('../folder-index-state');
 const { deriveProjectPath } = require('../derive-project-path');
-const { readSessionFile, enumerateSessionFiles } = require('../read-session-file');
+const { readSessionFile, enumerateSessionFiles, resolveBridgeSessionWinners } = require('../read-session-file');
 
 const PROJECTS_DIR = workerData.projectsDir;
 
@@ -21,7 +21,9 @@ function readFolderFromFilesystem(folder) {
     } catch {}
   }
 
-  return { folder, projectPath, sessions, indexMtimeMs };
+  // Collapse compaction mirrors sharing a bridgeSessionId -- see resolveBridgeSessionWinners.
+  const { toUpsert } = resolveBridgeSessionWinners([], sessions);
+  return { folder, projectPath, sessions: toUpsert, indexMtimeMs };
 }
 
 // Scan all folders, streaming one message per folder as soon as it's read

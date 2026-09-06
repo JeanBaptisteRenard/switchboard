@@ -165,6 +165,7 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
     let customTitle = null;
     let aiTitle = null;
     let agentId = null;
+    let bridgeSessionId = null;
     let sidechainSeen = false;
     // Real conversation time bounds. Resuming a session appends untimestamped
     // bookkeeping records (last-prompt, mode, ai-title, …) which bump the file's
@@ -186,6 +187,11 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
       if (entry.slug && !slug) slug = entry.slug;
       if (entry.agentId && !agentId) agentId = entry.agentId;
       if (entry.isSidechain) sidechainSeen = true;
+      // Compaction mirror dedup key -- see .ai/contexts/session-cache.md
+      if (entry.type === 'bridge-session' && typeof entry.bridgeSessionId === 'string' &&
+          entry.bridgeSessionId && !bridgeSessionId) {
+        bridgeSessionId = entry.bridgeSessionId;
+      }
       if (entry.type === 'custom-title' && entry.customTitle) {
         customTitle = entry.customTitle;
       }
@@ -260,11 +266,74 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
       modified: lastTimestamp || stat.mtime.toISOString(),
       fileMtime: stat.mtime.toISOString(),
       messageCount, textContent, slug, customTitle, aiTitle,
+      bridgeSessionId,
       dailyMetrics,
     };
   } catch {
     return null;
   }
+}
+
+/** Decide, within a project folder, which top-level sessions sharing a
+ *  bridgeSessionId survive as a single session_cache row. See
+ *  .ai/contexts/session-cache.md for the compaction-mirror rationale.
+ *
+ *  existingRows: rows already in session_cache for this folder (DB shape --
+ *    sessionId/created/bridgeSessionId/parentSessionId).
+ *  freshRows: sessions just produced by readSessionFile() for this pass,
+ *    about to be upserted.
+ *
+ *  Sessions with no bridgeSessionId, and subagents (parentSessionId set), are
+ *  left untouched -- absence must never collapse unrelated sessions into one.
+ *  Within a group, the earliest `created` (ISO8601, lexicographically
+ *  comparable) wins; ties break on sessionId for determinism. Returns
+ *  { toUpsert, toEvict }: toUpsert is freshRows with losing duplicates
+ *  dropped, toEvict lists sessionIds of already-cached rows that lost to a
+ *  freshly-discovered earlier file and must be deleted.
+ */
+function resolveBridgeSessionWinners(existingRows, freshRows) {
+  const bySessionId = new Map();
+  for (const row of existingRows || []) {
+    if (row.parentSessionId) continue;
+    bySessionId.set(row.sessionId, {
+      sessionId: row.sessionId, created: row.created,
+      bridgeSessionId: row.bridgeSessionId || null, isFresh: false,
+    });
+  }
+  for (const row of freshRows || []) {
+    if (row.parentSessionId) continue;
+    bySessionId.set(row.sessionId, {
+      sessionId: row.sessionId, created: row.created,
+      bridgeSessionId: row.bridgeSessionId || null, isFresh: true,
+    });
+  }
+
+  const groups = new Map();
+  for (const entry of bySessionId.values()) {
+    if (!entry.bridgeSessionId) continue;
+    if (!groups.has(entry.bridgeSessionId)) groups.set(entry.bridgeSessionId, []);
+    groups.get(entry.bridgeSessionId).push(entry);
+  }
+
+  const dropSessionIds = new Set();
+  const evictSessionIds = new Set();
+  for (const members of groups.values()) {
+    if (members.length < 2) continue;
+    members.sort((a, b) => {
+      if (a.created < b.created) return -1;
+      if (a.created > b.created) return 1;
+      return a.sessionId < b.sessionId ? -1 : 1;
+    });
+    for (const loser of members.slice(1)) {
+      if (loser.isFresh) dropSessionIds.add(loser.sessionId);
+      else evictSessionIds.add(loser.sessionId);
+    }
+  }
+
+  return {
+    toUpsert: (freshRows || []).filter(r => !dropSessionIds.has(r.sessionId)),
+    toEvict: Array.from(evictSessionIds),
+  };
 }
 
 /** Enumerate every jsonl in a project folder: top-level sessions plus any
@@ -418,4 +487,4 @@ function readSessionDisplayHeader(filePath, opts = {}) {
   }
 }
 
-module.exports = { readSessionFile, readSessionDisplayHeader, classifyUserText, subagentSessionId, resolveJsonlPath, readSubagentMeta, enumerateSessionFiles, extractDailyMetrics, isToolResultOnly };
+module.exports = { readSessionFile, readSessionDisplayHeader, classifyUserText, subagentSessionId, resolveJsonlPath, readSubagentMeta, enumerateSessionFiles, extractDailyMetrics, isToolResultOnly, resolveBridgeSessionWinners };
