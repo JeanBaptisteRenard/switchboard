@@ -3,7 +3,7 @@ const fs = require('fs');
 const { Worker } = require('worker_threads');
 const { getFolderIndexMtimeMs } = require('./folder-index-state');
 const { deriveProjectPath } = require('./derive-project-path');
-const { readSessionFile, readSessionDisplayHeader, enumerateSessionFiles, resolveJsonlPath } = require('./read-session-file');
+const { readSessionFile, readSessionDisplayHeader, enumerateSessionFiles, resolveJsonlPath, mergeBridgeGroups } = require('./read-session-file');
 const { encodeProjectPath, decodeProjectFolderBestEffort } = require('./encode-project-path');
 
 /**
@@ -57,7 +57,13 @@ function readFolderFromFilesystem(folder) {
     if (s) sessions.push(s);
   }
 
-  return { projectPath, sessions };
+  // Merge compaction mirrors sharing a bridgeSessionId -- see mergeBridgeGroups.
+  // existingRows=[] (fresh scan): every group member is re-derived from scratch.
+  const reread = (sessionId, cutoff) => readSessionFile(
+    path.join(folderPath, sessionId + '.jsonl'), folder, projectPath, { dedupeSinceTimestamp: cutoff }
+  );
+  const { toUpsert } = mergeBridgeGroups([], sessions, reread);
+  return { projectPath, sessions: toUpsert };
 }
 
 /** Refresh a single folder incrementally: only re-read changed/new .jsonl files.
@@ -145,6 +151,12 @@ function refreshFolder(folder, opts = {}) {
   const searchEntriesToUpsert = [];
   const namesToSet = [];
   const sessionsToDelete = [];
+  const metricsToReplace = [];
+  // Full reads only (the "NEW file" branch below) -- kept separate from
+  // sessionsToUpsert so mergeBridgeGroups never sees a header-only-refreshed
+  // row and mistakes it for a safe-to-reread fresh read (it isn't: the whole
+  // point of header-only refresh is to avoid a full re-read of a live file).
+  const newFileReads = [];
 
   // Refresh strategy:
   //   - NEW file (no cache row): full readSessionFile -- small at first turn,
@@ -218,25 +230,14 @@ function refreshFolder(folder, opts = {}) {
       continue;
     }
 
-    // NEW file -- full readSessionFile so the FTS index gets seeded.
+    // NEW file -- full readSessionFile so the FTS index gets seeded. Search
+    // entry / metrics / name are built AFTER merge resolution below, from
+    // whatever object actually survives (a compaction mirror's raw read here
+    // may still be replaced by a cutoff-filtered re-derivation, or dropped).
     const s = readSessionFile(filePath, folder, projectPath, { parentSessionId });
     if (s) {
       currentIds.add(s.sessionId);
-      sessionsToUpsert.push(s);
-      // Per-(date,model) metrics only exist on the full-read path. The header-only
-      // refresh branch above doesn't produce dailyMetrics, so this is the sole
-      // write point for an incremental refresh -- short transaction, fine to run
-      // outside the upsert batch.
-      replaceSessionMetrics(s.sessionId, s.dailyMetrics);
-      // Title precedence: user rename (session_meta.name) > JSONL custom-title > JSONL ai-title.
-      // Only customTitle (Claude /title) promotes to session_meta.name -- AI titles must NEVER
-      // be written there or they'd overwrite the user's UI rename on the next index pass.
-      const name = getMeta(s.sessionId)?.name || s.customTitle || s.aiTitle || '';
-      searchEntriesToUpsert.push({
-        id: s.sessionId, type: 'session', folder: s.folder,
-        title: (name ? name + ' ' : '') + s.summary, body: s.textContent,
-      });
-      if (s.customTitle) namesToSet.push({ id: s.sessionId, name: s.customTitle });
+      newFileReads.push(s);
     }
     changed = true;
   }
@@ -267,9 +268,41 @@ function refreshFolder(folder, opts = {}) {
     }
   }
 
+  // Merge compaction mirrors sharing a bridgeSessionId -- see mergeBridgeGroups.
+  // Only newFileReads (this pass's full reads) are eligible for re-derivation;
+  // cachedSessions is the folder's full pre-refresh state, independent of
+  // `targeted`, so an already-cached parent is recognised without re-reading it.
+  const reread = (sessionId, cutoff) => readSessionFile(
+    resolveJsonlPath(PROJECTS_DIR, { folder, sessionId }), folder, projectPath, { dedupeSinceTimestamp: cutoff }
+  );
+  const { toUpsert: mergedRows, toDelete: mergeDeletes } = mergeBridgeGroups(cachedSessions, newFileReads, reread);
+
+  // Now that merge resolution is final, build the search entry / metrics /
+  // name-set for each surviving row -- a plain fresh read, OR an
+  // already-cached member re-derived because its recorded mergedIntoSessionId
+  // disagreed with the winner just computed (see mergeBridgeGroups).
+  for (const s of mergedRows) {
+    sessionsToUpsert.push(s);
+    metricsToReplace.push({ sessionId: s.sessionId, dailyMetrics: s.dailyMetrics });
+    const name = getMeta(s.sessionId)?.name || s.customTitle || s.aiTitle || '';
+    searchEntriesToUpsert.push({
+      id: s.sessionId, type: 'session', folder: s.folder,
+      title: (name ? name + ' ' : '') + s.summary, body: s.textContent,
+    });
+    if (s.customTitle) namesToSet.push({ id: s.sessionId, name: s.customTitle });
+  }
+  // An already-cached member whose re-derivation found nothing surviving the
+  // newly-applicable cutoff must be removed outright -- leaving its old,
+  // pre-cutoff row in place would keep the exact double-count this fix exists
+  // to close.
+  sessionsToDelete.push(...mergeDeletes);
+
   // Batch all DB writes to reduce lock contention
   if (sessionsToUpsert.length > 0) {
     upsertCachedSessions(sessionsToUpsert);
+  }
+  for (const { sessionId, dailyMetrics } of metricsToReplace) {
+    replaceSessionMetrics(sessionId, dailyMetrics);
   }
   for (const entry of searchEntriesToUpsert) {
     deleteSearchSession(entry.id);
@@ -348,18 +381,39 @@ function buildProjectsFromCache(showArchived) {
   // Only insert a project entry once we have a session that survives the archive filter --
   // otherwise folders whose sessions are all archived would appear in the sidebar as
   // undismissable phantom entries.
+  // A compaction mirror keeps its own session_cache row (own fileMtime, own
+  // incremental refresh) but must never appear as a second sidebar entry --
+  // see mergeBridgeGroups in read-session-file.js. Roll its messageCount and
+  // modified up onto the row it merged into before building sidebar entries.
+  const mergedChildrenByParent = new Map();
+  for (const row of cachedRows) {
+    if (!row.mergedIntoSessionId) continue;
+    if (!mergedChildrenByParent.has(row.mergedIntoSessionId)) {
+      mergedChildrenByParent.set(row.mergedIntoSessionId, []);
+    }
+    mergedChildrenByParent.get(row.mergedIntoSessionId).push(row);
+  }
+
   const projectMap = new Map();
   for (const row of cachedRows) {
+    if (row.mergedIntoSessionId) continue; // rolled up into its parent below, not its own entry
     if (!row.projectPath) continue;
     if (hiddenProjects.has(row.projectPath)) continue;
     const meta = metaMap.get(row.sessionId);
+    const children = mergedChildrenByParent.get(row.sessionId) || [];
+    let messageCount = row.messageCount;
+    let modified = row.modified;
+    for (const child of children) {
+      messageCount += child.messageCount || 0;
+      if (child.modified && (!modified || child.modified > modified)) modified = child.modified;
+    }
     const s = {
       sessionId: row.sessionId,
       summary: row.summary,
       firstPrompt: row.firstPrompt,
       created: row.created,
-      modified: row.modified,
-      messageCount: row.messageCount,
+      modified,
+      messageCount,
       projectPath: row.projectPath,
       slug: row.slug || null,
       aiTitle: row.aiTitle || null,

@@ -50,8 +50,12 @@ function isToolResultOnly(content) {
  *  model-less assistant lines bucket under model '' (counted as a message but
  *  with zero tokens). User turns that are purely tool_result aren't counted as
  *  messages. Non-message line types are ignored entirely.
+ *
+ *  sinceTimestampExclusive (optional): skip any entry whose own `timestamp` is
+ *  <= this ISO8601 string. Used to dedupe a compaction mirror's recopied
+ *  prefix -- see .ai/contexts/session-cache.md.
  */
-function extractDailyMetrics(lines, fallbackDate) {
+function extractDailyMetrics(lines, fallbackDate, sinceTimestampExclusive) {
   const map = new Map();
   const bucket = (date, model) => {
     const key = `${date}|${model}`;
@@ -72,6 +76,8 @@ function extractDailyMetrics(lines, fallbackDate) {
     if (!line) continue;
     let entry;
     try { entry = JSON.parse(line); } catch { continue; }
+
+    if (sinceTimestampExclusive && (!entry.timestamp || entry.timestamp <= sinceTimestampExclusive)) continue;
 
     const ts = typeof entry.timestamp === 'string' && entry.timestamp.length >= 10
       ? entry.timestamp.slice(0, 10)
@@ -147,10 +153,16 @@ function classifyUserText(text) {
 /** Parse a single .jsonl file into a session object (or null if invalid).
  *  opts.parentSessionId — if set, treat as a subagent transcript and stamp the
  *  parent reference into the returned row.
+ *  opts.dedupeSinceTimestamp — if set (ISO8601), entries at or before this
+ *  timestamp are excluded from messageCount/textContent/summary-candidate/
+ *  dailyMetrics (but NOT from created/modified/slug/etc, which reflect the
+ *  file's true span). Used to dedupe a compaction mirror's recopied prefix
+ *  against the transcript it continues from -- see .ai/contexts/session-cache.md.
  */
 function readSessionFile(filePath, folder, projectPath, opts = {}) {
   const fileBase = path.basename(filePath, '.jsonl');
   const isSubagent = Boolean(opts.parentSessionId);
+  const cutoff = opts.dedupeSinceTimestamp || null;
   try {
     const stat = fs.statSync(filePath);
     const content = fs.readFileSync(filePath, 'utf8');
@@ -165,6 +177,7 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
     let customTitle = null;
     let aiTitle = null;
     let agentId = null;
+    let bridgeSessionId = null;
     let sidechainSeen = false;
     // Real conversation time bounds. Resuming a session appends untimestamped
     // bookkeeping records (last-prompt, mode, ai-title, …) which bump the file's
@@ -186,12 +199,20 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
       if (entry.slug && !slug) slug = entry.slug;
       if (entry.agentId && !agentId) agentId = entry.agentId;
       if (entry.isSidechain) sidechainSeen = true;
+      // Compaction mirror dedup key -- see .ai/contexts/session-cache.md
+      if (entry.type === 'bridge-session' && typeof entry.bridgeSessionId === 'string' &&
+          entry.bridgeSessionId && !bridgeSessionId) {
+        bridgeSessionId = entry.bridgeSessionId;
+      }
       if (entry.type === 'custom-title' && entry.customTitle) {
         customTitle = entry.customTitle;
       }
       if (entry.type === 'ai-title' && entry.aiTitle) {
         aiTitle = entry.aiTitle;
       }
+      // Everything below this line double-counts a compaction mirror's
+      // recopied prefix if not gated: skip entries at/before the cutoff.
+      if (cutoff && (!entry.timestamp || entry.timestamp <= cutoff)) continue;
       if (entry.type === 'user' || entry.type === 'assistant' ||
           (entry.type === 'message' && (entry.role === 'user' || entry.role === 'assistant'))) {
         messageCount++;
@@ -219,7 +240,7 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
     if (!summary || messageCount < 1) return null;
 
     const fallbackDate = stat.mtime.toISOString().slice(0, 10);
-    const dailyMetrics = extractDailyMetrics(lines, fallbackDate);
+    const dailyMetrics = extractDailyMetrics(lines, fallbackDate, cutoff);
 
     if (isSubagent) {
       // Sidechain marker must be present — otherwise the file lives under a
@@ -260,11 +281,157 @@ function readSessionFile(filePath, folder, projectPath, opts = {}) {
       modified: lastTimestamp || stat.mtime.toISOString(),
       fileMtime: stat.mtime.toISOString(),
       messageCount, textContent, slug, customTitle, aiTitle,
+      bridgeSessionId,
       dailyMetrics,
     };
   } catch {
     return null;
   }
+}
+
+/** Merge top-level sessions sharing a bridgeSessionId within a project folder
+ *  (issue #197) -- see .ai/contexts/session-cache.md for the measurement this
+ *  is built on.
+ *
+ *  A compaction mirror duplicates its parent's tail verbatim -- same
+ *  timestamps -- up to the compaction point, then keeps receiving genuinely
+ *  new content afterward (the CLI writes to the mirror, not the parent, once
+ *  compaction happens). Every member of a bridgeSessionId group keeps its OWN
+ *  session_cache row (own fileMtime, own incremental refresh -- unchanged),
+ *  but every member except the earliest (`created`) gets `mergedIntoSessionId`
+ *  set to the earliest member's sessionId, and has its own
+ *  messageCount/textContent/dailyMetrics recomputed excluding anything at or
+ *  before its immediate predecessor's `modified` -- exactly the recopied
+ *  overlap, no more. This way nothing is dropped on either side of a
+ *  compaction, and nothing is counted twice. Callers exclude
+ *  `mergedIntoSessionId`-tagged rows from sidebar/session-count listings;
+ *  session_metrics aggregates need no such exclusion, since parent and mirror
+ *  contribute under distinct sessionIds with non-overlapping timestamp
+ *  ranges.
+ *
+ *  Sessions with no bridgeSessionId, and subagents (parentSessionId set), are
+ *  left untouched -- absence must never collapse unrelated sessions into one.
+ *
+ *  existingRows: rows already in session_cache for this folder (DB shape).
+ *  freshRows: sessions just produced by readSessionFile() this pass.
+ *  reread(sessionId, dedupeSinceTimestamp): re-parses the named session's own
+ *    file with a cutoff (null means a full, uncut read), returning a new
+ *    session object (or null if nothing survives). Called for ANY group
+ *    member -- fresh or already-cached, winner or not -- whose recorded
+ *    mergedIntoSessionId disagrees with the role just computed for it here.
+ *    That disagreement is the only signal a stored row's
+ *    messageCount/session_metrics can be trusted by: a mirror indexed before
+ *    its parent was known has mergedIntoSessionId=null and a cutoff that was
+ *    never applied, so caching a row is never on its own proof that its
+ *    contribution is already correctly deduplicated -- and the reverse case
+ *    is just as real: if a group's earliest file is deleted (a real path --
+ *    session deletion), its former child is promoted to winner on the next
+ *    pass, but its stored contribution is still cutoff-filtered against a
+ *    predecessor that no longer exists, under-counting until it is re-read in
+ *    full. A member whose mergedIntoSessionId already matches its computed
+ *    role (child of the current winner, or winner with no mergedIntoSessionId
+ *    at all) is left untouched -- its stored contribution was already
+ *    computed against this exact cutoff, so the frozen parent in the common
+ *    case is never re-read on a routine pass.
+ *
+ *  Returns { toUpsert, toDelete }:
+ *  - toUpsert: every row that must be written this pass -- unchanged fresh
+ *    reads, and any group member (fresh or already-cached) whose
+ *    re-derivation produced new content.
+ *  - toDelete: sessionIds of already-cached rows whose re-derivation came
+ *    back null (nothing survives the newly-applicable cutoff) -- these must
+ *    be actively removed, not left with their pre-cutoff stale content.
+ */
+function mergeBridgeGroups(existingRows, freshRows, reread) {
+  const bySessionId = new Map();
+  const freshSessionIds = new Set();
+  for (const row of existingRows || []) {
+    if (row.parentSessionId) continue;
+    bySessionId.set(row.sessionId, {
+      sessionId: row.sessionId, created: row.created, modified: row.modified,
+      bridgeSessionId: row.bridgeSessionId || null,
+      mergedIntoSessionId: row.mergedIntoSessionId || null,
+    });
+  }
+  for (const row of freshRows || []) {
+    if (row.parentSessionId) continue;
+    freshSessionIds.add(row.sessionId);
+    bySessionId.set(row.sessionId, {
+      sessionId: row.sessionId, created: row.created, modified: row.modified,
+      bridgeSessionId: row.bridgeSessionId || null,
+      // readSessionFile() never sets this field, so a fresh row's value here
+      // is always null -- a fresh non-winner is therefore always re-derived,
+      // same as before this field-based check existed.
+      mergedIntoSessionId: row.mergedIntoSessionId || null,
+    });
+  }
+
+  const groups = new Map();
+  for (const entry of bySessionId.values()) {
+    if (!entry.bridgeSessionId) continue;
+    if (!groups.has(entry.bridgeSessionId)) groups.set(entry.bridgeSessionId, []);
+    groups.get(entry.bridgeSessionId).push(entry);
+  }
+
+  const replacements = new Map(); // sessionId -> new row object, or null (nothing survives the cutoff)
+
+  for (const members of groups.values()) {
+    members.sort((a, b) => {
+      if (a.created < b.created) return -1;
+      if (a.created > b.created) return 1;
+      return a.sessionId < b.sessionId ? -1 : 1;
+    });
+    const winnerId = members[0].sessionId;
+    // The winner can itself carry a stale mergedIntoSessionId: if its former
+    // earlier sibling's file was deleted (a real path -- session deletion),
+    // this member is promoted from child to winner on this pass -- including
+    // down to a group of one, once every other member is gone. Its stored
+    // contribution was cutoff-filtered against a predecessor that no longer
+    // exists, so -- unlike an already-settled winner -- it must be re-read in
+    // full (no cutoff) rather than left as first-among-equals untouched. This
+    // check must run even for a size-1 group, so it sits before the
+    // `members.length < 2` guard below (which only concerns the non-winner
+    // loop, meaningless with a single member).
+    if (members[0].mergedIntoSessionId) {
+      const rederivedWinner = reread(winnerId, null);
+      if (rederivedWinner) rederivedWinner.mergedIntoSessionId = null;
+      replacements.set(winnerId, rederivedWinner);
+    }
+    if (members.length < 2) continue;
+    for (let i = 1; i < members.length; i++) {
+      const member = members[i];
+      if (member.mergedIntoSessionId === winnerId) continue; // already correctly derived against this exact cutoff
+      const cutoff = members[i - 1].modified;
+      const rederived = reread(member.sessionId, cutoff);
+      if (rederived) rederived.mergedIntoSessionId = winnerId;
+      replacements.set(member.sessionId, rederived);
+    }
+  }
+
+  const toUpsert = [];
+  const toDelete = [];
+
+  for (const row of freshRows || []) {
+    if (row.parentSessionId) { toUpsert.push(row); continue; }
+    if (replacements.has(row.sessionId)) {
+      const replacement = replacements.get(row.sessionId);
+      if (replacement) toUpsert.push(replacement);
+      // else: nothing new since its predecessor -- never inserted at all.
+    } else {
+      toUpsert.push(row);
+    }
+  }
+
+  for (const row of existingRows || []) {
+    if (row.parentSessionId) continue;
+    if (freshSessionIds.has(row.sessionId)) continue; // already handled above
+    if (!replacements.has(row.sessionId)) continue; // winner, or already correctly derived -- no change
+    const replacement = replacements.get(row.sessionId);
+    if (replacement) toUpsert.push(replacement);
+    else toDelete.push(row.sessionId);
+  }
+
+  return { toUpsert, toDelete };
 }
 
 /** Enumerate every jsonl in a project folder: top-level sessions plus any
@@ -418,4 +585,4 @@ function readSessionDisplayHeader(filePath, opts = {}) {
   }
 }
 
-module.exports = { readSessionFile, readSessionDisplayHeader, classifyUserText, subagentSessionId, resolveJsonlPath, readSubagentMeta, enumerateSessionFiles, extractDailyMetrics, isToolResultOnly };
+module.exports = { readSessionFile, readSessionDisplayHeader, classifyUserText, subagentSessionId, resolveJsonlPath, readSubagentMeta, enumerateSessionFiles, extractDailyMetrics, isToolResultOnly, mergeBridgeGroups };

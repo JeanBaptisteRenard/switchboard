@@ -58,7 +58,9 @@ function aggregateDailyModelTokens(rows) {
   return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
 }
 
-// Mirror of getTotalCounts (metrics half + parent-only session count):
+// Mirror of getTotalCounts (metrics half + parent-only, non-merged session
+// count -- a compaction mirror row (mergedIntoSessionId set) is the same
+// session as the row it merged into, not a second one; issue #197).
 function aggregateTotals(metricRows, cacheRows) {
   let totalMessages = 0, totalToolCalls = 0, totalTokens = 0;
   for (const r of metricRows) {
@@ -66,7 +68,7 @@ function aggregateTotals(metricRows, cacheRows) {
     totalToolCalls += r.toolCallCount || 0;
     totalTokens += (r.inputTokens || 0) + (r.outputTokens || 0);
   }
-  const totalSessions = cacheRows.filter(r => r.parentSessionId == null).length;
+  const totalSessions = cacheRows.filter(r => r.parentSessionId == null && r.mergedIntoSessionId == null).length;
   return { totalSessions, totalMessages, totalToolCalls, totalTokens };
 }
 
@@ -131,6 +133,21 @@ test('aggregateTotals counts only parent sessions and sums metrics', () => {
   assert.equal(totals.totalMessages, 14);   // 4+3+2+5
   assert.equal(totals.totalToolCalls, 6);    // 3+0+1+2
   assert.equal(totals.totalTokens, 2900);    // 1200+0+600+1100
+});
+
+test('aggregateTotals excludes a compaction mirror row from the session count, but still sums its metrics', () => {
+  const cacheRows = [
+    { sessionId: 'parent', parentSessionId: null, mergedIntoSessionId: null },
+    { sessionId: 'mirror', parentSessionId: null, mergedIntoSessionId: 'parent' },
+  ];
+  const metricRows = [
+    { sessionId: 'parent', date: '2026-06-01', model: 'claude-opus-4-8', messageCount: 2, toolCallCount: 1, inputTokens: 100, outputTokens: 50 },
+    { sessionId: 'mirror', date: '2026-06-02', model: 'claude-opus-4-8', messageCount: 1, toolCallCount: 0, inputTokens: 9, outputTokens: 4 },
+  ];
+  const totals = aggregateTotals(metricRows, cacheRows);
+  assert.equal(totals.totalSessions, 1, 'the mirror is the same session as its parent, not a second one');
+  assert.equal(totals.totalMessages, 3, 'both files\' non-overlapping messages are still counted');
+  assert.equal(totals.totalTokens, 163, 'both files\' non-overlapping tokens are still summed -- 150 + 13');
 });
 
 test('aggregates return empty/zero on no rows', () => {
