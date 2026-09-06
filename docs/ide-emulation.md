@@ -12,6 +12,20 @@ Claude CLI discovers connected IDEs via the MCP protocol. When Switchboard is ru
 
 Clicking an OSC 8 `file://` hyperlink in the terminal output opens the file in the side panel with syntax highlighting. You can also right-click any file link in the terminal and choose **Open in panel**.
 
+### Windows drive letters
+
+A `file://` URI is turned into a disk path with the WHATWG `URL` parser, which
+does not special-case a Windows drive letter the way Node's
+`url.fileURLToPath` does: `file:///C:/a/b.js` parses to a pathname of
+`/C:/a/b.js`, leading slash kept. Passed on unchanged, `path.resolve()` in the
+main process turns that into `C:\C:.js`, which never exists;
+`read-file-for-panel` answers `{ ok: false }` and the panel silently does not
+open. `fileUriToPath` strips that leading slash, and it is the single
+conversion point for both the left-click and the context-menu paths.
+
+Known limit: a UNC URI (`file://server/share/x`) still loses its host, because
+the host lives in `URL.hostname` and only the pathname is read.
+
 ## Diff review
 
 When Claude proposes a file change, the side panel shows a diff — the old version on one side and the proposed edit on the other (or as a unified patch in inline mode).

@@ -189,6 +189,7 @@ const rendererCrossFileGlobals = {
   initGridGroupToggle: 'readonly',
   initFilePanel: 'readonly',
   openFileInPanel: 'readonly',
+  fileUriToPath: 'readonly',
   rekeyFilePanelState: 'readonly',
   loadStats: 'readonly',
   loadMemories: 'readonly',
