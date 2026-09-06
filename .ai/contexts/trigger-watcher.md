@@ -995,6 +995,56 @@ toward the chain total; and the single-`command` path's `waited_ms` now
 includes the submit-verification poll (and its retry, if one fired), which it
 previously left out entirely.
 
+### `steps_total`
+
+Every result carries `steps_total`: the number of steps of the chain **as
+written in the trigger file**, not the number that ran. A single-`command`
+trigger is a chain of one and reports `1`. It is injected in `writeResult()`
+itself, next to the `submitted` default, so every path through
+`processTriggerFile()` — success, validation refusal, timeout, internal error —
+emits it and no consumer has to special-case its absence. A trigger rejected
+before its shape is readable (unparseable JSON, oversized file, `command` and
+`chain` both present) reports `0`: no chain could be read from it.
+
+**Added 2026-09-06 (issue #193), strictly additive.** No existing field changed
+name, type or meaning, and no `error` value was added, removed or repurposed —
+in particular `"not sent"` still means nothing left the watcher, and
+`"chain timeout"` still means at least one step did. The result file is a
+published interface: the trigger watcher ships in released builds and we are
+not its only users, so a consumer that ignores unknown JSON fields sees no
+change at all.
+
+Why it exists: to redeliver the steps of a chain that never went out, a
+consumer has to know how long the chain was. Without this field it had to
+retain the chain it authored across the whole wait — up to five minutes, and
+across its own restarts. When it could not, the result was undecidable:
+`steps: [{idx: 0}]` reads identically whether the chain had one step or four.
+Measured case, trigger `c3f7a91e-5b4d-4e28-9a16-7d0e2f8b4a63` (2026-09-05):
+chain `/compact` then a resume prompt, `waitForBusyFall` consumed the full
+300 s because a subagent held the CLI busy, step 1 was never written, and the
+session was left compacted with no resume instruction.
+
+**Reading it: the asymmetry that costs time to work out.** On a wait timeout,
+the step that *was* written but whose wait never completed is pushed into
+`steps[]` and is *not* counted in `steps_completed`. So for a truncated chain:
+
+- `steps_completed` counts steps whose wait completed — it is **not** the
+  index the tail resumes from;
+- `max(steps[].idx)` is the last step actually sent;
+- **the unsent tail is `max(steps[].idx) + 1 .. steps_total - 1`.**
+
+In the measured case above, `steps_completed: 0` with one entry in `steps[]`:
+step 0 had gone out. Deriving the tail from `steps_completed` would have
+re-sent `/compact` a second time.
+
+When there is no step to take a `max` over, the whole chain —
+`0 .. steps_total - 1` — is the tail. Two shapes reach that state and they do
+not look alike: a chain refused during its initial idle wait carries
+`steps: []` with `steps_completed: 0`, whereas a refusal that never got as far
+as the chain loop (`session not found`, `target process not running`, a shape
+validation error) carries **no `steps` key at all**. Read it as
+`(result.steps || []).length === 0`, not as `result.steps.length === 0`.
+
 Trigger file is **deleted** after processing (success or failure).
 
 ### Removing the entry

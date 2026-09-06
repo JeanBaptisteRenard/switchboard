@@ -5520,3 +5520,180 @@ test('waitForBusyFall settle window still applies once a rise is observed (uncha
 // re-assertion at t=400, so by t=550 (250+300ms settle) the function
 // wrongly resolves on the 150ms gap instead of the real fall; this test goes
 // red.
+
+// ── steps_total (issue #193) ────────────────────────────────────────────────
+// See .ai/contexts/trigger-watcher.md, "steps_total".
+
+test('steps_total: a chain that runs to completion reports the chain length as written', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '2000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-steps-total-ok-' + Date.now();
+    const ctx = makeChainCtx(SESSION_ID);
+    watcher = start(ctx);
+
+    const uuid = 'steps-total-ok-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'idle',
+      chain: [
+        { command: '/compact' },
+        { command: 'resume the work' },
+        { command: 'open the PR' },
+      ],
+      timeout_ms: 5000,
+    });
+
+    await waitForFile(path.join(tmp, 'processed', uuid + '.result.json'), 6000);
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+
+    assert.equal(result.ok, true, 'result.ok should be true');
+    assert.equal(result.steps_total, 3, 'steps_total should be the 3 steps written in the trigger');
+    assert.equal(result.steps.length, 3, 'a completed chain writes every step');
+    assert.equal(result.steps.length, result.steps_total,
+      'a completed chain wrote as many steps as the trigger declared');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('steps_total: a chain truncated by a timeout still reports the full length, and the unsent tail starts after max(steps[].idx)', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '5000';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-steps-total-timeout-' + Date.now();
+    let busy = false;
+    const ctx = makeChainCtx(SESSION_ID, { noAutoTurn: true });
+    let writeCount = 0;
+    const origWrite = ctx._ptyProcess.write.bind(ctx._ptyProcess);
+    ctx._ptyProcess.write = function(data) {
+      origWrite(data);
+      writeCount++;
+      if (writeCount === 1) {
+        setTimeout(() => { busy = true; }, 50);
+        setTimeout(() => { busy = false; }, 350);
+      }
+      if (writeCount === 2) {
+        busy = true; // never falls → the global deadline fires on step 1
+      }
+    };
+    ctx.isSessionBusy = (id) => id === SESSION_ID ? busy : false;
+
+    watcher = start(ctx);
+
+    const uuid = 'steps-total-timeout-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'none',
+      chain: [
+        { command: '/compact' },
+        { command: 'step-two' },   // stuck
+        { command: 'step-three' }, // never sent
+        { command: 'step-four' },  // never sent
+      ],
+      timeout_ms: 1200,
+    });
+
+    await waitForFile(path.join(tmp, 'processed', uuid + '.result.json'), 4000);
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+
+    assert.equal(result.ok, false, 'result.ok should be false on timeout');
+    assert.equal(result.partial, true, 'partial should be true');
+    assert.equal(result.steps_total, 4, 'steps_total should be the 4 steps written in the trigger');
+    assert.ok(result.steps.length < result.steps_total,
+      'a truncated chain wrote fewer steps than the trigger declared');
+
+    // The asymmetry the field exists to make readable: the step whose wait
+    // timed out is present in steps[] but not counted in steps_completed, so
+    // the unsent tail starts after max(steps[].idx), not after steps_completed.
+    const lastIdx = Math.max(...result.steps.map(s => s.idx));
+    assert.equal(lastIdx, 1, 'step 1 was written even though its wait timed out');
+    assert.equal(result.steps_completed, 1, 'steps_completed counts only steps whose wait completed');
+    const unsentTail = lastIdx + 1;
+    assert.equal(result.steps_total - unsentTail, 2, 'two steps of the chain were never sent');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('steps_total: a single-command trigger reports 1', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-steps-total-single-' + Date.now();
+    const ctx = makeCtx(SESSION_ID);
+    watcher = start(ctx);
+
+    const uuid = 'steps-total-single-' + Date.now();
+    writeTrigger(tmp, uuid, { sessionId: SESSION_ID, command: '/compact' });
+
+    await waitForFile(path.join(tmp, 'processed', uuid + '.result.json'));
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+
+    assert.equal(result.ok, true, 'result.ok should be true');
+    assert.equal(result.steps_total, 1, 'an unchained command is a chain of one');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
+
+test('steps_total: a failure path that never sent anything still carries the field', async () => {
+  const tmp = mkTmp();
+  let watcher;
+  try {
+    process.env.SWITCHBOARD_TRIGGERS_DIR            = tmp;
+    process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS = '200';
+
+    const { start } = require('../trigger-watcher');
+    const SESSION_ID = 'sess-steps-total-notsent-' + Date.now();
+    // Always busy → the initial idle wait times out, nothing is written.
+    const ctx = makeChainCtx(SESSION_ID, { initiallyBusy: true, noAutoTurn: true });
+    watcher = start(ctx);
+
+    const uuid = 'steps-total-notsent-' + Date.now();
+    writeTrigger(tmp, uuid, {
+      sessionId: SESSION_ID,
+      wait: 'idle',
+      chain: [{ command: '/compact' }, { command: 'resume the work' }],
+      timeout_ms: 300,
+    });
+
+    await waitForFile(path.join(tmp, 'processed', uuid + '.result.json'), 4000);
+    const result = readResult(path.join(tmp, 'processed'), uuid);
+
+    assert.equal(result.ok, false, 'result.ok should be false');
+    assert.equal(result.error, 'not sent', 'nothing left the watcher, so the error stays "not sent"');
+    assert.equal(result.steps.length, 0, 'no step was written');
+    assert.equal(result.steps_total, 2, 'steps_total is readable even when no step was sent');
+
+  } finally {
+    if (watcher) watcher.close();
+    delete process.env.SWITCHBOARD_TRIGGERS_DIR;
+    delete process.env.SWITCHBOARD_TRIGGER_IDLE_TIMEOUT_MS;
+    cleanup(tmp);
+  }
+});
